@@ -1,0 +1,46 @@
+{
+ "title": "Shadow of the Tomb Raider, right arm, frames 36-41",
+ "note": "",
+ "images": [
+  [
+   "As found (community plugin, every 4th frame)",
+   [
+    "01_01.webp",
+    "01_02.webp",
+    "01_03.webp",
+    "01_04.webp",
+    "01_05.webp",
+    "01_06.webp"
+   ]
+  ],
+  [
+   "Ours (split + phase + fixes, every 4th frame)",
+   [
+    "02_01.webp",
+    "02_02.webp",
+    "02_03.webp",
+    "02_04.webp",
+    "02_05.webp",
+    "02_06.webp"
+   ]
+  ],
+  [
+   "Reference: network every frame (slow; for comparison)",
+   [
+    "03_01.webp",
+    "03_02.webp",
+    "03_03.webp",
+    "03_04.webp",
+    "03_05.webp",
+    "03_06.webp"
+   ]
+  ]
+ ],
+ "a": 1,
+ "b": 2,
+ "fps": 4,
+ "intro": "Shadow of the Tomb Raider, a captured clip (slow pan, Lara walking), frames 36-41, her right arm (crop, plays). As found leaves a translucent blue-gray band where the arm was a few frames earlier; it builds up over frames 37-39 and is gone on frame 40, when as found runs the network again. Ours mostly removes it (a faint trace stays) and changes more evenly from frame to frame. Open \"About these pictures\" for the fps figures and what got worse.",
+ "about": "<h2>Setup</h2><p>Shadow of the Tomb Raider, a captured clip (slow pan, Lara walking), frames 36-41, her right arm (crop, plays). Output 4K, FSR Balanced (render 2258x1270). DLSS 5 neural rendering (small model) before upscaling, then 4.1.2l-lossy (FSR 4.1.2 Lite, our build). RX 7800 XT, Linux/Proton.</p><h2>What to look at</h2><p>As found leaves a translucent blue-gray band where the arm was a few frames earlier; it builds up over frames 37-39 and is gone on frame 40, when as found runs the network again. Ours mostly removes it (a faint trace stays) and changes more evenly from frame to frame.</p><h2>What got worse</h2><p>Ours is better on frame 39 but somewhat worse on the frames right after as found&#x27;s network run (more pixels far from the reference on 36-38 and 40-41); over frames 36-43 as found measures slightly closer in this crop (37.10 vs 36.69 dB), on the whole clip 38.91 vs 38.53 dB. The split carries an older edit, which costs most in fast pans.</p><h2>Rough max attainable fps on this GPU</h2><div class=\"fpsbox\"><div class=\"fhead\">Fps you can hold with <b>every frame on time</b> (no stutter), rough estimate: <b>2.1x</b></div><div class=\"fbar\"><span class=\"flab\">As found</span><span class=\"ftrack\"><span class=\"ffill\" style=\"width:48%;background:#d98b3a\">\u2248 32 fps</span></span></div><div class=\"fbar\"><span class=\"flab\">Ours</span><span class=\"ftrack\"><span class=\"ffill\" style=\"width:100%;background:#3fae6a\">\u2248 67 fps</span></span></div><div class=\"fsub\">Average fps is about the same (as found \u2248 69, ours \u2248 68): both do the same work, ours spreads it over every frame instead of one long frame in four.</div><div class=\"fsub\">Frame time, ms, four frames in a row (estimate; line = 16.7 ms, 60 fps):</div><div class=\"fstrip\"><span class=\"flab\">As found</span><span class=\"fcol\"><span class=\"fcolbar\" style=\"height:68px;background:#d98b3a\"></span><span class=\"fcolv\">31</span></span><span class=\"fcol\"><span class=\"fcolbar\" style=\"height:20px;background:#d98b3a\"></span><span class=\"fcolv\">9</span></span><span class=\"fcol\"><span class=\"fcolbar\" style=\"height:20px;background:#d98b3a\"></span><span class=\"fcolv\">9</span></span><span class=\"fcol\"><span class=\"fcolbar\" style=\"height:20px;background:#d98b3a\"></span><span class=\"fcolv\">9</span></span><span class=\"fline\"></span></div><div class=\"fstrip\"><span class=\"flab\">Ours</span><span class=\"fcol\"><span class=\"fcolbar\" style=\"height:32px;background:#3fae6a\"></span><span class=\"fcolv\">15</span></span><span class=\"fcol\"><span class=\"fcolbar\" style=\"height:32px;background:#3fae6a\"></span><span class=\"fcolv\">15</span></span><span class=\"fcol\"><span class=\"fcolbar\" style=\"height:33px;background:#3fae6a\"></span><span class=\"fcolv\">15</span></span><span class=\"fcol\"><span class=\"fcolbar\" style=\"height:32px;background:#3fae6a\"></span><span class=\"fcolv\">15</span></span><span class=\"fline\"></span></div></div><p>Estimates: game + upscaler measured at 8.2 ms per frame without neural rendering; as found adds 22.9 ms on one frame in four and 0.7 ms on the others, ours 6.5 ms on every frame (both measured in the test harness at this size). Ours measured in the game&#x27;s benchmark: 75 fps average, 68 minimum (one run). Average = from the mean frame time. Smooth = from the slowest frame type: the fps you can hold if every frame must be on time.</p><h2>Notes</h2><p>Frames from a captured game clip; display mapping is ours (x/(1+x), gamma 1/2.2), not the game&#x27;s tone mapping; no UI or post-processing. DLSS 5 network run via the community AMD port (mauri870/DLSSNR-RDNA3); not affiliated with NVIDIA. Pictures: this project&#x27;s local test harness, one run each (deterministic).</p>",
+ "start": 3,
+ "autoplay": false
+}
