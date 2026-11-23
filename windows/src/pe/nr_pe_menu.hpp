@@ -1,16 +1,28 @@
 #pragma once
-// NR Control, the OptiScaler route's own NR menu (End), drawn by our DLL over the game's DXGI swap chain: DXGI's
+#include <vulkan/vulkan.h>
+#include <vector>
+// NR Control, the OptiScaler route's own NR menu (End), drawn by our DLL over the game's DXGI swap chain (the .asi route,
+// nr_asi_main.cpp; ported from windows/src/pe/nr_pe_menu.cpp without its native-D3D12 parts): DXGI's
 // Present is hooked in the system's dxgi.dll (below OptiScaler's own swap chain, after its menu and frame
-// generation), and while the menu is open it is drawn with ImGui into an 8-bit image of its own and laid over the
+// generation) and the menu is drawn there, on every frame shown - frame generation's too - as OptiScaler draws its own
+// (draw_game only marks the game's frames there, and draws while the system's Present does not) - and while the menu
+// is open it is drawn with ImGui into an 8-bit image of its own and laid over the
 // back buffer in the swap chain's encoding (SDR, scRGB, HDR10), on D3D11 and D3D12 swap chains. It edits the game's
 // dlssnr-amd.ini - [RenoDX] (every NR setting with the RenoDX-style option on), [Preprocess], [Network] - which
-// the DLL re-reads about once a second, and shows what NR is doing (nr_control_shared.hpp). The same menu as the
-// Linux build's Vulkan layer (linux/src/layer/nr_control_layer.cpp). OptiScaler's own menu (Insert) stays as it is.
+// the DLL takes at once (nr_pe_config.hpp touch_config), and shows what NR is doing (nr_control_shared.hpp). Vulkan
+// swap chains get the same menu from nr_pe_menu_vk.inl. OptiScaler's own menu (Insert) stays as it is.
 //
 // Test switches (no keyboard needed): NR_CONTROL_OPEN=1 starts it open; NR_CONTROL_AT=<n> makes the next two wait
 // until it has been drawn n times; NR_CONTROL_SET=Section.Key=value,... writes once through the menu's ini path;
 // NR_CONTROL_SHOT=1 presses its screenshot button once; NR_CONTROL_DUMP=<file> writes the first back buffer it
 // drew into as a PPM (8-bit sRGB; HDR with 203 nits as white).
+
+struct ID3D12Device;
+struct ID3D12CommandQueue;
+struct IDXGISwapChain;
+struct ID3D12CommandList;
+struct ID3D11Device;
+struct IUnknown;
 
 namespace nr::pe::menu {
 
@@ -18,5 +30,60 @@ namespace nr::pe::menu {
 // process of its own (nr_present_probe.cpp: a swap chain made in the game would be seen, and kept, by its hooks).
 // Not from DllMain.
 void install();
+
+// Lines another part of the .asi adds to NR Control's Diagnostics (the D3D12 passthrough's,
+// nr_d3d12_passthrough_panel.cpp; no other build sets one).
+void set_extra_diagnostics(void (*draw)());
+// And to its Network page, under the network options (the D3D12 passthrough's switch).
+void set_extra_network(void (*draw)());
+// Learns which queue a D3D12 swap chain presents on (DXVK's DXGI gives its device only): hooks ExecuteCommandLists of
+// the queue class of `device` (the game's). Once per process; not from DllMain.
+void watch_queues(ID3D12Device* device);
+bool queue_hooked();
+// Called on every Present of a D3D12 swap chain the menu sees, before it draws (whether or not it draws): the swap
+// chain, the queue it presents on and its encoding as the menu judges it (0 SDR, 1 an sRGB format, 2 scRGB, 3 HDR10).
+// The .asi's final-picture screenshot runs NR on the back buffer there.
+using D3D12PresentHook = void (*)(IDXGISwapChain* swap_chain, ID3D12CommandQueue* queue, int encoding);
+void on_d3d12_present(D3D12PresentHook hook);
+// Called on every Present of a D3D12 swap chain the system's Present sees, after the menu (drawn or not): what is shown
+// (the .asi's debug dump of the presented pictures).
+using D3D12ShownHook = void (*)(IDXGISwapChain* swap_chain, ID3D12CommandQueue* queue);
+void on_d3d12_shown(D3D12ShownHook hook);
+// A D3D12 swap chain made on `queue` (the .asi's hooks of the factories' CreateSwapChain*, every one they see - also
+// the ones frame generation makes under its proxy): where DXGI does not hand out a swap chain's queue (Proton's DXGI)
+// and the thread presenting it executed nothing (frame generation's presenting thread), the menu is drawn on that
+// queue. Kept in a table of the menu's (a reference to the queue), the eight newest swap chains.
+void note_swapchain_queue(IDXGISwapChain* swap_chain, ID3D12CommandQueue* queue);
+// The same for a D3D11 swap chain (its device): the .asi's D3D11 Present layers run there when the game's own Present
+// call was not reached.
+using D3D11PresentHook = void (*)(IDXGISwapChain* swap_chain, ID3D11Device* device);
+void on_d3d11_present(D3D11PresentHook hook);
+// Called after every ExecuteCommandLists of the watched queue class (watch_queues), the game's and ours: the queue and
+// the lists it was handed. The .asi's Present layers learn there where their guide copies were submitted.
+using ExecuteObserver = void (*)(ID3D12CommandQueue* queue, unsigned count, ID3D12CommandList* const* lists);
+void on_execute(ExecuteObserver observer);
+// The Present of the game's own swap chain (the .asi's hook of it, after its Present layers): a game frame. NR Control's
+// per-presented-frame bookkeeping (layers not run on it, the spatial outlines) is done once a game frame, at the first
+// frame the system's Present shows after it - frame generation shows two or more - else the layer rows flicker between
+// running and "not run on this presented frame". `new_frame` false: a present of a game frame already marked (DLSS-G
+// through NGX presents the generated frame and the real one, both the game's swap chain's, while the layers ran once
+// at its evaluate). While the system's Present has not drawn the menu for a second (not hooked, or it sees no
+// presents) the menu is drawn here instead, on the queue (D3D12) or device (D3D11) the swap chain was made with.
+void draw_game(IDXGISwapChain* swap_chain, IUnknown* device, bool new_frame = true);
+// The colour space the game set on `swap_chain` (IDXGISwapChain3::SetColorSpace1, a DXGI_COLOR_SPACE_TYPE); false when
+// it never set one.
+bool colour_space_of(IDXGISwapChain* swap_chain, int* space);
+// The process is ending (see nr::dlssnr::abandon_at_exit): the overlays are left as they are, not destroyed (their
+// destructors wait for the GPU and release objects of modules detached already).
+void abandon_at_exit();
+// Suppresses DXGI Present menu overlays while a native Vulkan swap chain serves the app.
+void set_dxgi_suppressed(bool suppressed);
+// Arbitrates primary swap-chain ownership when standalone hosts present multiple windows.
+bool is_primary_swapchain(IDXGISwapChain* swap_chain);
+// Native Vulkan Present: same Menu and input watcher as DXGI, its own Vulkan draw/compose passes.
+const VkPresentInfoKHR* vulkan_present(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
+        VkQueue queue, uint32_t family, VkSwapchainKHR sc, VkFormat format, VkColorSpaceKHR space,
+        VkExtent2D extent, const std::vector<VkImage>& images, const VkPresentInfoKHR* info);
+void vulkan_forget(VkDevice device, VkSwapchainKHR sc = VK_NULL_HANDLE);
 
 }  // namespace nr::pe::menu

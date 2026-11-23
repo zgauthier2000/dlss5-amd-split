@@ -1,20 +1,16 @@
-# Builds the packages on every push and pull request, and attaches them to a GitHub release when a v*
-# tag is pushed. The version in the package names comes from the tags (*/build/version.sh). No
+# Builds packages on v* tags or manual dispatch, and attaches them to a GitHub release for a v*
+# tag. The version in the package names comes from the tags (*/build/version.sh). No
 # package contains a model: the installers extract it from the user's own nvngx_dlssnr.dll.
 #
-# Windows switch: the Windows package is built unless the repository variable WINDOWS_PACKAGE is
-# "off" (for a Linux-only release):
-#   gh variable set WINDOWS_PACKAGE --body off     # Linux only
-#   gh variable set WINDOWS_PACKAGE --body on      # Linux and Windows
+# Linux packages require LINUX_PACKAGE=on. For Linux only, use a "-linux-" tag or set
+# WINDOWS_PACKAGE=off; otherwise the Windows package is built too.
 # A tag with "-win-" in it (v0.0.4-win-preview) is a Windows-only release: no Linux packages, and the
 # release is not marked latest, so the latest release keeps its Linux packages.
 name: Packages
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -22,7 +18,7 @@ permissions:
 
 jobs:
   linux:
-    if: ${{ !contains(github.ref_name, '-win-') }}
+    if: ${{ vars.LINUX_PACKAGE == 'on' && !contains(github.ref_name, '-win-') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -75,8 +71,15 @@ jobs:
 
       - name: Install build tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build mingw-w64 python3
+          if [[ -f /etc/apt/apt-mirrors.txt ]] && grep -q 'ec2\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            printf 'https://mirrors.edge.kernel.org/ubuntu/\nhttp://archive.ubuntu.com/ubuntu/\n' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          pkgs=(g++-mingw-w64-x86-64-win32 osslsigncode)
+          for pair in cmake:cmake ninja:ninja-build g++:g++ python3:python3 7z:p7zip-full openssl:openssl curl:curl git:git; do
+            command -v "${pair%%:*}" >/dev/null || pkgs+=("${pair#*:}")
+          done
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y --no-install-recommends "${pkgs[@]}"
 
       # GE-Proton's tarball is cached, its unpacked copy (1.6 GB) is not.
       - name: Cache pinned dependencies
@@ -92,7 +95,7 @@ jobs:
         run: bash fetch_deps.sh --windows
 
       - name: Build package   # builds the Vulkan loader and the OptiScaler DLLs too
-        run: bash windows/build/build_package.sh
+        run: NR_SIGN=1 bash windows/build/build_package.sh
 
       - name: Check that no model was packaged
         run: |
@@ -108,8 +111,9 @@ jobs:
     needs: [linux, windows]
     if: >-
       always() && startsWith(github.ref, 'refs/tags/v') &&
-      (needs.linux.result == 'success' || (needs.linux.result == 'skipped' && contains(github.ref_name, '-win-'))) &&
-      (needs.windows.result == 'success' || needs.windows.result == 'skipped')
+      (needs.linux.result == 'success' || needs.linux.result == 'skipped') &&
+      (needs.windows.result == 'success' || needs.windows.result == 'skipped') &&
+      (needs.linux.result == 'success' || needs.windows.result == 'success')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -123,5 +127,10 @@ jobs:
         run: |
           latest=true
           case "$GITHUB_REF_NAME" in *-win-*) latest=false;; esac
-          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
-            --generate-notes --latest="$latest"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$latest"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+              --generate-notes --latest="$latest"
+          fi

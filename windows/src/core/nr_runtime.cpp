@@ -1,6 +1,10 @@
+#include "nr_path_u8.hpp"
 #include "nr_runtime.hpp"
+#include "nr_d3d12_net_plan.hpp"
+#include "nr_gpu_completion.hpp"
 #include "nr_native_plan.hpp"
 #include "nr_runtime_dispatch.hpp"
+#include "nr_vram_tag.hpp"
 #define NR_NO_MAIN 1
 #include "nr_graph.cpp"
 #include "nr_input_check.hpp"
@@ -14,7 +18,13 @@
 #include "nr_ini_int4.hpp"
 #endif
 #ifdef _WIN32
-extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(const char*, char*, unsigned long);
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include "nr_path_win.hpp"
 #endif
 
 // Arena reuse: byte-identical to one value one slot at 16 extents, first and fourth
@@ -22,6 +32,33 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA
 constexpr bool kArenaReuseDefault = true;
 
 namespace nr {
+
+namespace {
+std::filesystem::path writable_cache_base(const std::filesystem::path& preferred) {
+#ifdef _WIN32
+    bool fb = false;
+    const std::string resolved = nr::u8::writable_cache_root(preferred.string(), &fb);
+    if (fb) {
+        static std::once_flag once;
+        std::call_once(once, [&] {
+            nr::logf("[nr] cache folder '%s' is read-only; storing pipeline caches in '%s'",
+                     preferred.string().c_str(), resolved.c_str());
+        });
+    }
+    return std::filesystem::path(resolved);
+#else
+    return preferred;
+#endif
+}
+
+std::string writable_ini_file(const std::filesystem::path& folder) {
+#ifdef _WIN32
+    return nr::u8::writable_ini_path(nr::u8::text(folder));
+#else
+    return (folder / "dlssnr-amd.ini").string();
+#endif
+}
+}  // namespace
 
 // What Runtime::act_arena / RuntimeConfig::act_arena pass around (GraphAct).
 struct ActArenaRef { std::shared_ptr<GraphAct> act; };
@@ -83,27 +120,8 @@ void compute_barrier(VkCommandBuffer cmd, bool exec_only = false, bool inv_only 
                          0, nullptr, 0, nullptr);
 }
 
-// runtime_prep.comp's push block; see the shader.
-// runtime_transfer.comp's push block, byte for byte.
-struct TransferPush {
-    uint32_t w, h, model_w, model_h, passthrough;
-    float detail, colour, max_ratio, white;
-    uint32_t mode, flags;
-    float sigma;
-};
-static_assert(sizeof(TransferPush) == 48, "runtime_transfer.comp's push block");
-constexpr uint32_t kTransferEnlarged = 1, kTransferGuided = 2, kTransferRoundU8 = 4;
-
-struct PrepPush {
-    uint32_t w, h, mode, flags, curve;
-    float bias, contrast, saturation, k, cap;
-    float dt;   // seconds since the last metered frame (the meter adapts in real time)
-};
-enum : uint32_t { kPrepAuto = 1, kPrepUnknee = 2, kPrepRestore = 4, kPrepReset = 8 };
-// Each curve's input scale that leaves mid grey (0.18) where it was, so the
-// curves shape shadows and highlights and the exposure alone sets brightness.
-// Solved numerically, once, for each curve below.
-constexpr float kPrepAnchor[7] = {1.0f, 1.0f, 1.2195122f, 2.9275228f, 1.0052344f, 0.7231708f, 0.8083602f};
+// ReversibleMode 0..4 (another value: 0), as the original reads it: part of the input domain a history was made under.
+inline uint32_t reversible_of(const Controls& c) { return c.reversible_mode >= 0 && c.reversible_mode <= 4 ? uint32_t(c.reversible_mode) : 0u; }
 
 void dispatch(VkCommandBuffer cmd, const nrvk::Kernel& k, uint32_t x, uint32_t y,
               uint32_t z, const void* push, uint32_t bytes, VkDescriptorSet set = VK_NULL_HANDLE) {
@@ -115,7 +133,9 @@ void dispatch(VkCommandBuffer cmd, const nrvk::Kernel& k, uint32_t x, uint32_t y
 
 // Another descriptor set for a kernel's layout, over other resources: buffers
 // first, then images in binding order, exactly as nrvk::Kernel::create writes
-// its own (a sampler makes a combined image sampler, none a storage image).
+// its own (a sampler makes a combined image sampler, none a storage image). The e4m3 bindings
+// read the FP16 twin of their arena and the alias bindings the arena itself, as `create` binds
+// them (RDNA3); a set that skipped this made the kernel treat a byte arena as FP16.
 VkDescriptorSet kernel_set(VkDevice device, VkDescriptorPool pool, const nrvk::Kernel& k,
                            const std::vector<VkBuffer>& buffers,
                            const std::vector<const nrvk::Context::Image*>& images) {
@@ -124,11 +144,21 @@ VkDescriptorSet kernel_set(VkDevice device, VkDescriptorPool pool, const nrvk::K
     VkDescriptorSet set{};
     if (vkAllocateDescriptorSets(device, &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
     const uint32_t nb = uint32_t(buffers.size()), ni = uint32_t(images.size());
-    std::vector<VkDescriptorBufferInfo> bi(nb);
+    std::vector<VkBuffer> bound(buffers);
+    if (k.twin_map && !k.twin_map->empty())
+        for (uint32_t b : k.twin_bindings) {
+            const auto twin = b < nb ? k.twin_map->find(buffers[b]) : k.twin_map->end();
+            if (twin != k.twin_map->end()) bound[b] = twin->second;
+        }
+    std::vector<uint32_t> alias_slots;
+    for (uint32_t a : k.alias_bindings)
+        if (a >= nrvk::Kernel::kAliasBase && a - nrvk::Kernel::kAliasBase < nb) alias_slots.push_back(a);
+    const uint32_t na = uint32_t(alias_slots.size());
+    std::vector<VkDescriptorBufferInfo> bi(nb + na);
     std::vector<VkDescriptorImageInfo> ii(ni);
-    std::vector<VkWriteDescriptorSet> w(nb + ni);
+    std::vector<VkWriteDescriptorSet> w(nb + ni + na);
     for (uint32_t i = 0; i < nb; ++i) {
-        bi[i] = {buffers[i], 0, VK_WHOLE_SIZE};
+        bi[i] = {bound[i], 0, VK_WHOLE_SIZE};
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = set; w[i].dstBinding = i; w[i].descriptorCount = 1;
         w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i];
@@ -141,13 +171,19 @@ VkDescriptorSet kernel_set(VkDevice device, VkDescriptorPool pool, const nrvk::K
                                                       : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         w[nb + i].pImageInfo = &ii[i];
     }
-    vkUpdateDescriptorSets(device, nb + ni, w.data(), 0, nullptr);
+    for (uint32_t i = 0; i < na; ++i) {
+        bi[nb + i] = {buffers[alias_slots[i] - nrvk::Kernel::kAliasBase], 0, VK_WHOLE_SIZE};
+        w[nb + ni + i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[nb + ni + i].dstSet = set; w[nb + ni + i].dstBinding = alias_slots[i]; w[nb + ni + i].descriptorCount = 1;
+        w[nb + ni + i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[nb + ni + i].pBufferInfo = &bi[nb + i];
+    }
+    vkUpdateDescriptorSets(device, nb + ni + na, w.data(), 0, nullptr);
     return set;
 }
 
 // How a caller's colour format reaches the network's RGBA32F image.
 //
-//   identical   - RGBA32F: a plain copy, no conversion anywhere.
+//   identical   - RGBA32F: this input step is a plain copy with no conversion.
 //   through a   - the four 8-bit formats: the bits are copied into a private
 //   transfer      UNORM image and blitted from there, so an *_SRGB view never
 //   image         applies its transfer function to the stored values. This is
@@ -252,11 +288,65 @@ constexpr uint32_t kPrePushBytes = sizeof(PushFSwin) + sizeof(PushPreImage);
 constexpr uint32_t kPreSeedAt = sizeof(PushFSwin) + offsetof(PushPreImage, seed);
 constexpr uint32_t kPreNoiseFieldAt = sizeof(PushFSwin) + offsetof(PushPreImage, noise_off);
 
+// The pass's model controls into one dispatch's push block (Runtime::Impl::patch_push; the D3D12 passthrough through
+// d3d12_net_controls). post_alpha / round_u8: the post block restores the alpha (and the 8-bit rounding) itself; grade:
+// the Style grade pipelines exist and are on.
+void patch_push_controls(std::vector<uint8_t>& blob, const std::string& kern, int style, float intensity, float tone,
+                         float structure, float skin_in, bool mask, bool post_alpha, bool round_u8, bool grade) {
+    const struct { int style; float intensity, tone, structure, skin_in; bool mask; } r{style, intensity, tone, structure, skin_in, mask};
+    const float skin = r.mask ? (r.skin_in < 0 ? r.structure : r.skin_in) : -1.0f;
+    const float background = r.mask ? r.structure : -1.0f;
+    if (kern.rfind("fswinimagepreds32", 0) == 0) {
+        PushPreImage p{};
+        std::memcpy(&p, blob.data() + sizeof(PushFSwin), sizeof p);
+        p.style = float(r.style) / 128; p.tone = r.tone;
+        p.structure = r.mask ? 1 : r.structure;
+        p.skin = skin; p.other = background;
+        std::memcpy(blob.data() + sizeof(PushFSwin), &p, sizeof p);
+    } else if (kern.rfind("imgin", 0) == 0) {
+        PushImgIn p{}; std::memcpy(&p, blob.data(), sizeof p);
+        p.s434 = float(r.style) / 128; p.aux0 = r.tone;
+        p.aux1 = r.mask ? 1 : r.structure;
+        p.gate0 = skin; p.gate1 = background;
+        std::memcpy(blob.data(), &p, sizeof p);
+    } else if (kern == "fswinimagepost32") {
+        constexpr size_t offset = sizeof(PushFSwin) + sizeof(PushUps);
+        PushImageTail p{}; std::memcpy(&p, blob.data() + offset, sizeof p);
+        // Native compose (the OptiScaler and ReShade routes): the fused
+        // tail's own blend IS the DLL's post-block Intensity. **Not clamped
+        // to 1**: that clamp came from one post variant's `sat(Intensity)`
+        // in the PTX, which governs that variant's lerp and not the
+        // control - the DLL copies Intensity out of its settings
+        // unsaturated (18001cf07) and the Toolkit documents 0..2. The tail
+        // takes 0..1 as the lerp and past it as a luminance-ratio power;
+        // see windows/shaders/rdna4/fswin_t.comp.
+        // Every route, every pass: each pass carries its own Intensity
+        // into this blend, as each OptiScaler DLSS-NR pass is its own DLL
+        // feature with its own Intensity.
+        p.intensity = std::clamp(r.intensity, 0.0f, 2.0f);
+        // Bits 28-29: the Style. For Natural and Cinematic the DLL grades the composed answer after the post
+        // block (cg2r_post_process_kernel); the *_grade post pipelines do the same
+        // (windows/shaders/rdna4/include/nr_style_grade.glsl). Non-zero bits select that pipeline at dispatch;
+        // they stay 0 without it. Controls are checked to 0..2 before they get here; the DLL clamps to its
+        // style count, 3.
+        p.w_off = (p.w_off & 0x0FFFFFFFu) |
+                  (post_alpha ? 0x80000000u | (round_u8 ? 0x40000000u : 0u) : 0u) |
+                  (grade ? uint32_t(std::clamp(r.style, 0, 2)) << 28 : 0u);
+        std::memcpy(blob.data() + offset, &p, sizeof p);
+    } else if (kern.rfind("imgout", 0) == 0) {
+        PushImgOut p{}; std::memcpy(&p, blob.data(), sizeof p);
+        p.nr_intensity = std::clamp(r.intensity, 0.0f, 2.0f);
+        std::memcpy(blob.data(), &p, sizeof p);
+    }
+}
+
 // The model extent. At scale 1 it is the frame's own, unaligned, as every
 // game has run so far; below 1 it is rounded to a multiple of 8 (the
-// network's tile) and never above the frame.
+// network's tile) and never above the frame; above 1 (supersampling) it is
+// OptiScaler DLSS-NR's work extent, the f32 product rounded to nearest.
 uint32_t model_extent(uint32_t v, float scale) {
     if (scale == 1.0f) return v;
+    if (scale > 1.0f) return uint32_t(float(v) * scale + 0.5f);
     uint32_t m = uint32_t(std::lround(double(v) * scale));
     m = (m + 4) / 8 * 8;
     return std::min(std::max(m, 8u), v);
@@ -294,11 +384,28 @@ struct Temporal {
     // model extent) when the package has the *hp variants; else an empty image.
     nrvk::Context::Image hpass{};
     bool hp{};
-    // (research NR_HIST16=1): the one-pass history images in RGBA16F.
+    // The one-pass history images in RGBA16F, as NVIDIA's DLL keeps its own (dlssnr_prev_output, RGBA16F): half the
+    // bytes (4K: 2 x 66 MB instead of 2 x 133). [Network] History Precision = 32 (live, Runtime::set_history_f16) or
+    // NR_HIST16=0 keeps RGBA32F. h16_ok: the folder has the RGBA16F post (and its grade twin where the RGBA32F one
+    // has one); then both posts are built - post_pp the RGBA32F history's, post16_pp the RGBA16F one's, the same sets -
+    // and a switch is new history images and the sets pointing at them (Impl::switch_history), no build.
     bool h16{};
+    bool h16_ok{}, h16_want{true};
+    nrvk::Kernel post16_pp[2], post16_grade_pp[2];
     bool pingpong{};
     uint32_t hcur{};
-    nrvk::Context::Image& hist(uint32_t i) { return i ? history_b : history; }
+    // the history images rotate among the features (NR passes, layers) instead of one bound pair with every
+    // feature's own image copied in and out at each change (4K RGBA16F: two 66 MB copies per change, 3 passes ~1.3 ms
+    // a frame). A feature reads the image that holds its last frame (hread) and its post writes a free one (hwrite),
+    // which becomes the feature's; the one it read is free again. One feature: hist(0) / hist(1) in turn, as before.
+    // N features: N + 1 images (extra = the third and later), sets for each (read, write) pair made when first used.
+    std::vector<nrvk::Context::Image> extra;
+    struct Var { nrvk::Kernel pre, post, post_grade, post16, post16_grade; };
+    std::map<std::pair<uint32_t, uint32_t>, Var> vars;
+    uint32_t hread{}, hwrite{1};
+    bool hfresh{};   // hread starts from zeros this recording (a feature without history yet)
+    uint32_t hist_count() const { return 2u + uint32_t(extra.size()); }
+    nrvk::Context::Image& hist(uint32_t i) { return i == 0 ? history : i == 1 ? history_b : extra[i - 2u]; }
     // Where the engine's depth is put, so the consumer has one descriptor
     // whether a game supplies depth or not. Allocated always and left cleared
     // when it is not; the shader is told which by the parameter buffer rather
@@ -339,8 +446,17 @@ struct Temporal {
             if (pre_pp[c].device) pre_pp[c].destroy();
             if (post_pp[c].device) post_pp[c].destroy();
             if (post_grade_pp[c].device) post_grade_pp[c].destroy();
+            if (post16_pp[c].device) post16_pp[c].destroy();
+            if (post16_grade_pp[c].device) post16_grade_pp[c].destroy();
         }
         if (history_b.handle) ctx.destroy(history_b);
+        for (auto& v : vars)
+            for (nrvk::Kernel* k : {&v.second.pre, &v.second.post, &v.second.post_grade, &v.second.post16,
+                                    &v.second.post16_grade})
+                if (k->device) k->destroy();
+        vars.clear();
+        for (auto& e : extra) { e.sampler = VK_NULL_HANDLE; ctx.destroy(e); }   // (the sampler is history's)
+        extra.clear();
         if (hpass.handle) ctx.destroy(hpass);
         // flow0_sampled aliases flow[0]; only its sampler is ours to free.
         if (motion_sampler) vkDestroySampler(ctx.device, motion_sampler, nullptr);
@@ -355,40 +471,160 @@ struct Runtime::Impl {
     float post_blend_scale = kPostBlendScale;   // this network's blend_scale
     NrSession session;
     nrvk::Kernel alpha, mask_pre, mask_resolve;
-    // The linear-light path: the proxy is made in place on tex_in and the
-    // original kept here for the decode. Only when RuntimeConfig::linear_input.
-    nrvk::Kernel encode, transfer_pass;
-    nrvk::Context::Image keep{};
-    bool linear{};
-    // Preprocess (RuntimeConfig::preprocess): runtime_prep.comp's meter,
-    // forward and back modes, the frame as it came in (`prep_keep`, model
-    // sized) and the meter's state. `prep_back` is `prep` itself unless later
-    // passes overwrite tex_in, when the first pass's input is shown_keep and
-    // the frame is put back there for the transfer pass. `transfer_prep` is the
-    // transfer pass reading prep_keep as what the network was shown.
-    bool prep{}, prep_unknee{};
-    nrvk::Kernel prep_k, prep_back_k, transfer_prep;
-    nrvk::Context::Image prep_keep{};
-    nrvk::Buffer prep_state{};
-    // What the last frame asked for. A change resets the meter and bumps
-    // prep_gen; each history made under another generation (in the other
-    // domain) is not consumed, per feature, as OptiScaler runs each pass as
-    // its own feature.
-    bool prep_was_on{};
-    Preprocess prep_last{};
-    std::chrono::steady_clock::time_point prep_metered{};
-    uint32_t prep_gen{}, prep_gen_single{};
+    // The input copy (tex_in) and the answer image (surf0) when a frame first needs them (--lazy-images): until then
+    // 1x1 stand-ins fill the descriptors. A frame sampled in place needs no input copy and one whose answer is stored
+    // in place no answer image - most game frames (4K RGBA16F: 2 x 66 MB). NVIDIA's DLL makes its colour snapshot
+    // on demand as well. The kernels' sets from before go to retired_pools (a recording in flight may hold them), the
+    // stand-ins to retired_images; both with the runtime.
+    std::vector<VkDescriptorPool> retired_pools;
+    std::vector<nrvk::Context::Image> retired_images;
+    // The noise table (NrSession::noise_buf) once frames keep seed 0: consecutive recordings whose pre block ran
+    // seed 0 (the first after a reset is every feature's, so it takes two), and the table then made at the start
+    // of the next recording - before its in-place sets, which bind t.pre_buffers. The stand-in to retired_buffers.
+    uint32_t seed0_run{};
+    bool want_noise{};
+    std::vector<nrvk::Buffer> retired_buffers;
+    void make_noise(VkCommandBuffer cmd) {
+        auto& s = session;
+        want_noise = false;
+        if (s.noise_real || s.noise_jobs.empty() || !s.noise_fill.device) return;
+        const nrvk::Buffer stand = s.noise_buf;
+        nrvk::Buffer made = s.ctx.buffer(s.noise_bytes());
+        s.noise_fill.retarget_buffer(stand.handle, made.handle, retired_pools);
+        s.noise_buf = made;
+        // after whatever the queue ran before reads binding 5 again, the fill, then its barrier (fill_noise)
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0,
+                             nullptr, 0, nullptr);
+        s.fill_noise(cmd);
+        for (auto& kv : s.kern) kv.second.retarget_buffer(stand.handle, made.handle, retired_pools);
+        auto& t = temporal;
+        nrvk::Kernel* ks[] = {&mask_pre, &t.pre, &t.pre_pp[0], &t.pre_pp[1]};
+        for (nrvk::Kernel* k : ks) k->retarget_buffer(stand.handle, made.handle, retired_pools);
+        for (VkBuffer& b : t.pre_buffers) if (b == stand.handle) b = made.handle;
+        retired_buffers.push_back(stand);
+        s.noise_real = true;
+        nr::logf("[nr] noise table made (%.1f MB): frames keep the network's seed 0", double(s.noise_bytes()) / 1e6);
+    }
+    void materialize(VkCommandBuffer cmd, bool want_tex_in, bool want_surf0) {
+        auto& s = session;
+        if (!(want_tex_in && !s.tex_in_real) && !(want_surf0 && !s.surf0_real)) return;
+        const bool defer = s.ctx.defer_transitions;
+        s.ctx.defer_transitions = true;   // inside a recording: the first transitions are recorded below, into cmd
+        auto rebind = [&](nrvk::Context::Image& im, nrvk::Context::Image made) {
+            const nrvk::Context::Image stand = im;
+            im = made;
+            for (auto& kv : s.kern) kv.second.retarget(stand, im, retired_pools);
+            auto& t = temporal;
+            nrvk::Kernel* ks[] = {&alpha, &mask_pre, &mask_resolve, &post_grade, &t.pre, &t.post, &t.post_grade,
+                                  &t.pre_pp[0], &t.pre_pp[1], &t.post_pp[0], &t.post_pp[1],
+                                  &t.post_grade_pp[0], &t.post_grade_pp[1], &t.post16_pp[0], &t.post16_pp[1],
+                                  &t.post16_grade_pp[0], &t.post16_grade_pp[1]};
+            for (nrvk::Kernel* k : ks) k->retarget(stand, im, retired_pools);
+            for (auto& row : t.luma_kernel) for (auto& k : row) k.retarget(stand, im, retired_pools);
+            retired_images.push_back(stand);
+        };
+        try {
+            if (want_tex_in && !s.tex_in_real) {
+                rebind(s.tex_in, s.real_tex_in());
+                s.tex_in_real = true;
+                nr::logf("[nr] input copy made (%ux%u): a frame not sampled in place", s.tex_in.w, s.tex_in.h);
+            }
+            if (want_surf0 && !s.surf0_real) {
+                rebind(s.surf0, s.real_surf0());
+                s.surf0_real = true;
+                nr::logf("[nr] answer image made (%ux%u): an answer not stored in place", s.surf0.w, s.surf0.h);
+            }
+        } catch (...) { s.ctx.defer_transitions = defer; throw; }
+        s.ctx.defer_transitions = defer;
+        if (!s.ctx.pending.empty()) {
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                                 0, nullptr, uint32_t(s.ctx.pending.size()), s.ctx.pending.data());
+            s.ctx.pending.clear();
+        }
+    }
+    // [Network] History Precision changed (Runtime::set_history_f16): history images in the other format, cleared,
+    // every temporal kernel's set pointing at them (the sampled read of hist(c) in the [c] kernels, the storage write
+    // of hist(c) in the post's [c ^ 1] ones), the old images retired. Each feature's own image goes too and every
+    // history starts afresh (latch off): a switch is a cut, as a network switch is.
+    bool switch_history(VkCommandBuffer cmd) {
+        auto& t = temporal;
+        auto& s = session;
+        if (!t.enabled || !t.pingpong || t.hp || !t.h16_ok || t.h16 == t.h16_want) return false;
+        drop_rotation();   // the images beyond the pair and their sets go; every feature starts afresh below
+        const VkFormat fmt = t.h16_want ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+        nrvk::Context::Image old[2] = {t.history, t.history_b}, made[2];
+        const bool defer = s.ctx.defer_transitions;
+        s.ctx.defer_transitions = true;   // inside a recording: the first transitions go into cmd
+        try {
+            for (unsigned c = 0; c < 2; ++c) {
+                made[c] = s.ctx.image(old[c].w, old[c].h, fmt, true);
+                vkDestroySampler(s.ctx.device, made[c].sampler, nullptr);
+                made[c].sampler = old[c].sampler;   // the LINEAR sampler the history is read with, now the new image's
+                s.ctx.transition(made[c], VK_IMAGE_LAYOUT_GENERAL);
+            }
+        } catch (...) { s.ctx.defer_transitions = defer; throw; }
+        s.ctx.defer_transitions = defer;
+        if (!s.ctx.pending.empty()) {
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                                 0, nullptr, uint32_t(s.ctx.pending.size()), s.ctx.pending.data());
+            s.ctx.pending.clear();
+        }
+        const VkClearColorValue zero{};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        for (unsigned c = 0; c < 2; ++c)
+            vkCmdClearColorImage(cmd, made[c].handle, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                           VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr,
+                             0, nullptr);
+        auto store = [](nrvk::Context::Image im) { im.sampler = VK_NULL_HANDLE; return im; };
+        for (unsigned c = 0; c < 2; ++c) {
+            nrvk::Kernel* reads[] = {&t.pre_pp[c], &t.post_pp[c], &t.post_grade_pp[c], &t.post16_pp[c],
+                                     &t.post16_grade_pp[c]};
+            for (nrvk::Kernel* k : reads) k->retarget(old[c], made[c], retired_pools);
+            nrvk::Kernel* writes[] = {&t.post_pp[c ^ 1u], &t.post_grade_pp[c ^ 1u], &t.post16_pp[c ^ 1u],
+                                      &t.post16_grade_pp[c ^ 1u]};
+            for (nrvk::Kernel* k : writes) k->retarget(store(old[c]), store(made[c]), retired_pools);
+        }
+        t.history = made[0];
+        t.history_b = made[1];
+        t.hist_store[0] = store(made[0]);
+        t.hist_store[1] = store(made[1]);
+        for (unsigned c = 0; c < 2; ++c) {
+            old[c].sampler = VK_NULL_HANDLE;   // the new image's now
+            retiring.emplace_back(old[c], recordings + kRetireAfter, gpu_uses);
+        }
+        for (auto& f : features) {
+            if (f.second.history.handle) retiring.emplace_back(f.second.history, recordings + kRetireAfter, gpu_uses);
+            f.second.history = {};
+            f.second.cleared = false;
+            f.second.latch = false;
+        }
+        t.latch = false;
+        t.h16 = t.h16_want;
+        nr::logf("[nr] history images %s ([Network] History Precision %s): the history starts afresh",
+                 t.h16 ? "RGBA16F" : "RGBA32F", t.h16 ? "16" : "32");
+        return true;
+    }
+    // Tag history with its input domain, per feature. A global counter would reset alternating layers that use
+    // different encodings even when neither layer's settings changed.
+    struct InputDomain {
+        bool valid{};
+        uint32_t reversible{};
+        bool operator==(const InputDomain& o) const { return valid && o.valid && reversible == o.reversible; }
+    } input_single{};
     // The pre block's noise seed on frames without a motion source (Runtime::record, Controls::noise_every_frame):
     // the DLL's counter moves on every launch whatever the motion vectors (FUN_180060cf0 copies +0xc8 into the
     // packet and increments it), and Reset zeroes it (FUN_1800616e0).
     uint32_t plain_seed{};
-    float white_point{1.0f};
-    // Model Resolution: the network runs at mw x mh, the frame is width x
-    // height. When they differ, `keep_full` holds the frame as handed over
-    // (linear or sRGB, whichever it is) and `full_out` is where the transfer
-    // pass writes the full-resolution answer; both are absent otherwise.
+    // The network's extent: the frame's (mw x mh = width x height).
     uint32_t mw{}, mh{};
-    bool scaled{};
     // Why this runtime runs another network than it was asked for ("" when it runs the one asked for).
     std::string network_note;
     // The resize path: this runtime's images in a network memory's heap (nrvk::ImageHeap), when built inside a
@@ -400,103 +636,12 @@ struct Runtime::Impl {
     // (the native plan's padded one) and Model Resolution.
     std::vector<std::string> share_arguments;
     uint32_t work_w{}, work_h{};
-    float model_scale{1.0f};
-    bool native_compose{};   // RuntimeConfig::native_compose
     // The post block restores the frame's alpha (and the 8-bit rounding) in its
     // own store, so the alpha pass is skipped: native compose, one pass, no
     // Model Resolution - there the answer is the post block's output as it is.
     bool post_alpha{};
-    VkFilter downscale_filter{VK_FILTER_LINEAR};
-    nrvk::Context::Image keep_full{}, full_out{};
-    // `keep_native`: keep_full in the frame's own format (an *_SRGB frame's UNORM twin) rather than
-    // RGBA32F. The frame is copied into it as it is and runtime_downscale.comp makes the model's
-    // input from it, sampling where the linear blit would (`taps`, measured from a probe blit at
-    // build). `store_native`: the transfer pass (runtime_transfer_store.spv) also writes the answer
-    // back into keep_full, each pixel after reading it, with the alpha pass's rounding; then there
-    // is no full_out and no alpha pass, and the write-back is a copy.
-    bool keep_native{}, store_native{};
-    nrvk::Kernel downscale;
-    nrvk::Buffer taps{};
-    // store_native with the caller's frame itself (usage SAMPLED and STORAGE, keep_full's format):
-    // runtime_downscale.comp reads it and the transfer pass writes the answer back into it, so
-    // neither the copy into keep_full nor the copy back is made. Views and sets per recording,
-    // in a ring retired like DirectSrc's. transfer_binds / transfer_prep_binds: the images the two
-    // transfer kernels were created with, [2] (keep) and [3] (answer) replaced by the frame's.
-    struct FrameRw { VkImageView view{}; VkDescriptorPool pool{}; VkDescriptorSet down{}, transfer{}, transfer_prep{}; };
-    std::vector<FrameRw> frame_ring;
-    bool frame_rw_failed{}, frame_rw_logged{};
-    std::vector<nrvk::Context::Image> transfer_binds, transfer_prep_binds;
-    const FrameRw* frame_rw_source(VkImage image, VkFormat format) {
-        if (frame_rw_failed) return nullptr;
-        const VkDevice dev = session.ctx.device;
-        if (frame_ring.empty()) frame_ring.resize(size_t(kRetireAfter) + 2);
-        FrameRw& f = frame_ring[size_t(recordings % frame_ring.size())];
-        if (f.view) { vkDestroyImageView(dev, f.view, nullptr); f.view = VK_NULL_HANDLE; }
-        f.down = f.transfer = f.transfer_prep = VK_NULL_HANDLE;
-        bool ok = true;
-        if (!f.pool) {
-            const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
-                                                  {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6},
-                                                  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 10}};
-            VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-            pi.maxSets = 3; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
-            ok = vkCreateDescriptorPool(dev, &pi, nullptr, &f.pool) == VK_SUCCESS;
-        } else {
-            ok = vkResetDescriptorPool(dev, f.pool, 0) == VK_SUCCESS;
-        }
-        if (ok) {
-            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-            vi.image = image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = format;
-            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            ok = vkCreateImageView(dev, &vi, nullptr, &f.view) == VK_SUCCESS;
-        }
-        if (ok) {
-            nrvk::Context::Image sampled = keep_full;   // its sampler; texelFetch ignores filtering
-            sampled.handle = image; sampled.view = f.view; sampled.layout = VK_IMAGE_LAYOUT_GENERAL;
-            nrvk::Context::Image storage = sampled;
-            storage.sampler = VK_NULL_HANDLE;
-            nrvk::Context::Image tin = session.tex_in;
-            tin.sampler = VK_NULL_HANDLE; tin.layout = VK_IMAGE_LAYOUT_GENERAL;
-            f.down = kernel_set(dev, f.pool, downscale, {taps.handle}, {&sampled, &tin});
-            auto set_for = [&](const nrvk::Kernel& k, std::vector<nrvk::Context::Image> binds) {
-                binds[2] = sampled; binds[3] = storage;
-                std::vector<const nrvk::Context::Image*> p;
-                for (const auto& b : binds) p.push_back(&b);
-                return kernel_set(dev, f.pool, k, {}, p);
-            };
-            f.transfer = set_for(transfer_pass, transfer_binds);
-            if (transfer_prep.device) f.transfer_prep = set_for(transfer_prep, transfer_prep_binds);
-            ok = f.down && f.transfer && (!transfer_prep.device || f.transfer_prep);
-        }
-        if (!ok) {
-            if (f.view) { vkDestroyImageView(dev, f.view, nullptr); f.view = VK_NULL_HANDLE; }
-            frame_rw_failed = true;
-            nr::logf("[nr] reading and writing the frame in place failed; copying instead");
-            return nullptr;
-        }
-        if (!frame_rw_logged) {
-            frame_rw_logged = true;
-            nr::logf("[nr] Model resolution: frame read and written in place (VkFormat %u)", unsigned(format));
-        }
-        return &f;
-    }
-    // Classic with a scaler other than bilinear: the model's answer enlarged to the frame by
-    // runtime_upscale.comp. The two passes also declare an `up_shown` binding that neither reads or
-    // writes; up_result is bound there too, rather than a frame-sized RGBA32F image of its own (4K: 127 MiB).
-    nrvk::Context::Image up_result{};
-    nrvk::Kernel upscale_pass, upscale_prep;
-    // Multi-pass: what the first pass was shown, kept for the transfer pass
-    // because later passes overwrite tex_in; and one history per pass.
-    uint32_t max_passes{1};
-    nrvk::Context::Image shown_keep{};
-    // The detail-only cascade (RuntimeConfig::cascade_detail_only): the log
-    // luminance ratio, its separable blur (through tmp), and the pass that
-    // writes the next input. Model-sized, GENERAL for life.
-    bool cascade_detail{};
-    int cascade_radius{4};
-    nrvk::Context::Image lograt{}, cascade_tmp{}, lowpass{};
-    nrvk::Kernel cascade_lograt, cascade_blur_h, cascade_blur_v, cascade_feed;
-    std::vector<nrvk::Context::Image> history_store;
+    std::map<uint64_t, uint32_t> plain_seeds;
+    bool unnamed_temporal_used{};
     // ---- what the pass costs, measured on the GPU ----------------------------
     //
     // A timestamp pair around everything `record_all` puts in the caller's
@@ -516,7 +661,7 @@ struct Runtime::Impl {
     // whole. network_ms is their sum, the rest of gpu_ms is the route's own work (input,
     // enlargement and composition, copies).
     bool split_timing{};
-    uint32_t timing_stride{2};             // queries per slot: 2 + 2 x max_passes
+    uint32_t timing_stride{2};             // queries per slot: 2 + 2 for the network
     uint32_t slot_passes[kTimingSlots]{};  // passes timed in each slot
     float net_ms{}, net_ms_avg{};
     // Read the oldest slot in the ring, if its recording has finished. Called
@@ -525,7 +670,7 @@ struct Runtime::Impl {
         if (!timing_ok || timings_recorded <= kTimingSlots) return;
         const uint32_t oldest = timing_slot;   // the next to be overwritten
         const uint32_t n = 2 + 2 * slot_passes[oldest];
-        uint64_t stamps[2 + 2 * 16] = {};
+        uint64_t stamps[4] = {};   // the recording's pair, the network's pair
         if (n > sizeof stamps / sizeof stamps[0]) return;
         if (vkGetQueryPoolResults(session.ctx.device, timing, oldest * timing_stride, n, n * sizeof(uint64_t), stamps,
                                   sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
@@ -539,6 +684,11 @@ struct Runtime::Impl {
             net_ms = float(double(net) * timestamp_ns / 1e6);
             net_ms_avg = net_ms_avg > 0.0f ? net_ms_avg + (net_ms - net_ms_avg) * 0.1f : net_ms;
         }
+        if (std::getenv("NR_LAYER_TIMING_DIAG"))
+            for (uint32_t p = 0; p < slot_passes[oldest]; ++p)
+                nr::logf("[nr] timing runtime %p pass %u total %llu %llu network %llu %llu ns %.6f",
+                         static_cast<void*>(this), p, (unsigned long long)stamps[0], (unsigned long long)stamps[1],
+                         (unsigned long long)stamps[2 + 2 * p], (unsigned long long)stamps[3 + 2 * p], timestamp_ns);
         // A plain exponential average. Ten frames is enough to stop the last
         // digit dancing and short enough that a resolution change shows up
         // immediately rather than being dragged in from before it.
@@ -553,7 +703,7 @@ struct Runtime::Impl {
     // weights, the pipelines and the activation arena are properties of the
     // network and the extent, not of the handle.
     //
-    // So a feature here is exactly this: one history image, the first-frame
+    // A feature keeps one history image per active pass, the first-frame
     // latch and the estimator's parity. `temporal.history` stays the image the
     // pre/post descriptor sets are baked against - it is the *bound* history -
     // and a feature's own image is copied into it on the way in and back out on
@@ -562,48 +712,182 @@ struct Runtime::Impl {
     // and the recording is byte-identical to what it always was.
     struct FeatureState {
         nrvk::Context::Image history{};
+        std::vector<nrvk::Context::Image> estimator_luma;
+        bool estimated_previous{};
         bool latch{};
         uint32_t parity{};
         bool cleared{};
-        uint32_t prep_gen{};   // Impl::prep_gen its history was made under
+        InputDomain input{};   // the encoding its history was made under
         uint32_t seed{};       // Temporal::seed
+        int slot{-1};          // the history image holding its last frame (Temporal::hist), -1 none yet
     };
     std::map<uint64_t, FeatureState> features;
+    // A feature's own history image is made when it first has to leave the bound history (another feature binds
+    // over it) - never while it is the only one, which is every single-layer caller: there it would only hold the
+    // zeros its first frame starts from (4K: a whole RGBA16F image). A feature without one has never been
+    // swapped out, so binding it means starting from zeros (record_all clears the bound history).
+    FeatureState make_feature() { return FeatureState{}; }
+    void ensure_history(FeatureState& f) {
+        if (f.history.handle) return;
+        const auto& h = temporal.history;
+        f.history = session.ctx.image(h.w, h.h, h.format, true, false);
+        f.cleared = false;   // still UNDEFINED: record_all brings it to GENERAL before its first copy
+    }
     uint64_t bound_feature{};
+    // History rotation (Temporal::extra): on for the one-pass ping-pong history (the product's), off for the
+    // research NR_HPASS path, which keeps the copies.
+    bool rotation() const { return temporal.pingpong && !temporal.hp; }
+    bool slot_taken(uint32_t i, const FeatureState* except) const {
+        for (const auto& f : features) if (&f.second != except && f.second.slot == int(i)) return true;
+        return false;
+    }
+    // A free image other than `not_this`, preferring `want`; made (UNDEFINED -> GENERAL in cmd) when none is free.
+    uint32_t free_slot(VkCommandBuffer cmd, const FeatureState* fs, uint32_t want, uint32_t not_this) {
+        auto& t = temporal;
+        if (want < t.hist_count() && want != not_this && !slot_taken(want, fs)) return want;
+        for (uint32_t i = 0; i < t.hist_count(); ++i)
+            if (i != not_this && !slot_taken(i, fs)) return i;
+        nrvk::Context::Image im = session.ctx.image(t.history.w, t.history.h, t.history.format, true, false);
+        vkDestroySampler(session.ctx.device, im.sampler, nullptr);
+        im.sampler = t.history.sampler;   // LINEAR, history's (borrowed)
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = im.handle; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                             0, nullptr, 1, &b);
+        im.layout = VK_IMAGE_LAYOUT_GENERAL;
+        t.extra.push_back(im);
+        return t.hist_count() - 1u;
+    }
+    // This recording's history pair for feature `fs` (null: the unnamed caller, hist(hcur) / hist(hcur ^ 1)).
+    void select_history(VkCommandBuffer cmd, FeatureState* fs) {
+        auto& t = temporal;
+        if (!rotation() || !fs) { t.hread = t.hcur; t.hwrite = t.hcur ^ 1u; t.hfresh = false; return; }
+        t.hfresh = fs->slot < 0;
+        // a feature without history takes hist(hcur) when it is free, as the bound history it used to clear
+        t.hread = t.hfresh ? free_slot(cmd, fs, t.hcur, ~0u) : uint32_t(fs->slot);
+        t.hwrite = free_slot(cmd, fs, t.hread < 2u ? t.hread ^ 1u : ~0u, t.hread);
+        if (!(t.hread < 2u && t.hwrite == (t.hread ^ 1u))) variant(t.hread, t.hwrite);
+    }
+    // pre_pp / post_pp for a pair other than (0, 1) and (1, 0): copies of pre_pp[0] / post*_pp[0] with the history
+    // read (hist(0)) and write (hist_store[1]) bindings pointing at hist(r) / hist(w).
+    static void clone_kernel(const nrvk::Kernel& base, nrvk::Kernel& out,
+                             const std::vector<std::pair<VkImageView, nrvk::Context::Image>>& changes) {
+        out = base;
+        out.pool = VK_NULL_HANDLE; out.set = VK_NULL_HANDLE;
+        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpi.maxSets = 1; dpi.poolSizeCount = uint32_t(base.pool_sizes.size()); dpi.pPoolSizes = base.pool_sizes.data();
+        NRVK_CHECK(vkCreateDescriptorPool(base.device, &dpi, nullptr, &out.pool));
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = out.pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &base.dsl;
+        NRVK_CHECK(vkAllocateDescriptorSets(base.device, &dai, &out.set));
+        std::vector<VkCopyDescriptorSet> copies(base.binding_ids.size());
+        for (size_t b = 0; b < base.binding_ids.size(); ++b) {
+            copies[b] = {VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+            copies[b].srcSet = base.set; copies[b].srcBinding = base.binding_ids[b];
+            copies[b].dstSet = out.set; copies[b].dstBinding = base.binding_ids[b];
+            copies[b].descriptorCount = 1;
+        }
+        vkUpdateDescriptorSets(base.device, 0, nullptr, uint32_t(copies.size()), copies.data());
+        std::vector<VkDescriptorImageInfo> infos(base.image_views.size());
+        std::vector<VkWriteDescriptorSet> w;
+        for (uint32_t i = 0; i < uint32_t(base.image_views.size()); ++i)
+            for (const auto& ch : changes)
+                if (base.image_views[i] == ch.first) {
+                    infos[i] = {ch.second.sampler, ch.second.view, VK_IMAGE_LAYOUT_GENERAL};
+                    out.image_views[i] = ch.second.view;
+                    VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                    x.dstSet = out.set; x.dstBinding = base.buffer_bindings + i; x.descriptorCount = 1;
+                    x.descriptorType = ch.second.sampler ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                         : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                    x.pImageInfo = &infos[i];
+                    w.push_back(x);
+                    break;
+                }
+        vkUpdateDescriptorSets(base.device, uint32_t(w.size()), w.data(), 0, nullptr);
+    }
+    Temporal::Var& variant(uint32_t r, uint32_t w) {
+        auto& t = temporal;
+        auto it = t.vars.find({r, w});
+        if (it != t.vars.end()) return it->second;
+        Temporal::Var& v = t.vars[{r, w}];
+        nrvk::Context::Image rd = t.hist(r), wr = t.hist(w);
+        wr.sampler = VK_NULL_HANDLE;   // the storage view the post writes
+        const VkImageView read0 = t.hist(0).view, write1 = t.hist(1).view;
+        const std::vector<std::pair<VkImageView, nrvk::Context::Image>> pre_ch{{read0, rd}};
+        clone_kernel(t.pre_pp[0], v.pre, pre_ch);
+        // post_pp[0]: hist(0) sampled (read), hist(1) storage (write) - matched by view and kind
+        const auto post = [&](const nrvk::Kernel& base, nrvk::Kernel& out) {
+            if (!base.device) return;
+            clone_kernel(base, out, {{read0, rd}});
+            // the write binding: the storage descriptor showing hist(1)'s view (after the read was moved, a read of
+            // hist(1) - r == 1 - shows hist(1)'s view too: only the storage one is the write)
+            std::vector<VkDescriptorImageInfo> one(1, VkDescriptorImageInfo{VK_NULL_HANDLE, wr.view, VK_IMAGE_LAYOUT_GENERAL});
+            for (uint32_t i = 0; i < uint32_t(base.image_views.size()); ++i) {
+                if (base.image_views[i] != write1) continue;
+                VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                x.dstSet = out.set; x.dstBinding = base.buffer_bindings + i; x.descriptorCount = 1;
+                x.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; x.pImageInfo = one.data();
+                vkUpdateDescriptorSets(base.device, 1, &x, 0, nullptr);
+                out.image_views[i] = wr.view;
+            }
+        };
+        post(t.post_pp[0], v.post);
+        post(t.post_grade_pp[0], v.post_grade);
+        post(t.post16_pp[0], v.post16);
+        post(t.post16_grade_pp[0], v.post16_grade);
+        return v;
+    }
+    const nrvk::Kernel& pre_for(uint32_t r, uint32_t w) {
+        auto& t = temporal;
+        return r < 2u && (!rotation() || w == (r ^ 1u)) ? t.pre_pp[r] : variant(r, w).pre;
+    }
+    nrvk::Kernel& post_for(uint32_t r, uint32_t w, bool h16) {
+        auto& t = temporal;
+        if (r < 2u && (!rotation() || w == (r ^ 1u))) return h16 ? t.post16_pp[r] : t.post_pp[r];
+        Temporal::Var& v = variant(r, w);
+        return h16 ? v.post16 : v.post;
+    }
+    // The grade twin of a post kernel post_for returned (null: none).
+    nrvk::Kernel* grade_of(const nrvk::Kernel* k) {
+        auto& t = temporal;
+        for (unsigned c = 0; c < 2; ++c) {
+            if (k == &t.post_pp[c]) return &t.post_grade_pp[c];
+            if (k == &t.post16_pp[c]) return &t.post16_grade_pp[c];
+        }
+        for (auto& v : t.vars) {
+            if (k == &v.second.post) return &v.second.post_grade;
+            if (k == &v.second.post16) return &v.second.post16_grade;
+        }
+        return nullptr;
+    }
+    // The history images and sets beyond the pair, all at once (a precision switch).
+    void drop_rotation() {
+        auto& t = temporal;
+        for (auto& v : t.vars)
+            for (nrvk::Kernel* k : {&v.second.pre, &v.second.post, &v.second.post_grade, &v.second.post16,
+                                    &v.second.post16_grade})
+                if (k->pool) { retired_pools.push_back(k->pool); k->pool = VK_NULL_HANDLE; k->set = VK_NULL_HANDLE; k->shared.reset(); }
+        t.vars.clear();
+        for (auto& e : t.extra) { e.sampler = VK_NULL_HANDLE; retiring.emplace_back(e, recordings + kRetireAfter, gpu_uses); }
+        t.extra.clear();
+        for (auto& f : features) f.second.slot = -1;
+    }
     // Released features, and the recording count at which their images may be
     // destroyed. Never a wait: the render thread that releases a feature must
     // not block on the GPU, and OptiScaler has already parked the feature for 32
     // evaluates before it gets here (DlssNr_Dx12.cpp ParkNrFeature).
     static constexpr uint64_t kRetireAfter = 64;
-    std::vector<std::pair<nrvk::Context::Image, uint64_t>> retiring;
+    struct Retiring { nrvk::Context::Image first; uint64_t second; nr::gpu::Uses uses;
+        Retiring(nrvk::Context::Image im, uint64_t at, const nr::gpu::Uses& u) : first(im), second(at), uses(u) {} };
+    nr::gpu::Uses gpu_uses;
+    std::vector<Retiring> retiring;
     uint64_t recordings{};
     // A runtime built inside a recording (RuntimeConfig::deferred): its images' first layout transitions as the first
     // recording made them, kept to make again when a recording is dropped (drop_history).
     std::vector<VkImageMemoryBarrier> first_transitions;
-    // **The tone control is a frame edit and belongs to one pass.** NVIDIA's own
-    // description of `LocalToneStrength` is "low-frequency details such as
-    // broader lighting and colour response", and it enters the network as five
-    // constant features on the pre block - the same constant on every pixel.
-    // Running the network again on its own answer therefore applies that whole
-    // low-frequency edit a second time, and it compounds: measured on the
-    // TR2013 frame against NVIDIA's own output, the block-mean luminance ratio
-    // runs 1.052 -> 1.102 -> 1.136 over three passes with the tone control on
-    // each time, and 1.052 -> 1.055 -> 1.056 when only the first pass carries
-    // it. That drift is the red skin the user sees at more than one pass.
-    // Structure is what a later pass can legitimately add more of, so only the
-    // tone feature is dropped. One alternate push blob per dispatch, parallel to
-    // `session.disp`, empty for every dispatch that is not the pre block.
-    //
-    // **Not under `cascade_detail_only`.** That feed hands the next pass the
-    // first pass's *tone* with this pass's structure on it, so the tone edit has
-    // been taken back out of the picture and the network has to make it again;
-    // dropping the control there moves the two-pass answer away from the
-    // one-pass one instead of towards it (block drift mean 0.0163 -> 0.0273 in
-    // `linear_frame_test`). The two are alternative ways to stop the same
-    // stacking, so exactly one of them is active at a time.
-    // [pass][dispatch]; empty means "use pass 1's push". Pass 0's entry is
-    // unused - that pass writes session.disp[i].push in place.
-    std::vector<std::vector<std::vector<uint8_t>>> pass_push;
     nrvk::Context::Image mask_image;
     nrvk::Buffer mask_rect;
     // the plain path's pre and post (the graph's own pipelines), for sampling the
@@ -628,8 +912,11 @@ struct Runtime::Impl {
     // for *_SRGB) and a plain copy fills it; see the graph's --tex-in-format.
     bool direct_in{};
 #if NR_INT4
-    bool int4_mixed{};   // the int4 mixed network (Runtime::int4_mixed)
+    bool int4{};   // CC_SILVER_AARDWOLD_OPTIMIZED's int4 layers (Runtime::int4)
+    int layers{};  // and its level (Runtime::layers)
 #endif
+    bool experimental{};   // CC_SMALL_FP8_EXPERIMENTAL (Runtime::experimental)
+    bool optimized{};   // CC_SILVER_AARDWOLD_OPTIMIZED (Runtime::optimized)
     // The post block stores into an image in the frame's (UNORM) format and the
     // write-back is a copy; see the graph's --out0-format.
     bool direct_out{};
@@ -654,7 +941,7 @@ struct Runtime::Impl {
     // and the estimator's quarter-resolution field they used to be blitted into
     // blended foreground and background vectors at every silhouette and left the
     // five-tap depth choice a quarter of a texel to work with.
-    struct DirectSrc {
+    struct DirectSrc { nr::gpu::Ticket gpu;
         VkImageView cview{}, dview{}, mview{}, tview{};
         VkDescriptorPool pool{};
         VkDescriptorSet pre[2]{}, post[2]{};
@@ -743,14 +1030,15 @@ struct Runtime::Impl {
     // Any of colour (with its depth) and motion may be null: that one is our
     // own image, bound as in the sets made at creation.
     const DirectSrc* direct_source(VkImage colour, VkFormat format, VkImage depth, VkImage motion,
-                                   VkFormat mformat, uint32_t c, bool store = false, VkImage target = VK_NULL_HANDLE,
-                                   bool plain = false) {
+                                   VkFormat mformat, uint32_t c, uint32_t cw, bool store = false,
+                                   VkImage target = VK_NULL_HANDLE, bool plain = false) {
         if (!colour && !motion) return nullptr;
         auto& s = session; auto& t = temporal;
         const VkDevice dev = s.ctx.device;
         if (direct_ring.empty()) direct_ring.resize(size_t(kRetireAfter) + 2);
-        DirectSrc& d = direct_ring[size_t(recordings % direct_ring.size())];
+        DirectSrc& d = nr::gpu::slot(direct_ring, size_t(recordings % direct_ring.size()));
         direct_slot_release(d);
+        d.gpu = nr::gpu::current();
         auto view = [&](VkImage im, VkFormat f, VkImageView* out) {
             VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             vi.image = im; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = f;
@@ -795,27 +1083,31 @@ struct Runtime::Impl {
                 // (nr_graph.cpp), the caller's colour for tex_in.
                 const VkBuffer a = s.act.handle, w = s.wgt.handle;
                 nrvk::Context::Image surf1 = s.surf1;
-                d.pre[0] = kernel_set(dev, d.pool, *plain_pre, {a, a, w, w, w, a}, {&cim});
+                d.pre[0] = kernel_set(dev, d.pool, *plain_pre, {a, a, w, w, w, s.noise_buf.handle}, {&cim});
                 d.post[0] = kernel_set(dev, d.pool, *plain_post, {a, a, w, w, w}, {&surf0, &surf1, &cim});
                 ok = d.pre[0] && d.post[0];
             } else {
             // One pass: this parity's ping-pong pre and post. More (no ping-pong, `c` 0): the pre and post
             // every pass runs, the model's write going to surf1 as in their own sets.
-            const nrvk::Kernel& pre_k = t.pingpong ? t.pre_pp[c] : t.pre;
-            const nrvk::Kernel& post_k = t.pingpong ? t.post_pp[c] : t.post;
+            // this recording's history pair (c read, cw written; Temporal::hread / hwrite), its sets in [0]
+            const nrvk::Kernel& pre_k = t.pingpong ? pre_for(c, cw) : t.pre;
+            const nrvk::Kernel& post_k = t.pingpong ? post_for(c, cw, false) : t.post;
             nrvk::Context::Image surf1 = s.surf1;
-            nrvk::Context::Image* written = t.pingpong ? &t.hist_store[c ^ 1u] : &surf1;
-            d.pre[c] = t.hp ? kernel_set(dev, d.pool, pre_k, t.pre_buffers, {&cim, &mim, &t.hist(c), &dim, &t.hpass})
+            nrvk::Context::Image hw = t.pingpong ? t.hist(cw) : surf1;
+            hw.sampler = t.pingpong ? VK_NULL_HANDLE : hw.sampler;
+            nrvk::Context::Image* written = t.pingpong ? &hw : &surf1;
+            d.pre[0] = t.hp ? kernel_set(dev, d.pool, pre_k, t.pre_buffers, {&cim, &mim, &t.hist(c), &dim, &t.hpass})
                             : kernel_set(dev, d.pool, pre_k, t.pre_buffers, {&cim, &mim, &t.hist(c), &dim});
-            d.post[c] = t.hp ? kernel_set(dev, d.pool, post_k, t.post_buffers,
+            d.post[0] = t.hp ? kernel_set(dev, d.pool, post_k, t.post_buffers,
                                           {&surf0, written, &cim, &mim, &t.hist(c), &t.hpass})
                              : kernel_set(dev, d.pool, post_k, t.post_buffers,
                                           {&surf0, written, &cim, &mim, &t.hist(c)});
-            ok = d.pre[c] && d.post[c];
+            ok = d.pre[0] && d.post[0];
             }
         }
         if (!ok) {
             direct_slot_release(d);
+        d.gpu = nr::gpu::current();
             // Whichever view could not be made stops being tried; a set that
             // could not be written (both views made) stops both.
             if (colour && (!colour_ok || motion_ok)) direct_src_failed = true;
@@ -1031,6 +1323,7 @@ struct Runtime::Impl {
         if (!s.ctx.device) return;
         for (auto& d : direct_ring) {
             direct_slot_release(d);
+        d.gpu = nr::gpu::current();
             if (d.pool) vkDestroyDescriptorPool(s.ctx.device, d.pool, nullptr);
         }
         for (auto& d : depth_ring) {
@@ -1039,35 +1332,10 @@ struct Runtime::Impl {
         }
         if (depth_copy.device) depth_copy.destroy();
         if (alpha.device) alpha.destroy();
-        if (encode.device) encode.destroy();
-        if (transfer_pass.device) transfer_pass.destroy();
-        if (prep_k.device) prep_k.destroy();
-        if (prep_back_k.device) prep_back_k.destroy();
-        if (transfer_prep.device) transfer_prep.destroy();
-        if (prep_keep.handle) session.ctx.destroy(prep_keep);
-        if (prep_state.handle) session.ctx.destroy(prep_state);
-        if (keep.handle) session.ctx.destroy(keep);
-        if (keep_full.handle) session.ctx.destroy(keep_full);
-        if (downscale.device) downscale.destroy();
-        if (taps.handle) session.ctx.destroy(taps);
-        for (auto& f : frame_ring) {
-            if (f.view) vkDestroyImageView(s.ctx.device, f.view, nullptr);
-            if (f.pool) vkDestroyDescriptorPool(s.ctx.device, f.pool, nullptr);
+        for (auto& f : features) {
+            if (f.second.history.handle) session.ctx.destroy(f.second.history);
+            for (auto& p : f.second.estimator_luma) if (p.handle) session.ctx.destroy(p);
         }
-        if (up_result.handle) session.ctx.destroy(up_result);
-        if (upscale_pass.device) upscale_pass.destroy();
-        if (upscale_prep.device) upscale_prep.destroy();
-        if (full_out.handle) session.ctx.destroy(full_out);
-        if (shown_keep.handle) session.ctx.destroy(shown_keep);
-        if (lograt.handle) session.ctx.destroy(lograt);
-        if (cascade_tmp.handle) session.ctx.destroy(cascade_tmp);
-        if (lowpass.handle) session.ctx.destroy(lowpass);
-        if (cascade_lograt.device) cascade_lograt.destroy();
-        if (cascade_blur_h.device) cascade_blur_h.destroy();
-        if (cascade_blur_v.device) cascade_blur_v.destroy();
-        if (cascade_feed.device) cascade_feed.destroy();
-        for (auto& h : history_store) session.ctx.destroy(h);
-        for (auto& f : features) if (f.second.history.handle) session.ctx.destroy(f.second.history);
         for (auto& r : retiring) if (r.first.handle) session.ctx.destroy(r.first);
         if (mask_pre.device) mask_pre.destroy();
         if (post_grade.device) post_grade.destroy();
@@ -1084,6 +1352,11 @@ struct Runtime::Impl {
         s.ctx.destroy(mask_rect);
         if (s.runner.ctx) s.runner.destroy();
         for (auto& entry : s.kern) if (entry.second.device) entry.second.destroy();
+        for (VkDescriptorPool p : retired_pools) vkDestroyDescriptorPool(s.ctx.device, p, nullptr);
+        for (auto& im : retired_images) s.ctx.destroy(im);
+        if (s.noise_fill.device) s.noise_fill.destroy();
+        for (auto& b : retired_buffers) s.ctx.destroy(b);
+        s.ctx.destroy(s.noise_buf);
         s.ctx.destroy(s.tex_in); s.ctx.destroy(s.surf0); s.ctx.destroy(s.surf1);
         s.ctx.destroy(encoded);
         // The arenas go with the last runtime that uses them (NrSession::arenas, the resize path).
@@ -1092,94 +1365,17 @@ struct Runtime::Impl {
         // Do not destroy the host's instance, device or queue.
     }
 
-    // One pass's resolved model controls. A later pass inherits pass 1 with the
-    // tone zeroed - that is what the original's own hosts do, and re-applying
-    // the tone control every pass compounds it (x1.052 -> x1.102 -> x1.136 over
-    // three) - unless the caller gave that pass its own set.
+    // The pass's resolved model controls.
     struct Resolved { int style; float intensity, tone, structure, skin_in; bool mask; };
 
-    Resolved resolve_pass(const Controls& c, uint32_t pass) const {
-        Resolved r{c.style, c.intensity, c.local_tone, c.local_structure, c.skin_structure,
-                   c.automatic_mask};
-        if (pass == 0) return r;
-        if (!cascade_detail) r.tone = 0.0f;
-        const size_t k = size_t(pass) - 1;
-        if (k < c.per_pass.size() && c.per_pass[k].used) {
-            const PassControls& o = c.per_pass[k];
-            r.style = o.style; r.intensity = o.intensity; r.tone = o.local_tone;
-            r.structure = o.local_structure; r.skin_in = o.skin_structure; r.mask = o.automatic_mask;
-        }
-        return r;
-    }
-
-    // Which dispatches carry a control at all. Everything else uses pass 1's
-    // push, so a later pass costs four small blobs rather than a copy of the
-    // whole table.
-    static bool carries_controls(const std::string& kern) {
-        return kern.rfind("fswinimagepreds32", 0) == 0 || kern.rfind("imgin", 0) == 0 ||
-               kern == "fswinimagepost32" || kern.rfind("imgout", 0) == 0;
-    }
-
     void patch_push(std::vector<uint8_t>& blob, const std::string& kern, const Resolved& r) const {
-        const float skin = r.mask ? (r.skin_in < 0 ? r.structure : r.skin_in) : -1.0f;
-        const float background = r.mask ? r.structure : -1.0f;
-        if (kern.rfind("fswinimagepreds32", 0) == 0) {
-            PushPreImage p{};
-            std::memcpy(&p, blob.data() + sizeof(PushFSwin), sizeof p);
-            p.style = float(r.style) / 128; p.tone = r.tone;
-            p.structure = r.mask ? 1 : r.structure;
-            p.skin = skin; p.other = background;
-            std::memcpy(blob.data() + sizeof(PushFSwin), &p, sizeof p);
-        } else if (kern.rfind("imgin", 0) == 0) {
-            PushImgIn p{}; std::memcpy(&p, blob.data(), sizeof p);
-            p.s434 = float(r.style) / 128; p.aux0 = r.tone;
-            p.aux1 = r.mask ? 1 : r.structure;
-            p.gate0 = skin; p.gate1 = background;
-            std::memcpy(blob.data(), &p, sizeof p);
-        } else if (kern == "fswinimagepost32") {
-            constexpr size_t offset = sizeof(PushFSwin) + sizeof(PushUps);
-            PushImageTail p{}; std::memcpy(&p, blob.data() + offset, sizeof p);
-            // Native compose (the OptiScaler and ReShade routes): the fused
-            // tail's own blend IS the DLL's post-block Intensity. **Not clamped
-            // to 1**: that clamp came from one post variant's `sat(Intensity)`
-            // in the PTX, which governs that variant's lerp and not the
-            // control - the DLL copies Intensity out of its settings
-            // unsaturated (18001cf07) and the Toolkit documents 0..2. The tail
-            // takes 0..1 as the lerp and past it as a luminance-ratio power;
-            // see windows/shaders/rdna4/fswin_t.comp.
-            // Every route, every pass: each pass carries its own Intensity
-            // into this blend, as each OptiScaler DLSS-NR pass is its own DLL
-            // feature with its own Intensity.
-            p.intensity = std::clamp(r.intensity, 0.0f, 2.0f);
-            // Bits 28-29: the Style. For Natural and Cinematic the DLL grades the composed answer after the post
-            // block (cg2r_post_process_kernel); the *_grade post pipelines do the same
-            // (windows/shaders/rdna4/include/nr_style_grade.glsl). Non-zero bits select that pipeline at dispatch;
-            // they stay 0 without it. Controls are checked to 0..2 before they get here; the DLL clamps to its
-            // style count, 3.
-            p.w_off = (p.w_off & 0x0FFFFFFFu) |
-                      (post_alpha ? 0x80000000u | (round_u8 ? 0x40000000u : 0u) : 0u) |
-                      (style_grade && style_grade_on ? uint32_t(std::clamp(r.style, 0, 2)) << 28 : 0u);
-            std::memcpy(blob.data() + offset, &p, sizeof p);
-        } else if (kern.rfind("imgout", 0) == 0) {
-            PushImgOut p{}; std::memcpy(&p, blob.data(), sizeof p);
-            p.nr_intensity = std::clamp(r.intensity, 0.0f, 2.0f);
-            std::memcpy(blob.data(), &p, sizeof p);
-        }
+        patch_push_controls(blob, kern, r.style, r.intensity, r.tone, r.structure, r.skin_in, r.mask, post_alpha, round_u8,
+                            style_grade && style_grade_on);
     }
 
     void controls(const Controls& c) {
-        const uint32_t npass = std::max<uint32_t>(max_passes, 1u);
-        pass_push.assign(npass, {});
-        for (auto& d : session.disp) patch_push(d.push, d.kern, resolve_pass(c, 0));
-        for (uint32_t p = 1; p < npass; ++p) {
-            const Resolved r = resolve_pass(c, p);
-            pass_push[p].assign(session.disp.size(), {});
-            for (size_t i = 0; i < session.disp.size(); ++i) {
-                if (!carries_controls(session.disp[i].kern)) continue;
-                pass_push[p][i] = session.disp[i].push;
-                patch_push(pass_push[p][i], session.disp[i].kern, r);
-            }
-        }
+        const Resolved r{c.style, c.intensity, c.local_tone, c.local_structure, c.skin_structure, c.automatic_mask};
+        for (auto& d : session.disp) patch_push(d.push, d.kern, r);
     }
 };
 
@@ -1217,10 +1413,39 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // development tree has build/ and artifacts/ at its root instead.
     const auto data = std::filesystem::is_directory(root / "dlssnr-amd") ? root / "dlssnr-amd" : root;
     const bool installed = data != root;
+
+    // The network of the GPU's architecture (nr_gpu_arch.hpp); RDNA3's is ACO's machine code only, from the bundle's
+    // rdna3 folder.
+    {
+        std::string why;
+        if (!impl_->session.ctx.set_arch(host.arch, &why)) throw std::runtime_error(why);
+    }
     // The ACO network (nr_pipeline_binary.hpp) needs a device created with pipeline binaries; one that
     // was not (a game's device made before we could add them) builds with the driver's compiler.
     if (!nr::binary::directory().empty() && !nr::binary::enabled(host.device))
         nr::binary::disable("the device was created without pipeline binaries");
+    // The ACO folder is the architecture's own: RDNA3's records are gfx11 code, the bundle's own (RDNA4's) gfx12.
+    switch (host.arch) {
+    case nr::arch::GpuArch::rdna3:
+        if (!nr::binary::directory().empty()) {
+            std::string why;
+            if (!nr::binary::use_rdna3(&why)) nr::binary::disable(why);
+        }
+        if (nr::binary::directory().empty())
+            throw std::runtime_error("this GPU (RDNA3) runs NR as ACO's machine code only, and ACO Mode is off" +
+                                     (nr::binary::disabled_why().empty() ? std::string()
+                                                                         : " (" + nr::binary::disabled_why() + ")"));
+        break;
+    case nr::arch::GpuArch::rdna4: {
+        const std::string d = nr::binary::directory();
+        if (d.size() > 6 && d.compare(d.size() - 6, 6, "/rdna3") == 0)
+            throw std::runtime_error("this GPU (RDNA4) needs the bundle's own ACO network, and the process's ACO folder is "
+                                     "RDNA3's (" + d + ")");
+        break;
+    }
+    case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2:
+        break;   // refused above
+    }
     const std::string aco = nr::binary::directory();
     const auto native_shaders = installed ? data / "shaders" : root / "build";
     const auto network_shaders = !aco.empty() ? std::filesystem::path(aco) / "shaders" : native_shaders;
@@ -1232,45 +1457,93 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         }
         return false;
     };
-    if (!std::isfinite(config.model_scale) || config.model_scale <= 0.f || config.model_scale > 1.f)
-        throw std::invalid_argument("model_scale must be in (0, 1]");
-    if (config.max_passes < 1 || config.max_passes > 16)
-        throw std::invalid_argument("max_passes must be 1..16");
-    // The model extent. At scale 1 it is the frame's own, unaligned, as every
-    // game has run so far; below 1 it is rounded to a multiple of 8 (the
-    // network's tile) and never above the frame.
-    const uint32_t mw = model_extent(config.width, config.model_scale), mh = model_extent(config.height, config.model_scale);
-    impl_->mw = mw; impl_->mh = mh; impl_->scaled = mw != config.width || mh != config.height;
+    // The network runs at the frame's own extent; the composition around it is its callers' (nr_renodx.cpp,
+    // nr_wilsjo2_flow.hpp): the runtime hands back the post block's answer, the DLL's own composition.
+    const uint32_t mw = config.width, mh = config.height;
+    impl_->mw = mw; impl_->mh = mh;
     // The model: the caller's choice over DLSSNR_MODEL over dlssnr-amd.ini [Network] Model; none of them: the
-    // small model. Its weights (dlssnr-small.bin, made by install.ps1 from the 310.9 DLL) are only in an installed
+    // small model. Its weights (CC_SMALL_FP8.bin, made by install.ps1 from the 310.9 DLL) are only in an installed
     // tree; missing: the original model, and the log says why.
     NetworkModel network = NetworkModel::Small;
+    bool experimental = false, optimized = false;
+    // Their SPIR-V: the Linux network's in a dlssnr-amd folder on RDNA4, and on RDNA3 the bundle's own gfx11 builds
+    // (aco/rdna3/experimental/shaders, .../optimized/shaders: the records are aco/rdna3/records, found by hash).
+    const bool aco_rdna3 = host.arch == nr::arch::GpuArch::rdna3 && !aco.empty();
+    const std::filesystem::path xroot = aco_rdna3 ? std::filesystem::path(aco) / "experimental" : data / "experimental";
+    const std::filesystem::path oroot = aco_rdna3 ? std::filesystem::path(aco) / "optimized" : data / "optimized";
+    const std::string x_incomplete = aco_rdna3 ? "dlssnr-amd/aco/rdna3/experimental/ is incomplete"
+                                               : "dlssnr-amd/experimental/ is incomplete";
+    const std::string o_incomplete = aco_rdna3 ? "dlssnr-amd/aco/rdna3/optimized/ is incomplete"
+                                               : "dlssnr-amd/optimized/ is incomplete";
     {
         std::string env;
 #ifdef _WIN32
-        { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", b, sizeof b); if (n && n < sizeof b) env = b; }
+        { char b[64] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", b, sizeof b); if (n && n < sizeof b) env = b; }
 #endif
         if (env.empty()) if (const char* e = std::getenv("DLSSNR_MODEL")) env = e;
         const int ev = env.empty() ? -1 : nr::network_value(env);
-        if (!env.empty() && ev < 0) nr::logf("[nr] DLSSNR_MODEL=%s is not small or original: ignored", env.c_str());
-        const int iv = config.network >= 0 || ev >= 0 ? -1 : nr::ini_network((data.parent_path() / "dlssnr-amd.ini").string());
+        if (!env.empty() && ev < 0) nr::logf("[nr] DLSSNR_MODEL=%s is not a network's codename: ignored", env.c_str());
+        const int iv = config.network >= 0 || ev >= 0 ? -1 : nr::ini_network(writable_ini_file(data.parent_path()));
         const char* from = config.network >= 0 ? "caller" : ev >= 0 ? "DLSSNR_MODEL" : iv >= 0 ? "dlssnr-amd.ini" : "default";
         const int v = config.network >= 0 ? config.network : ev >= 0 ? ev : iv;
         if (v == 0) network = NetworkModel::Original;
         std::error_code ec;
-        const char* missing = network != NetworkModel::Small ? nullptr
+        // CC_SMALL_FP8_EXPERIMENTAL: the small model with its own weights (CC_SMALL_FP8_EXPERIMENTAL.bin, made by
+        // install.ps1 from the small model) and shaders (experimental/shaders: the Linux network's, run as ACO's
+        // machine code - ACO Mode only, as int4 mixed; RDNA3: the bundle's own aco/rdna3/experimental/shaders);
+        // anything missing: the small model.
+        if (v == 2) {
+            const char* missing = !installed ? "not an installed tree"
+                : aco.empty() ? "it needs ACO Mode (a driver with pipeline binaries)"
+                : !std::filesystem::is_regular_file(xroot / "shaders" / "fixed-attention.txt", ec) ||
+                          !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? x_incomplete.c_str()
+                : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8_EXPERIMENTAL.bin", ec)
+                          ? "dlssnr-amd/CC_SMALL_FP8_EXPERIMENTAL.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
+                : nullptr;
+            if (missing) {
+                nr::logf("[nr] CC_SMALL_FP8_EXPERIMENTAL (%s) but %s: CC_SMALL_FP8", from, missing);
+                impl_->network_note = missing;
+            } else {
+                experimental = true;
+            }
+        }
+        // CC_SILVER_AARDWOLD_OPTIMIZED: the 310.8 model with its own weights (CC_SILVER_AARDWOLD_OPTIMIZED.bin, made by install.ps1
+        // from CC_SILVER_AARDWOLD.bin) and shaders (optimized/shaders: the Linux network's, run as ACO's machine code - ACO Mode
+        // only; with its int4 layers int4/, below; RDNA3: the bundle's own aco/rdna3/optimized/shaders);
+        // anything missing: the 310.8 model as it is.
+        if (v == 3) {
+            network = NetworkModel::Original;
+            const char* missing = !installed ? "not an installed tree"
+                : aco.empty() ? "it needs ACO Mode (a driver with pipeline binaries)"
+                : !std::filesystem::is_regular_file(oroot / "shaders" / "fixed-attention.txt", ec) ||
+                          !std::filesystem::is_directory(oroot / "shaders" / "temporal", ec) ? o_incomplete.c_str()
+                : !std::filesystem::is_regular_file(data / "CC_SILVER_AARDWOLD_OPTIMIZED.bin", ec)
+                          ? "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED.bin is missing (run install.ps1 again)"
+                : nullptr;
+            if (missing) {
+                nr::logf("[nr] CC_SILVER_AARDWOLD_OPTIMIZED (%s) but %s: CC_SILVER_AARDWOLD", from, missing);
+                impl_->network_note = missing;
+            } else {
+                optimized = true;
+            }
+        }
+        const char* missing = network != NetworkModel::Small || experimental ? nullptr
             : !installed ? "not an installed tree"
-            : !std::filesystem::is_regular_file(data / "dlssnr-small.bin", ec) ? "dlssnr-amd/dlssnr-small.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
+            : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8.bin", ec) ? "dlssnr-amd/CC_SMALL_FP8.bin is missing (run install.ps1 with the 310.9.16 nvngx_dlssnr.dll)"
             : nullptr;
         if (missing) {
             nr::logf("[nr] small model (%s) but %s: original model", from, missing);
             impl_->network_note = missing;
             network = NetworkModel::Original;
         } else {
-            nr::logf("[nr] %s model (%s)", network == NetworkModel::Small ? "small" : "original", from);
+            nr::logf("[nr] %s model (%s)", network == NetworkModel::Small ? experimental ? "small experimental" : "small"
+                                                                         : optimized ? "original optimized" : "original", from);
         }
+        if (network != NetworkModel::Small) experimental = false;
     }
     impl_->network = network;
+    impl_->experimental = experimental;
+    impl_->optimized = optimized;
     impl_->post_blend_scale = network == NetworkModel::Small ? kPostBlendScaleSmall : kPostBlendScale;
     // [Network] Motion Without Depth = 1, the default: the pre block reads each pixel's own motion vector, as NVIDIA's
     // DLLs (310.8, 310.9) do - their host never binds the depth, so the kernel's nearest-of-five depth pick never runs
@@ -1278,16 +1551,20 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // panning disc with jittered vectors: 43.6 dB, against 33.6 with the pick). 0: the depth picks where the vector
     // is read when there is one.
     {
-        std::string v = nr::ini_network_key((data.parent_path() / "dlssnr-amd.ini").string(), "motion without depth");
+        std::string v = nr::ini_network_key(writable_ini_file(data.parent_path()), "motion without depth");
         for (auto& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
         impl_->motion_without_depth = !(v == "0" || v == "false" || v == "off" || v == "no");
         if (!impl_->motion_without_depth)
             nr::logf("[nr] motion vectors read where the depth picks (dlssnr-amd.ini [Network] Motion Without Depth = 0)");
     }
-    impl_->native_compose = config.native_compose;
-    if (config.native_compose && impl_->scaled)
-        throw std::runtime_error("native_compose needs model_scale 1: the DLL has no transfer pass to resample through");
-    impl_->max_passes = config.max_passes;
+    // [Network] History Precision: 16 (the default) the history images RGBA16F, 32 RGBA32F (live afterwards:
+    // Runtime::set_history_f16). NR_HIST16 in the environment wins.
+    {
+        std::string v = nr::ini_network_key(writable_ini_file(data.parent_path()), "history precision");
+        for (auto& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        impl_->temporal.h16_want = !(v == "32" || v == "fp32" || v == "full" || v == "rgba32f");
+        if (const char* e = std::getenv("NR_HIST16")) impl_->temporal.h16_want = std::atoi(e) != 0;
+    }
     const auto native = make_native_plan(mw, mh, network);
     std::string plan_name = "compiled native descriptor";
     if (!config.plan.empty()) {
@@ -1302,7 +1579,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             }
             return result;
         };
-        std::ifstream provided(path); std::istringstream expected(native.text);
+        std::ifstream provided(nr::u8::path(path)); std::istringstream expected(native.text);
         if (!provided || tokens(provided) != tokens(expected))
             throw std::invalid_argument("explicit plan does not match native source-sized descriptor plan");
         plan_name = path.string();
@@ -1341,47 +1618,65 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         if (sl.images && sl.images->region_cap < want)
             sl.px_unfit = std::max(sl.px_unfit, double(config.width) * double(config.height));
         if (sl.images && sl.bytes_per_px > 0 && sl.images->region_cap >= want) {
-            const uint32_t r = sl.next_region;
-            sl.next_region ^= 1u;
-            sl.images->gen[r] += 1; sl.images->cursor[r] = 0; sl.images->need[r] = 0;
-            impl_->heap = sl.images; impl_->heap_region = r; impl_->heap_gen = sl.images->gen[r];
-            s.ctx.heap = sl.images.get(); s.ctx.heap_region = r;
+            uint32_t r = sl.next_region;
+            if (!sl.images->uses[r].ready()) r ^= 1u;
+            if (sl.images->uses[r].ready()) {
+                sl.next_region = r ^ 1u;
+                sl.images->gen[r] += 1; sl.images->cursor[r] = 0; sl.images->need[r] = 0;
+                impl_->heap = sl.images; impl_->heap_region = r; impl_->heap_gen = sl.images->gen[r];
+                s.ctx.heap = sl.images.get(); s.ctx.heap_region = r;
+            } // Both regions retained: allocate this runtime's images separately.
         }
     }
     s.ctx.require_matrix_config();
 #if NR_INT4
-    // int4_mixed ([Int4Mixed] in dlssnr-amd.ini; DLSSNR_INT4 wins over the ini, the caller's choice - the in-game
-    // switch - over both). Installed, it needs dlssnr-amd/int4/ (shaders, quantisers, settings.txt), the weights the
-    // installer made (dlssnr-amd/dlssnr-int4.bin) and ACO Mode enabled on a device supporting VK_KHR_pipeline_binary;
-    // anything missing: the default network, and the log says why.
+    // CC_SILVER_AARDWOLD_OPTIMIZED's level of optimized layers (the caller's choice - the in-game switch - over
+    // DLSSNR_INT4 over dlssnr-amd.ini [Network] OptimizedLayers; none of them: Ultra Performance). Balanced, Performance and Ultra
+    // Performance run int4 layers; installed, they need their data directory (int4/, int4-performance/, int4-ultra/:
+    // shaders, quantisers, settings.txt), the int4 weights the installer made (CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin, one file for the three:
+    // their int4 layers' FP8 weights are the same; Ultra Performance's tables cover the others'), Performance and Ultra
+    // Performance their own FP8 weights for some layers (the "performance/" entries of the optimized pack) and ACO Mode
+    // enabled on a device supporting VK_KHR_pipeline_binary; anything missing: Quality, and the log says why. RDNA3
+    // runs them as the bundle's gfx11 int4 records (the iu4 WMMA rewrite of NR_I4_MMA2 pairs made with the records).
     bool int4 = false;
     std::string int4_env;
 #ifdef _WIN32
     { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_INT4", b, sizeof b); if (n && n < sizeof b) int4_env = b; }
 #endif
     if (int4_env.empty()) if (const char* e = std::getenv("DLSSNR_INT4")) int4_env = e;
-    if (config.int4_mixed >= 0) int4_env = config.int4_mixed ? "1" : "0";
-    const char* int4_from = config.int4_mixed >= 0 ? "switch" : int4_env.empty() ? "dlssnr-amd.ini" : "DLSSNR_INT4";
-    if (int4_env.empty()) {
-        // no Enabled: on (nr_ini_int4.hpp) - but only an installed tree has int4 data; a development tree stays off
-        const int iv = nr::ini_int4((data.parent_path() / "dlssnr-amd.ini").string()).enabled;
-        int4_env = iv == 0 ? "0" : iv == 1 || installed ? "1" : "";
+    const char* int4_from = config.layers >= 0 ? "switch" : int4_env.empty() ? "dlssnr-amd.ini" : "DLSSNR_INT4";
+    int level = config.layers >= 0 ? config.layers : nr::optimized_layers_value(int4_env);
+    if (config.layers < 0 && int4_env.empty()) {
+        // no OptimizedLayers: Ultra Performance (nr_ini_int4.hpp) - but only an installed tree has int4 data; a development
+        // tree stays at Quality
+        const int iv = nr::ini_optimized_layers(writable_ini_file(data.parent_path()));
+        level = iv >= 0 ? iv : installed ? nr::kLayersDefault : nr::kLayersQuality;
     }
-    // What the build reads for int4 (nr_build_cfg.hpp): installed, only this map - empty for the default network, so
+    if (level < 0) level = nr::kLayersQuality;   // DLSSNR_INT4 neither a level nor a level's word
+    // What the build reads for int4 (nr_build_cfg.hpp): installed, only this map - empty without int4 layers, so
     // nothing in the environment reaches it; a development tree keeps reading the environment.
     std::map<std::string, std::string> int4_cfg;
-    const std::filesystem::path i4root = data / "int4";
-    if (int4_env == "1") {
+    const std::filesystem::path i4root = data / (level == nr::kLayersPerformance ? "int4-performance"
+                                                 : level == nr::kLayersUltra ? "int4-ultra" : "int4");
+    // The int4 levels' SPIR-V: the Linux network's in i4root/shaders on RDNA4; on RDNA3 the bundle's own gfx11 builds
+    // (aco/rdna3/<int4 | int4-performance | int4-ultra>/shaders, stand-ins naming their records in aco/rdna3/int4/
+    // records). The tables (vit/, swin/, settings.txt) are i4root's on both: the same int4 network.
+    const std::filesystem::path i4spv = (aco_rdna3 ? std::filesystem::path(aco) / i4root.filename() : i4root) / "shaders";
+    const std::filesystem::path i4weights = data / "CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin";
+    if (level >= nr::kLayersBalanced && (optimized || !installed)) {
         std::error_code ec;
-        const char* missing = network == NetworkModel::Small ? "the small model has no int4 network"
+        const std::string incomplete = "dlssnr-amd/" + i4root.filename().string() + "/ is incomplete";
+        const std::string no_weights = "dlssnr-amd/" + i4weights.filename().string() + " is missing (run install.ps1 again)";
+        const char* missing = network == NetworkModel::Small ? "the small model has no int4 layers"
             : !installed ? "not an installed tree"
-            : !std::filesystem::is_directory(i4root / "shaders" / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
-                      !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? "dlssnr-amd/int4/ is incomplete"
-            : !std::filesystem::is_regular_file(data / "dlssnr-int4.bin", ec) ? "dlssnr-amd/dlssnr-int4.bin is missing (run install.ps1 again)"
+            : !std::filesystem::is_directory(i4spv / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
+                      !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? incomplete.c_str()
+            : !std::filesystem::is_regular_file(i4weights, ec) ? no_weights.c_str()
             : nr::binary::directory().empty() || !nr::binary::enabled(host.device) ? "ACO Mode is off or pipeline binaries are unavailable"
             : nullptr;
         if (missing) {
-            nr::logf("[nr] int4_mixed requested (%s) but %s: default network", int4_from, missing);
+            nr::logf("[nr] optimized layers %s requested (%s) but %s: CC_SILVER_AARDWOLD_OPTIMIZED at quality",
+                     nr::layers_word(level), int4_from, missing);
             impl_->network_note = missing;
         } else {
             if (!std::filesystem::is_directory(std::filesystem::path(aco) / "int4/records", ec))
@@ -1389,16 +1684,19 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             int4 = true;
             int4_cfg["NR_I4_DIR"] = (i4root / "vit").string();
             if (std::filesystem::is_directory(i4root / "swin", ec)) int4_cfg["NR_SWI4_DIR"] = (i4root / "swin").string();
-            int4_cfg["NR_I4_WEIGHTS"] = (data / "dlssnr-int4.bin").string();
+            int4_cfg["NR_I4_WEIGHTS"] = i4weights.string();
             // the rewritten pipeline binaries (nrvk.hpp create_iu4), keyed by driver like pipeline.cache
-            std::filesystem::create_directories(i4root / "pipeline-binaries", ec);
-            if (!ec) int4_cfg["NR_I4_CACHE"] = (i4root / "pipeline-binaries").string();
+            const std::filesystem::path cache_data = writable_cache_base(data);
+            const std::filesystem::path cache_i4 = (cache_data == data) ? i4root : (cache_data / i4root.filename());
+            std::filesystem::create_directories(cache_i4 / "pipeline-binaries", ec);
+            if (!ec) int4_cfg["NR_I4_CACHE"] = (cache_i4 / "pipeline-binaries").string();
             const auto t = slurp((i4root / "settings.txt").string());
             nr::int4_settings(std::string(t.begin(), t.end()), int4_cfg);
-            nr::logf("[nr] int4_mixed network (%s)", int4_from);
+            nr::logf("[nr] CC_SILVER_AARDWOLD_OPTIMIZED (layers: %s) (%s)", nr::layers_word(level), int4_from);
         }
     }
-    impl_->int4_mixed = int4;
+    impl_->int4 = int4;
+    impl_->layers = int4 ? level : nr::kLayersQuality;
 #endif
     // Where the pass's own cost is measured. Two queries per ring slot. A queue
     // family is allowed to report no timestamp bits - then there is no pool, and
@@ -1407,7 +1705,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
         impl_->split_timing = true;
-        impl_->timing_stride = 2 + 2 * config.max_passes;
+        impl_->timing_stride = 4;   // the whole recording's pair, the network's pair
         qi.queryCount = Impl::kTimingSlots * impl_->timing_stride;
         if (vkCreateQueryPool(s.ctx.device, &qi, nullptr, &impl_->timing) == VK_SUCCESS) {
             impl_->timing_ok = true;
@@ -1421,31 +1719,64 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         const char* e = std::getenv("NR_ARENA_REUSE");
         return e && *e ? std::atoi(e) != 0 : kArenaReuseDefault;
     };
+    const std::filesystem::path cache_data = installed ? writable_cache_base(data) : data;
+    const std::filesystem::path cache_file = installed
+        ? (cache_data / "pipeline.cache")
+        : (writable_cache_base(root) / "dlssnr-amd.pipelinecache");
+    {
+        std::error_code cec;
+        std::filesystem::create_directories(cache_file.parent_path(), cec);
+    }
     std::vector<std::string> arguments = {"nr_runtime", "--plan", plan_name,
         "--unpacked", (installed ? data / "model" : root / "artifacts").string(),
         "--spv-dir", network_shaders.string(),
         "--host-boundary", arena_reuse() ? "--reuse" : "--no-reuse", "--source-width", std::to_string(mw),
         "--source-height", std::to_string(mh), "--accumulation", config.accumulation,
-        "--pipeline-cache", (installed ? data / "pipeline.cache" : root / "dlssnr-amd.pipelinecache").string()};
-#if NR_INT4
-    if (int4)   // the int4 network: its own shaders and its own pipeline cache
+        "--pipeline-cache", cache_file.string(),
+        "--lazy-images"};
+    if (experimental || optimized) {   // CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD_OPTIMIZED: their own shaders (ACO SPIR-V: kept with ACO Mode on) and pipeline caches
+        const std::filesystem::path& var_root = experimental ? xroot : oroot;
+        const std::filesystem::path var_cache = ((cache_data == data) ? var_root : (cache_data / var_root.filename())) / "pipeline.cache";
+        std::error_code cec;
+        std::filesystem::create_directories(var_cache.parent_path(), cec);
         for (size_t i = 0; i + 1 < arguments.size(); ++i) {
-            if (arguments[i] == "--spv-dir") arguments[i + 1] = (i4root / "shaders").string();
-            if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (i4root / "pipeline.cache").string();
+            if (arguments[i] == "--spv-dir") arguments[i + 1] = (var_root / "shaders").string();
+            if (arguments[i] == "--pipeline-cache") arguments[i + 1] = var_cache.string();
         }
+        arguments.push_back("--spv-dir-aco");
+    }
+#if NR_INT4
+    if (int4) {   // with the int4 layers: their own shaders and pipeline cache
+        const std::filesystem::path i4_cache = ((cache_data == data) ? i4root : (cache_data / i4root.filename())) / "pipeline.cache";
+        std::error_code cec;
+        std::filesystem::create_directories(i4_cache.parent_path(), cec);
+        for (size_t i = 0; i + 1 < arguments.size(); ++i) {
+            if (arguments[i] == "--spv-dir") arguments[i + 1] = i4spv.string();
+            if (arguments[i] == "--pipeline-cache") arguments[i + 1] = i4_cache.string();
+        }
+    }
 #endif
     // The weights as one file (windows/build/pack_model.py); the names inside are
     // the relative paths the graph asks for under --unpacked.
+#if NR_INT4
+    const bool perf_pack = int4 && impl_->layers >= nr::kLayersPerformance;   // Performance / Ultra Performance: the
+                                                                              // pack's "performance/" entries
+#else
+    const bool perf_pack = false;
+#endif
     if (installed) {
-        const auto pack = data / (network == NetworkModel::Small ? "dlssnr-small.bin" : "dlssnr.bin");
+        const auto pack = data / (experimental ? "CC_SMALL_FP8_EXPERIMENTAL.bin"
+                                  : optimized ? "CC_SILVER_AARDWOLD_OPTIMIZED.bin"
+                                  : network == NetworkModel::Small ? "CC_SMALL_FP8.bin" : "CC_SILVER_AARDWOLD.bin");
         if (!std::filesystem::is_regular_file(pack))
             throw std::runtime_error("missing " + pack.string() + " (run install.ps1 again)");
         arguments.push_back("--model-pack"); arguments.push_back(pack.string());
+        if (optimized && perf_pack) { arguments.push_back("--model-pack-variant"); arguments.push_back("performance"); }
     }
     // One pass at the frame's own extent, not linear: every kernel only samples
     // the input image, so it can be the frame's own format filled by a copy.
-    // Sampling converts exactly as the blit into RGBA32F did (the blit is a
-    // sampling shader too) - the same values for a quarter of the bytes, and
+    // Sampling matched the RGBA32F blit in the tested input formats on RDNA4
+    // (the blit is a sampling shader too), with a quarter of the bytes and
     // no conversion pass. Anything else keeps RGBA32F: later passes copy their
     // answer into it, and the linear path writes it as storage.
     {
@@ -1453,9 +1784,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         VkFormatProperties fp{};
         vkGetPhysicalDeviceFormatProperties(host.physical, in_format, &fp);
         const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-        impl_->direct_in = NR_DIRECT_IN && transfer != Transfer::Identical && !impl_->scaled &&
-                           !config.linear_input && !config.preprocess && config.max_passes == 1 &&
-                           mask_config.width == 0 &&
+        impl_->direct_in = NR_DIRECT_IN && transfer != Transfer::Identical && mask_config.width == 0 &&
                            (fp.optimalTilingFeatures & need) == need;
         if (impl_->direct_in) {
             arguments.push_back("--tex-in-format");
@@ -1475,7 +1804,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         VkFormatProperties3 f3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
         VkFormatProperties2 f2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &f3};
         vkGetPhysicalDeviceFormatProperties2(host.physical, unorm, &f2);
-        impl_->direct_out = NR_DIRECT_OUT && NR_POST_ALPHA && impl_->direct_in && config.native_compose && store_matches_blit &&
+        impl_->direct_out = NR_DIRECT_OUT && NR_POST_ALPHA && impl_->direct_in && store_matches_blit &&
                             mask_config.width == 0 &&
                             (f3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT) &&
                             (f3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT);
@@ -1491,13 +1820,21 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // built with these same arguments but for the source extent, and this model.
     {
         // The colour format only sizes the input and answer images (the kernels sample one and store into the other
-        // without a format), so a network serves frames of another format too: a game that switches its colour
-        // buffer between R11G11B10 and RGBA16F at camera cuts (FF7 Rebirth) gets a runtime from the same network.
-        std::vector<std::string> same = arguments;
-        for (size_t i = 0; i + 1 < same.size(); ++i)
-            if (same[i] == "--source-width" || same[i] == "--source-height" || same[i] == "--tex-in-format" ||
-                same[i] == "--out0-format")
-                same[i + 1].clear();
+        // without a format; the 8-bit rounding is a push constant), so a network serves frames of another format too:
+        // a game that switches its colour buffer between R11G11B10 and RGBA16F at camera cuts (FF7 Rebirth) gets a
+        // runtime from the same network, and so does a layer whose network input turns RGBA32F ([Preprocess] on a
+        // wilsjo2 layer: no --tex-in-format / --out0-format at all then). The source extent's values are left out,
+        // the two format arguments whole.
+        std::vector<std::string> same;
+        for (size_t i = 0; i < arguments.size(); ++i) {
+            const bool sized = i + 1 < arguments.size() &&
+                               (arguments[i] == "--source-width" || arguments[i] == "--source-height");
+            const bool format = i + 1 < arguments.size() &&
+                                (arguments[i] == "--tex-in-format" || arguments[i] == "--out0-format");
+            if (format) { ++i; continue; }
+            same.push_back(arguments[i]);
+            if (sized) { same.push_back(""); ++i; }
+        }
         if (config.share) {
             const RuntimeCore& c = *config.share;
             if (c.arguments == same && c.network == network && c.work_w == native.width && c.work_h == native.height &&
@@ -1513,7 +1850,6 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         impl_->share_arguments = std::move(same);
     }
     impl_->work_w = native.width; impl_->work_h = native.height;
-    impl_->model_scale = config.model_scale;
     std::vector<char*> argv;
     for (auto& a : arguments) argv.push_back(a.data());
     timer.mark("device");
@@ -1537,230 +1873,14 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // The runtime passes are the driver's compile in either case (the ACO bundle's are the same SPIR-V).
     const auto adapters = std::filesystem::canonical(config.adapter_shaders.empty()
         ? native_shaders / "runtime" : std::filesystem::path(config.adapter_shaders));
+    nrvk::set_compute_blit_spirv((adapters / "runtime_blit.spv").string());   // (nrvk::blit on compute-only lists)
     if (!inside(adapters))
         throw std::invalid_argument("adapter shaders must be inside NR root");
-    if (impl_->scaled) {
-        if (mask_config.width) throw std::invalid_argument("the control mask path does not support model_scale below 1");
-        // The downscale is a blit from the RGBA32F keep; linear filtering on a
-        // 32-bit float format is a feature bit, not a given.
-        VkFormatProperties fp{}; vkGetPhysicalDeviceFormatProperties(host.physical, VK_FORMAT_R32G32B32A32_SFLOAT, &fp);
-        impl_->downscale_filter = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
-            ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        // The frame kept in its own format (Impl::keep_native) for the formats whose texelFetch is
-        // the blit's own conversion; the store into it where that store is the blit's conversion
-        // too (the formats the post block's own store covers, see direct_out below).
-        // NR_KEEP_RGBA32F=1: the RGBA32F keep and the blits, as before.
-        const VkFormat keep_format = transfer == Transfer::Encoded ? unorm : config.colour_format;
-        const VkFormat cf = config.colour_format;
-        const bool listed = transfer == Transfer::Encoded || cf == VK_FORMAT_R8G8B8A8_UNORM ||
-            cf == VK_FORMAT_B8G8R8A8_UNORM || cf == VK_FORMAT_R16G16B16A16_SFLOAT || cf == VK_FORMAT_R16G16B16A16_UNORM ||
-            cf == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || cf == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ||
-            cf == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-        const bool store_listed = impl_->round_u8 || cf == VK_FORMAT_R16G16B16A16_SFLOAT ||
-            cf == VK_FORMAT_R16G16B16A16_UNORM || cf == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-        VkFormatProperties3 k3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
-        VkFormatProperties2 k2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &k3};
-        vkGetPhysicalDeviceFormatProperties2(host.physical, keep_format, &k2);
-        const VkFormatFeatureFlags2 kf = k3.optimalTilingFeatures;
-        const char* old_keep = std::getenv("NR_KEEP_RGBA32F");
-        impl_->keep_native = !(old_keep && std::atoi(old_keep)) && listed && impl_->downscale_filter == VK_FILTER_LINEAR &&
-            s.tex_in.format == VK_FORMAT_R32G32B32A32_SFLOAT && (kf & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT) &&
-            (kf & VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT) && (kf & VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT);
-        impl_->store_native = impl_->keep_native && store_listed && (kf & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT) &&
-            (kf & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT);
-        impl_->keep_full = s.ctx.image(config.width, config.height,
-                                       impl_->keep_native ? keep_format : VK_FORMAT_R32G32B32A32_SFLOAT, true, true,
-                                       !impl_->keep_native || impl_->store_native);
-        s.ctx.transition(impl_->keep_full, VK_IMAGE_LAYOUT_GENERAL);
-        if (!impl_->store_native) {
-            impl_->full_out = s.ctx.image(config.width, config.height, VK_FORMAT_R32G32B32A32_SFLOAT, false);
-            s.ctx.transition(impl_->full_out, VK_IMAGE_LAYOUT_GENERAL);
-        }
-        impl_->up_result = s.ctx.image(config.width, config.height, VK_FORMAT_R32G32B32A32_SFLOAT, false);
-        s.ctx.transition(impl_->up_result, VK_IMAGE_LAYOUT_GENERAL);
-        if (impl_->keep_native) {
-            // Where the blit samples: a frame-sized probe holding each texel's column and row,
-            // blitted down as the frame would be, read back into `taps` on the GPU. Frame and
-            // model sized RGBA32F for the length of one submission.
-            const uint32_t W = config.width, H = config.height;
-            impl_->taps = s.ctx.buffer(VkDeviceSize(mw + mh) * 8);
-            auto probe = s.ctx.image(W, H, VK_FORMAT_R32G32B32A32_SFLOAT, false, false);
-            auto probed = s.ctx.image(mw, mh, VK_FORMAT_R32G32B32A32_SFLOAT, false, false);
-            probe.layout = probed.layout = VK_IMAGE_LAYOUT_GENERAL;
-            nrvk::Kernel taps_k;
-            taps_k.create(s.ctx, (adapters / "runtime_taps.spv").string(), {impl_->taps.handle}, 12, {&probe, &probed});
-            s.ctx.one_shot([&](VkCommandBuffer cmd) {
-                barrier(cmd, probe.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
-                const uint32_t fill[] = {W, H, 0u};
-                dispatch(cmd, taps_k, (W + 63) / 64, H, 1, fill, sizeof fill);
-                barrier(cmd, probe.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-                barrier(cmd, probed.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-                VkImageBlit down{};
-                down.srcSubresource = down.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                down.srcOffsets[1] = {int32_t(W), int32_t(H), 1};
-                down.dstOffsets[1] = {int32_t(mw), int32_t(mh), 1};
-                vkCmdBlitImage(cmd, probe.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               probed.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &down, impl_->downscale_filter);
-                barrier(cmd, probed.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-                const uint32_t read[] = {mw, mh, 1u};
-                dispatch(cmd, taps_k, (mw + mh + 63) / 64, 1, 1, read, sizeof read);
-                compute_barrier(cmd);
-            });
-            taps_k.destroy();
-            s.ctx.destroy(probe); s.ctx.destroy(probed);
-            nrvk::Context::Image tex_in_storage = s.tex_in;
-            tex_in_storage.sampler = VK_NULL_HANDLE;
-            tex_in_storage.layout = VK_IMAGE_LAYOUT_GENERAL;
-            impl_->downscale.create(s.ctx, (adapters / "runtime_downscale.spv").string(), {impl_->taps.handle}, 8,
-                                    {&impl_->keep_full, &tex_in_storage});
-        }
-        nr::logf("[nr] Model resolution %ux%u: frame kept %s, answer %s", mw, mh,
-                 impl_->keep_native ? "in its own format" : "as RGBA32F",
-                 impl_->store_native ? "stored in its own format" : "RGBA32F, converted on the way back");
-    }
-    // At the frame's extent, one pass, the input copied in the frame's own format (direct_in), no
-    // native compose: the transfer pass stores the answer in that format too, into keep_full, with the
-    // alpha pass's rounding (store_native, as below 100%), so there is no alpha pass and the write-back
-    // is a copy. The formats whose store is the write-back blit's own conversion (direct_out's).
-    // NR_UNSCALED_STORE=0: the RGBA32F answer, the alpha pass and the blit, as before.
-    if (!impl_->scaled && impl_->direct_in && !config.native_compose && config.max_passes == 1 &&
-        !config.linear_input && !config.preprocess && !mask_config.width) {
-        const char* env = std::getenv("NR_UNSCALED_STORE");
-        const VkFormat cf = config.colour_format;
-        const VkFormat keep_format = transfer == Transfer::Encoded ? unorm : cf;
-        const bool listed = impl_->round_u8 || cf == VK_FORMAT_R16G16B16A16_SFLOAT ||
-            cf == VK_FORMAT_R16G16B16A16_UNORM || cf == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-        VkFormatProperties3 k3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
-        VkFormatProperties2 k2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &k3};
-        vkGetPhysicalDeviceFormatProperties2(host.physical, keep_format, &k2);
-        const VkFormatFeatureFlags2 kf = k3.optimalTilingFeatures;
-        if (!(env && !std::atoi(env)) && listed && (kf & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT) &&
-            (kf & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT) && (kf & VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT)) {
-            impl_->store_native = true;
-            impl_->keep_full = s.ctx.image(config.width, config.height, keep_format, true, true, true);
-            s.ctx.transition(impl_->keep_full, VK_IMAGE_LAYOUT_GENERAL);
-            nr::logf("[nr] answer stored in the frame's format by the transfer pass: no alpha pass, write-back copied");
-        }
-    }
-    if (config.max_passes > 1) {
-        if (mask_config.width) throw std::invalid_argument("the control mask path does not support more than one pass");
-        impl_->shown_keep = s.ctx.image(mw, mh, VK_FORMAT_R32G32B32A32_SFLOAT, true);
-        s.ctx.transition(impl_->shown_keep, VK_IMAGE_LAYOUT_GENERAL);
-        if (config.cascade_detail_only) {
-            impl_->cascade_detail = true;
-            impl_->cascade_radius = std::max(4, int(mh / 60));
-            for (auto* im : {&impl_->lograt, &impl_->cascade_tmp, &impl_->lowpass}) {
-                *im = s.ctx.image(mw, mh, VK_FORMAT_R32_SFLOAT, false);
-                s.ctx.transition(*im, VK_IMAGE_LAYOUT_GENERAL);
-            }
-            nrvk::Context::Image tex_in_storage = s.tex_in;
-            tex_in_storage.sampler = VK_NULL_HANDLE;
-            tex_in_storage.layout = VK_IMAGE_LAYOUT_GENERAL;
-            impl_->cascade_lograt.create(s.ctx, (adapters / "cascade_lograt.spv").string(), {}, 12,
-                                         {&s.surf0, &impl_->shown_keep, &impl_->lograt});
-            impl_->cascade_blur_h.create(s.ctx, (adapters / "cascade_blur.spv").string(), {}, 16,
-                                         {&impl_->lograt, &impl_->cascade_tmp});
-            impl_->cascade_blur_v.create(s.ctx, (adapters / "cascade_blur.spv").string(), {}, 16,
-                                         {&impl_->cascade_tmp, &impl_->lowpass});
-            impl_->cascade_feed.create(s.ctx, (adapters / "cascade_feed.spv").string(), {}, 12,
-                                       {&impl_->shown_keep, &impl_->lograt, &impl_->lowpass, &tex_in_storage});
-        }
-    }
-    // The alpha pass restores the frame's own alpha onto the answer: the answer
-    // is full_out when scaled, and the frame's alpha lives wherever the frame
-    // was kept.
-    // store_native: the answer is written into keep_full (a storage alias of it).
-    nrvk::Context::Image keep_full_storage = impl_->keep_full;
-    keep_full_storage.sampler = VK_NULL_HANDLE;
-    nrvk::Context::Image* answer = impl_->store_native ? &keep_full_storage : impl_->scaled ? &impl_->full_out : &s.surf0;
-    nrvk::Context::Image* frame_alpha = impl_->scaled ? &impl_->keep_full
-                                        : (config.max_passes > 1 ? &impl_->shown_keep : &s.tex_in);
-    if (!impl_->store_native)
-        impl_->alpha.create(s.ctx, (adapters / "runtime_alpha.spv").string(), {}, 12, {answer, frame_alpha});
-    if (config.linear_input) {
-        impl_->linear = true;
-        impl_->white_point = config.white_point;
-        // Sampled, because the transfer reads it; the encode writes it through
-        // a storage alias (same image and view, no sampler, GENERAL).
-        impl_->keep = s.ctx.image(mw, mh, VK_FORMAT_R32G32B32A32_SFLOAT, true);
-        s.ctx.transition(impl_->keep, VK_IMAGE_LAYOUT_GENERAL);
-        nrvk::Context::Image keep_storage = impl_->keep;
-        keep_storage.sampler = VK_NULL_HANDLE;
-        // tex_in as a storage image, in GENERAL for the one pass that writes it.
-        // Same VkImage and view as the sampled descriptor every kernel reads;
-        // the alias owns nothing and is never destroyed.
-        nrvk::Context::Image tex_in_storage = s.tex_in;
-        tex_in_storage.sampler = VK_NULL_HANDLE;
-        tex_in_storage.layout = VK_IMAGE_LAYOUT_GENERAL;
-        impl_->encode.create(s.ctx, (adapters / "runtime_encode.spv").string(), {}, 16,
-                             {&tex_in_storage, &keep_storage});
-    }
-    // The transfer runs on every frame at the FRAME extent: `result` and
-    // `shown` are model-sized (sampled bilinearly when scaled), `keep` is the
-    // frame as handed over - the full-resolution copy when scaled, the
-    // untouched linear original on the linear path, the frame itself
-    // otherwise - and `out` is the full-resolution answer.
-    const char* const transfer_spv = impl_->store_native ? "runtime_transfer_store.spv" : "runtime_transfer.spv";
-    {
-        nrvk::Context::Image* shown = config.max_passes > 1 ? &impl_->shown_keep : &s.tex_in;
-        nrvk::Context::Image* keep = impl_->scaled ? &impl_->keep_full
-                                     : impl_->linear ? &impl_->keep : shown;
-        // Unscaled, the two enlargement bindings are never read; the model's answer stands in (an
-        // RGBA32F image, as they are declared).
-        nrvk::Context::Image* up_r = impl_->scaled ? &impl_->up_result : &s.surf0;
-        nrvk::Context::Image* up_s = up_r;   // up_shown: never accessed (see Impl::up_result)
-        impl_->transfer_pass.create(s.ctx, (adapters / transfer_spv).string(), {}, sizeof(TransferPush),
-                               {&s.surf0, shown, keep, answer, up_r, up_s});
-        impl_->transfer_binds = {s.surf0, *shown, *keep, *answer, *up_r, *up_s};
-        if (impl_->scaled)
-            impl_->upscale_pass.create(s.ctx, (adapters / "runtime_upscale.spv").string(), {}, 20,
-                                       {&s.surf0, shown, &impl_->up_result, &impl_->up_result});
-    }
-    if (config.preprocess && !mask_config.width) {
-        impl_->prep = true;
-        impl_->prep_unknee = config.preprocess_unknee;
-        impl_->prep_keep = s.ctx.image(mw, mh, VK_FORMAT_R32G32B32A32_SFLOAT, true);
-        s.ctx.transition(impl_->prep_keep, VK_IMAGE_LAYOUT_GENERAL);
-        // Host visible: 16 bytes the log reads (Runtime::preprocess_meter).
-        impl_->prep_state = s.ctx.buffer(16, true);
-        // Storage aliases, as the linear path's: same image and view, no sampler.
-        auto storage = [](const nrvk::Context::Image& im) {
-            nrvk::Context::Image alias = im; alias.sampler = VK_NULL_HANDLE; alias.layout = VK_IMAGE_LAYOUT_GENERAL;
-            return alias;
-        };
-        nrvk::Context::Image tex_in_st = storage(s.tex_in), keep_st = storage(impl_->prep_keep),
-                             surf0_st = storage(s.surf0);
-        const auto spv = (adapters / "runtime_prep.spv").string();
-        impl_->prep_k.create(s.ctx, spv, {impl_->prep_state.handle}, sizeof(PrepPush), {&tex_in_st, &keep_st, &surf0_st});
-        if (config.max_passes > 1) {
-            nrvk::Context::Image shown_st = storage(impl_->shown_keep);
-            impl_->prep_back_k.create(s.ctx, spv, {impl_->prep_state.handle}, sizeof(PrepPush), {&shown_st, &keep_st, &surf0_st});
-        } else if (!config.native_compose) {
-            // One pass: tex_in keeps what the network saw and the transfer pass
-            // reads the frame from prep_keep instead, as `shown` and, when
-            // tex_in was also the frame as handed over, as `keep`.
-            nrvk::Context::Image* keep = impl_->scaled ? &impl_->keep_full
-                                         : impl_->linear ? &impl_->keep : &impl_->prep_keep;
-            nrvk::Context::Image* answer = impl_->store_native ? &keep_full_storage
-                                           : impl_->scaled ? &impl_->full_out : &s.surf0;
-            nrvk::Context::Image* up_r = impl_->scaled ? &impl_->up_result : answer;
-            nrvk::Context::Image* up_s = up_r;
-            impl_->transfer_prep.create(s.ctx, (adapters / transfer_spv).string(), {},
-                                        sizeof(TransferPush), {&s.surf0, &impl_->prep_keep, keep, answer, up_r, up_s});
-            impl_->transfer_prep_binds = {s.surf0, impl_->prep_keep, *keep, *answer, *up_r, *up_s};
-            if (impl_->scaled)
-                impl_->upscale_prep.create(s.ctx, (adapters / "runtime_upscale.spv").string(), {}, 20,
-                                           {&s.surf0, &impl_->prep_keep, &impl_->up_result, &impl_->up_result});
-        }
-    }
+    // The alpha pass restores the frame's own alpha onto the answer (where the post block's own store does not:
+    // the control mask, or a graph without the fused post block).
+    impl_->alpha.create(s.ctx, (adapters / "runtime_alpha.spv").string(), {}, 12, {&s.surf0, &s.tex_in});
     auto require_variant_profile = [&](const std::filesystem::path& directory) {
-        std::ifstream manifest(directory / "shader-constants.txt");
+        std::ifstream manifest(nr::u8::path(directory / "shader-constants.txt"));
         uint32_t profile = 0;
         if (manifest) {
             const auto values = nr::detail::read_shader_manifest(manifest);
@@ -1784,7 +1904,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         if (s.kern.count(pre_name)) {
             impl_->original_pre=&s.kern.at(pre_name);
             k.create(s.ctx,(adapters/"mask_pre_fp32.spv").string(),
-                {s.act.handle,s.act.handle,s.wgt.handle,s.wgt.handle,s.wgt.handle,s.act.handle,impl_->mask_rect.handle},
+                {s.act.handle,s.act.handle,s.wgt.handle,s.wgt.handle,s.wgt.handle,s.noise_buf.handle,impl_->mask_rect.handle},
                 sizeof(PushFSwin)+sizeof(PushPreImage),{&s.tex_in,&impl_->mask_image});
         } else if (s.kern.count("imgin16fast")) {
             impl_->original_pre=&s.kern.at("imgin16fast");
@@ -1819,10 +1939,11 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             ? (!aco.empty() ? std::filesystem::path(aco) / "shaders/temporal"
                : installed ? data / "shaders/temporal" : root / "build/windows/rdna4/network/temporal")
             : std::filesystem::path(temporal_config.shaders));
+        if (experimental) shaders = std::filesystem::canonical(xroot / "shaders" / "temporal");
+        if (optimized) shaders = std::filesystem::canonical(oroot / "shaders" / "temporal");
 #if NR_INT4
-        // The int4 network's temporal pre/post variants are built with its defines (hard-swish, whose scale
-        // NR_HS_FOLDPP folds into the pre/post weights): int4/shaders/temporal, never the default ones.
-        if (int4) shaders = std::filesystem::canonical(i4root / "shaders" / "temporal");
+        // with the int4 layers, the temporal pre/post variants built with their network's defines: int4/shaders/temporal
+        if (int4) shaders = std::filesystem::canonical(i4spv / "temporal");
 #endif
         require_variant_profile(shaders);
         if (!inside(shaders))
@@ -1866,8 +1987,11 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             NRVK_CHECK(vkCreateSampler(s.ctx.device, &si, nullptr, &sampler));
             return sampler;
         };
-        t.h16 = std::getenv("NR_HIST16") && std::atoi(std::getenv("NR_HIST16")) && config.max_passes == 1 &&
-                std::filesystem::exists(shaders / "temporal_post_fp32h16.spv");
+        // (and its Style-grade twin where the RGBA32F one has it, or the grade would go)
+        t.h16_ok = std::filesystem::exists(shaders / "temporal_post_fp32h16.spv") &&
+                   (!std::filesystem::exists(shaders / "temporal_post_fp32_grade.spv") ||
+                    std::filesystem::exists(shaders / "temporal_post_fp32h16_grade.spv"));
+        t.h16 = t.h16_ok && t.h16_want;
         const VkFormat hist_format = t.h16 ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
         t.history = s.ctx.image(mw, mh, hist_format, true);
         vkDestroySampler(s.ctx.device, t.history.sampler, nullptr);
@@ -1891,8 +2015,11 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         t.flow0_sampled = t.flow[0];
         t.flow0_sampled.sampler = t.motion_sampler;
         // Single channel and float: a depth buffer's value is all this reads, and
-        // the blit converts whatever the game hands over.
-        t.depth = s.ctx.image(mw, mh, VK_FORMAT_R32_SFLOAT, true);
+        // the blit converts whatever the game hands over. With Motion Without Depth (the default, as NVIDIA's DLLs,
+        // which never bind a depth) nothing copies into it or samples it (game_depth is false, the pre block's depth
+        // branch is off): a 1x1 image fills the descriptor (4K: 33 MB).
+        t.depth = impl_->motion_without_depth ? s.ctx.image(1, 1, VK_FORMAT_R32_SFLOAT, true)
+                                              : s.ctx.image(mw, mh, VK_FORMAT_R32_SFLOAT, true);
         vkDestroySampler(s.ctx.device, t.depth.sampler, nullptr);
         t.depth.sampler = linear_sampler();
         s.ctx.transition(t.depth, VK_IMAGE_LAYOUT_GENERAL);
@@ -1923,7 +2050,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
                                             first ? &t.flow[k] : &t.flow[k + 1], &t.flow[k]});
             }
         }
-        t.pingpong = config.max_passes == 1;
+        t.pingpong = true;   // one pass: the post block writes the next frame's history itself
         if (t.pingpong) {
             t.history_b = s.ctx.image(mw, mh, t.history.format, true);
             vkDestroySampler(s.ctx.device, t.history_b.sampler, nullptr);
@@ -1948,7 +2075,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         nrvk::Context::Image (&hist_store)[2] = t.hist_store;
         hist_store[0] = storage_of(t.hist(0)); hist_store[1] = storage_of(t.hist(1));
         t.pre_buffers = {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle,
-                         s.act.handle, t.params.handle};
+                         s.noise_buf.handle, t.params.handle};   // binding 5: the noise table (image_input.glsl)
         t.post_buffers = {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle,
                           t.params.handle};
         for (unsigned c = 0; c < (t.pingpong ? 2u : 1u); ++c) {
@@ -1959,15 +2086,13 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             const bool tp_nh = pre_nh && std::filesystem::exists(shaders / "temporal_pre_fp32nh.spv");
             // (research NR_HPASS=1): the pre block hands the post its history.
             const std::string pre_spv = std::string(tp_nh ? "temporal_pre_fp32nh" : "temporal_pre_fp32") + (t.hp ? "hp.spv" : ".spv");
-            pre.create(s.ctx, (shaders / pre_spv).string(),
-                       {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle,
-                        s.act.handle, t.params.handle},
+            pre.create(s.ctx, (shaders / pre_spv).string(), t.pre_buffers,
                        sizeof(PushFSwin) + sizeof(PushPreImage),
                        t.hp ? std::vector<nrvk::Context::Image*>{&s.tex_in, &t.flow0_sampled, &t.hist(c), &t.depth, &t.hpass}
                             : std::vector<nrvk::Context::Image*>{&s.tex_in, &t.flow0_sampled, &t.hist(c), &t.depth});
             // The post variant reads the same parameter buffer, the motion field and
             // the history the pre variant does: its blend is gated by the same term.
-            const std::string post_name = t.hp ? "temporal_post_fp32hp" : t.h16 ? "temporal_post_fp32h16" : "temporal_post_fp32";
+            const std::string post_name = t.hp ? "temporal_post_fp32hp" : "temporal_post_fp32";
             const std::vector<nrvk::Context::Image*> post_images = t.hp
                 ? std::vector<nrvk::Context::Image*>{&s.surf0, t.pingpong ? &hist_store[c ^ 1u] : &s.surf1, &s.tex_in,
                                                      &t.flow0_sampled, &t.hist(c), &t.hpass}
@@ -1984,19 +2109,22 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
                          t.params.handle},
                         sizeof(PushFSwin) + sizeof(PushUps) + sizeof(PushImageTail), post_images);
             else impl_->style_grade = false;
-        }
-        t.history_strength = temporal_config.history_strength;
-        t.enabled = true;
-        // One history per pass. Pass k reads and writes store[k] through the
-        // bound history image; the copies are model-sized and cost nothing
-        // next to a pass.
-        if (config.max_passes > 1) {
-            impl_->history_store.resize(config.max_passes);
-            for (auto& h : impl_->history_store) {
-                h = s.ctx.image(mw, mh, VK_FORMAT_R32G32B32A32_SFLOAT, false);
-                s.ctx.transition(h, VK_IMAGE_LAYOUT_GENERAL);
+            // The RGBA16F history's post (History Precision 16), over the same images: the sets are the same,
+            // only the history store's format differs (Impl::switch_history).
+            if (t.h16_ok && !t.hp && t.pingpong) {
+                t.post16_pp[c].create(s.ctx, (shaders / "temporal_post_fp32h16.spv").string(),
+                        {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle, t.params.handle},
+                        sizeof(PushFSwin) + sizeof(PushUps) + sizeof(PushImageTail), post_images);
+                if (impl_->style_grade)
+                    t.post16_grade_pp[c].create(s.ctx, (shaders / "temporal_post_fp32h16_grade.spv").string(),
+                        {s.act.handle, s.act.handle, s.wgt.handle, s.wgt.handle, s.wgt.handle, t.params.handle},
+                        sizeof(PushFSwin) + sizeof(PushUps) + sizeof(PushImageTail), post_images);
             }
         }
+        if (!t.post16_pp[0].device) t.h16_ok = t.h16 = false;
+        t.history_strength = temporal_config.history_strength;
+        t.enabled = true;
+        // Later-pass histories are allocated when a caller actually runs those passes.
     }
     if(transfer != Transfer::Identical) {
         for(VkFormat format : {transfer == Transfer::Encoded ? unorm : config.colour_format,
@@ -2010,8 +2138,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // Only the 8-bit path needs the private transfer image: it exists to keep an
     // *_SRGB view from applying its transfer function to the bits, not to
     // convert anything. The wide Wayland formats blit straight through.
-    // (Not with the answer stored in the frame's format at its extent: in and out are copies there.)
-    if(transfer == Transfer::Encoded && !(impl_->store_native && !impl_->scaled)) {
+    if(transfer == Transfer::Encoded) {
         auto& im=impl_->encoded;im.w=config.width;im.h=config.height;im.format=unorm;
         VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         info.imageType=VK_IMAGE_TYPE_2D;info.format=unorm;info.extent={im.w,im.h,1};
@@ -2030,8 +2157,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         NRVK_CHECK(vkBindImageMemory(host.device,im.handle,im.memory,0));
         s.ctx.transition(im,VK_IMAGE_LAYOUT_GENERAL);
     }
-    impl_->post_alpha = NR_POST_ALPHA && impl_->native_compose && !impl_->scaled &&
-                        impl_->max_passes == 1 && s.kern.count("fswinimagepost32");
+    impl_->post_alpha = NR_POST_ALPHA && s.kern.count("fswinimagepost32");
     timer.mark("adapters");
     // Built: from here on the caller serialises this runtime's submits itself.
     s.ctx.queue_lock = nullptr; s.ctx.queue_unlock = nullptr;
@@ -2042,7 +2168,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // runtimes built inside frames in this memory has to hold (Runtime::image_heap_wanted).
     if (!config.share && s.arenas && !config.plan_only) {
         const double px = double(config.width) * double(config.height);
-        const double hist = double(impl_->temporal.history.w) * impl_->temporal.history.h * 16;
+        const double hist = double(impl_->temporal.history.w) * impl_->temporal.history.h * (impl_->temporal.h16 ? 8 : 16);
         s.arenas->bytes_per_px = (double(s.ctx.image_bytes) + hist) / px * 1.05;
         s.arenas->max_px = px * std::max(1.0, config.capacity);   // the frames its arena has room for; px_unfit beyond
     }
@@ -2055,10 +2181,8 @@ Runtime::~Runtime() = default;
 std::shared_ptr<const RuntimeCore> Runtime::share_for(uint32_t width, uint32_t height) const {
     const auto& s = impl_->session;
     if (!s.core || !width || !height) return nullptr;
-    const uint32_t mw = model_extent(width, impl_->model_scale), mh = model_extent(height, impl_->model_scale);
-    if (impl_->native_compose && (mw != width || mh != height)) return nullptr;
-    const auto native = make_native_plan(mw, mh, impl_->network);
-    if (native.width != impl_->work_w || native.height != impl_->work_h || mh > s.core->source_h) return nullptr;
+    const auto native = make_native_plan(width, height, impl_->network);
+    if (native.width != impl_->work_w || native.height != impl_->work_h || height > s.core->source_h) return nullptr;
     auto c = std::make_shared<RuntimeCore>();
     c->graph = s.core; c->slot = s.arenas; c->arguments = impl_->share_arguments; c->network = impl_->network;
     c->work_w = impl_->work_w; c->work_h = impl_->work_h;
@@ -2195,6 +2319,10 @@ uint64_t network_ram_bytes(const RuntimeCore& core) {
 
 static bool adopt_for(nrvk::Context& ctx, const HostDevice& host) {
     std::string why;
+    if (!ctx.set_arch(host.arch, &why)) {
+        nr::logf("[nr] the network's memory cannot be moved: %s", why.c_str());
+        return false;
+    }
     if (!ctx.adopt(host.instance, host.physical, host.device, host.queue, host.queue_family, &why)) {
         nr::logf("[nr] the network's memory cannot be moved: %s", why.c_str());
         return false;
@@ -2232,6 +2360,10 @@ void release_network(const RuntimeCore& core, std::vector<uint8_t>&& weights) {
     vkDestroyBuffer(a->device, a->wgt.handle, nullptr);
     vkFreeMemory(a->device, a->wgt.memory, nullptr);
     a->wgt = nrvk::Buffer{};
+    if (a->wgt_e.mapped) vkUnmapMemory(a->device, a->wgt_e.memory);
+    if (a->wgt_e.handle) vkDestroyBuffer(a->device, a->wgt_e.handle, nullptr);
+    if (a->wgt_e.memory) vkFreeMemory(a->device, a->wgt_e.memory, nullptr);
+    a->wgt_e = nrvk::Buffer{};
     a->act_want = a->act_need ? a->act_need : a->act ? a->act->cap : a->act_want;
     a->act.reset();
     a->loaded = 0;
@@ -2254,32 +2386,54 @@ bool reload_network(const HostDevice& host, const RuntimeCore& core, const std::
     if (!arena) {
         if (act && act->act && act->act->device == a->device && act->act->cap >= a->act_want) {
             arena = act->act;
+            if (ctx.rdna3 && arena && !arena->twin.handle && arena->cap) {
+                arena->twin = ctx.buffer(VkDeviceSize(arena->cap) * 2);
+            }
         } else {
             auto g = std::make_shared<GraphAct>();
             g->device = a->device; g->cap = size_t(double(a->act_want) * std::max(1.0, slack) + 255) / 256 * 256;
+            nr::vram::Scope kind(nr::vram::kActivations);
             g->buf = ctx.buffer(g->cap, false, /*device_address=*/true);   // freed by ~GraphAct if what follows throws
+            if (ctx.rdna3) {
+                g->twin = ctx.buffer(VkDeviceSize(g->cap) * 2);
+            }
             arena = std::move(g);
         }
+    } else if (ctx.rdna3 && !arena->twin.handle && arena->cap) {
+        arena->twin = ctx.buffer(VkDeviceSize(arena->cap) * 2);
     }
-    nrvk::Buffer w = ctx.buffer(a->wgt_cap);
+    nrvk::Buffer w{}, w_e{};
+    nr::vram::Scope kind(nr::vram::kWeights);
     try {
+        w = ctx.buffer(a->wgt_cap);
+        if (ctx.rdna3) {
+            w_e = ctx.buffer(VkDeviceSize(a->wgt_cap) * 2);
+        }
         ctx.upload(w, 0, a->host_weights.data(), a->host_weights.size());
+        if (ctx.rdna3) {
+            std::array<uint16_t, 256> to_f16{};
+            for (int i = 0; i < 256; ++i) to_f16[size_t(i)] = tin::f_to_f16(tin::e4m3_to_f(uint8_t(i)));
+            std::vector<uint8_t> f16_buf(a->host_weights.size() * 2);
+            uint16_t* out = reinterpret_cast<uint16_t*>(f16_buf.data());
+            for (size_t i = 0; i < a->host_weights.size(); ++i) out[i] = to_f16[a->host_weights[i]];
+            ctx.upload(w_e, 0, f16_buf.data(), f16_buf.size());
+        }
     } catch (...) {
-        ctx.destroy(w);
+        if (w.handle) ctx.destroy(w);
+        if (w_e.handle) ctx.destroy(w_e);
         throw;
     }
     a->wgt = w;
+    if (ctx.rdna3) a->wgt_e = w_e;
     a->act = std::move(arena);
     a->loaded = 0;   // the tail and the noise fields: the first recording (retarget)
     std::vector<uint8_t>().swap(a->host_weights);
     return true;
 }
 
-bool core_runs(const RuntimeCore& c, uint32_t width, uint32_t height, float scale, bool native_compose) {
-    const uint32_t mw = model_extent(width, scale), mh = model_extent(height, scale);
-    if (native_compose && (mw != width || mh != height)) return false;
-    const auto native = make_native_plan(mw, mh, c.network);
-    return native.width == c.work_w && native.height == c.work_h && mh <= c.source_h;
+bool core_runs(const RuntimeCore& c, uint32_t width, uint32_t height) {
+    const auto native = make_native_plan(width, height, c.network);
+    return native.width == c.work_w && native.height == c.work_h && height <= c.source_h;
 }
 
 void release_image_heap(const RuntimeCore& core) {
@@ -2300,16 +2454,50 @@ bool Runtime::owns_image_memory() const {
 bool Runtime::carry_history(VkCommandBuffer cmd, const Runtime& from, uint64_t feature) {
     auto& t = impl_->temporal;
     auto& ft = from.impl_->temporal;
-    if (!cmd || !feature || !t.enabled || !ft.enabled || impl_->max_passes != 1 || from.impl_->max_passes != 1 ||
-        from.stale() || stale())
+    if (!cmd || !feature || !t.enabled || !ft.enabled || from.stale() || stale())
         return false;
+    impl_->gpu_uses.touch(); from.impl_->gpu_uses.touch();
+    if (impl_->heap) impl_->heap->uses[impl_->heap_region].touch();
+    if (from.impl_->heap) from.impl_->heap->uses[from.impl_->heap_region].touch();
     const auto fit = from.impl_->features.find(feature);
     if (fit == from.impl_->features.end() || !fit->second.latch) return false;
-    // What the feature's next frame would have read there: the bound history, or its own image.
-    const nrvk::Context::Image& src = from.impl_->bound_feature == feature ? ft.hist(ft.hcur) : fit->second.history;
+    // What the feature's next frame would have read there: the bound history, or its own image (rotation: the
+    // image its slot names).
+    if (from.impl_->rotation() && fit->second.slot < 0) return false;
+    const nrvk::Context::Image& src = from.impl_->rotation() ? ft.hist(uint32_t(fit->second.slot))
+                                      : from.impl_->bound_feature == feature ? ft.hist(ft.hcur) : fit->second.history;
     if (!src.handle) return false;
     auto& s = impl_->session;
     auto it = impl_->features.find(feature);
+    if (impl_->rotation()) {   // into the image this runtime's next recording of the feature reads
+        if (it == impl_->features.end()) it = impl_->features.emplace(feature, impl_->make_feature()).first;
+        Impl::FeatureState& fs = it->second;
+        if (fs.slot < 0) fs.slot = int(impl_->free_slot(cmd, &fs, t.hcur, ~0u));
+        nrvk::Context::Image& dst = t.hist(uint32_t(fs.slot));
+        barrier(cmd, src.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {int32_t(src.w), int32_t(src.h), 1};
+        b.dstOffsets[1] = {int32_t(dst.w), int32_t(dst.h), 1};
+        const VkFilter filter = impl_->filters_linearly(src.format) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        nrvk::blit(s.ctx.physical, s.ctx.device, cmd, src.handle, src.format, VK_IMAGE_LAYOUT_GENERAL, dst.handle,
+                   dst.format, VK_IMAGE_LAYOUT_GENERAL, 1, &b, filter);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        barrier(cmd, src.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0);
+        fs.cleared = true;
+        fs.latch = true;
+        fs.seed = fit->second.seed;
+        fs.parity = fit->second.parity;
+        fs.input = fit->second.input;
+        return true;
+    }
     if (it == impl_->features.end()) {
         Impl::FeatureState made{};
         // sampled as well, as temporal.history is: the temporal kernels read a feature's history through a sampler
@@ -2332,7 +2520,8 @@ bool Runtime::carry_history(VkCommandBuffer cmd, const Runtime& from, uint64_t f
     b.srcOffsets[1] = {int32_t(src.w), int32_t(src.h), 1};
     b.dstOffsets[1] = {int32_t(dst.w), int32_t(dst.h), 1};
     const VkFilter filter = impl_->filters_linearly(src.format) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    vkCmdBlitImage(cmd, src.handle, VK_IMAGE_LAYOUT_GENERAL, dst.handle, VK_IMAGE_LAYOUT_GENERAL, 1, &b, filter);
+    nrvk::blit(s.ctx.physical, s.ctx.device, cmd, src.handle, src.format, VK_IMAGE_LAYOUT_GENERAL, dst.handle, dst.format,
+               VK_IMAGE_LAYOUT_GENERAL, 1, &b, filter);
     barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -2344,7 +2533,7 @@ bool Runtime::carry_history(VkCommandBuffer cmd, const Runtime& from, uint64_t f
     fs.latch = true;
     fs.seed = fit->second.seed;
     fs.parity = fit->second.parity;
-    fs.prep_gen = impl_->prep_gen;
+    fs.input = fit->second.input;
     return true;
 }
 
@@ -2356,15 +2545,16 @@ bool Runtime::stale() const {
 uint32_t Runtime::model_width() const { return impl_->mw; }
 uint32_t Runtime::model_height() const { return impl_->mh; }
 NetworkModel Runtime::network() const { return impl_->network; }
+bool Runtime::experimental() const { return impl_->experimental; }
+bool Runtime::optimized() const { return impl_->optimized; }
 #if NR_INT4
-bool Runtime::int4_mixed() const { return impl_->int4_mixed; }
+bool Runtime::int4() const { return impl_->int4; }
+int Runtime::layers() const { return impl_->layers; }
 #endif
 
 void Runtime::set_style_grade(bool on) { impl_->style_grade_on = on; }
-
-void Runtime::set_white_point(float v) {
-    if (impl_->linear) impl_->white_point = v > 1e-4f ? v : 1e-4f;
-}
+bool Runtime::style_grade_active() const { return impl_->style_grade && impl_->style_grade_on; }
+void Runtime::set_history_f16(bool on) { if (!std::getenv("NR_HIST16")) impl_->temporal.h16_want = on; }
 
 void Runtime::set_history_strength(float v) {
     if (impl_->temporal.enabled) impl_->temporal.history_strength = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
@@ -2372,12 +2562,37 @@ void Runtime::set_history_strength(float v) {
 
 void Runtime::release_feature(uint64_t feature) {
     if (!feature) return;
+    impl_->plain_seeds.erase(feature);
     auto it = impl_->features.find(feature);
     if (it == impl_->features.end()) return;
     if (it->second.history.handle)
         impl_->retiring.emplace_back(it->second.history,
-                                     impl_->recordings + Impl::kRetireAfter);
+                                     impl_->recordings + Impl::kRetireAfter, impl_->gpu_uses);
+    for (auto& p : it->second.estimator_luma)
+        if (p.handle) impl_->retiring.emplace_back(p, impl_->recordings + Impl::kRetireAfter, impl_->gpu_uses);
     impl_->features.erase(it);
+    // Rotation: the images beyond what the features left need (theirs and one to write) go, from the last
+    if (impl_->rotation()) {
+        auto& t = impl_->temporal;
+        uint32_t owned = 0;
+        for (const auto& f : impl_->features) if (f.second.slot >= 0) ++owned;
+        while (!t.extra.empty() && t.hist_count() > std::max(owned + 1u, 2u) &&
+               !impl_->slot_taken(t.hist_count() - 1u, nullptr)) {
+            const uint32_t last = t.hist_count() - 1u;
+            for (auto v = t.vars.begin(); v != t.vars.end();) {
+                if (v->first.first != last && v->first.second != last) { ++v; continue; }
+                for (nrvk::Kernel* k : {&v->second.pre, &v->second.post, &v->second.post_grade, &v->second.post16,
+                                        &v->second.post16_grade})
+                    if (k->pool) { impl_->retired_pools.push_back(k->pool); k->pool = VK_NULL_HANDLE; k->shared.reset(); }
+                v = t.vars.erase(v);
+            }
+            nrvk::Context::Image e = t.extra.back();
+            e.sampler = VK_NULL_HANDLE;
+            impl_->retiring.emplace_back(e, impl_->recordings + Impl::kRetireAfter, impl_->gpu_uses);
+            t.extra.pop_back();
+            if (t.hcur >= t.hist_count()) t.hcur = 0;
+        }
+    }
     // The bound history keeps whatever this feature left in it; the next
     // feature to record copies its own state over the top, and a feature that
     // is gone has no state to write back.
@@ -2425,7 +2640,10 @@ RecordResult Runtime::record(VkCommandBuffer cmd, const ColourFrame& frame, cons
 }
 
 RecordResult Runtime::record(VkCommandBuffer cmd, const ColourFrame& frame, const Controls& c, bool reset) {
-    if (reset) impl_->plain_seed = 0;
+    if (reset) {
+        if (c.feature) impl_->plain_seeds[c.feature] = 0;
+        else impl_->plain_seed = 0;
+    }
     return record(cmd,frame,c,nullptr).frame;
 }
 
@@ -2450,8 +2668,7 @@ TemporalResult Runtime::record_temporal(VkCommandBuffer cmd, const ColourFrame& 
 }
 
 bool Runtime::takes_target(const Controls& c) const {
-    return c.enabled && c.apply_model && impl_->temporal.enabled &&
-           std::min<uint32_t>(std::max(c.passes, 1), impl_->max_passes) == 1;
+    return c.enabled && c.apply_model && impl_->temporal.enabled;
 }
 
 EngineResult Runtime::record_engine(VkCommandBuffer cmd, const EngineFrame& frame,
@@ -2477,7 +2694,19 @@ EngineResult Runtime::record_engine(VkCommandBuffer cmd, const EngineFrame& fram
 ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& frame, const Controls& c,
                              const ControlMaskFrame* mask, const TemporalFrame* temporal,
                              bool* history_consumed, const EngineFrame* engine) {
+    impl_->gpu_uses.touch();
+    if (impl_->heap) impl_->heap->uses[impl_->heap_region].touch();
     if (stale()) throw std::logic_error("a runtime whose images another one has taken over (Runtime::stale)");
+    // images made while recording (a feature's history) are this network's (NR Control's VRAM breakdown)
+#if NR_INT4
+    const bool int4 = impl_->int4;
+    const int layers = impl_->layers;
+#else
+    const bool int4 = false;
+    const int layers = 0;
+#endif
+    nr::vram::Scope owner(nr::vram::kUnset, impl_->experimental ? 3 : impl_->network == NetworkModel::Small ? 0
+                                            : impl_->optimized ? nr::network_with_layers(2, int4 ? layers : 0) : 1);
     validate(c);
     if (!cmd || !frame.image || frame.format != impl_->colour_format ||
         frame.width != impl_->width || frame.height != impl_->height ||
@@ -2501,11 +2730,42 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // the one fallible allocation of a recording - a new feature's
     // history image - before anything is recorded, so a failure leaves the caller's
     // images in the layouts it gave and its fallback (seed copy, in place) sound.
-    if (c.enabled && temporal && impl_->temporal.enabled && temporal->feature && !impl_->features.count(temporal->feature)) {
-        const auto& th = impl_->temporal.history;
-        Impl::FeatureState made{};
-        made.history = impl_->session.ctx.image(th.w, th.h, th.format, true, false);
-        impl_->features.emplace(temporal->feature, made);
+    if (c.enabled && temporal && impl_->temporal.enabled) {
+        // Every caller of a shared runtime should name its layer's feature; a caller without one still runs (its history
+        // may restart while named callers share the runtime) rather than failing the frame.
+        if ((!temporal->feature && !impl_->features.empty()) || (temporal->feature && impl_->unnamed_temporal_used)) {
+            static bool said = false;
+            if (!said) { said = true; nr::logf("[nr] a shared runtime has a caller without a layer feature: its history may restart"); }
+        }
+        if (temporal->feature) {
+            auto it = impl_->features.find(temporal->feature);
+            if (it == impl_->features.end())
+                it = impl_->features.emplace(temporal->feature, impl_->make_feature()).first;
+            // This recording binds this feature over another: the other one's state leaves the bound history
+            // into its own image, made now if it never left before.
+            if (!impl_->rotation() && impl_->bound_feature && impl_->bound_feature != temporal->feature) {
+                auto bound = impl_->features.find(impl_->bound_feature);
+                if (bound != impl_->features.end()) impl_->ensure_history(bound->second);
+            }
+            auto& f = it->second;
+            impl_->select_history(cmd, &f);   // this recording's history pair
+            if (!engine && f.estimator_luma.empty()) {
+                std::vector<nrvk::Context::Image> made(kTemporalLevels);
+                try {
+                    for (unsigned k = 0; k < kTemporalLevels; ++k) {
+                        const auto& l = impl_->temporal.luma[0][k];
+                        made[k] = impl_->session.ctx.image(l.w, l.h, l.format, false, false);
+                    }
+                } catch (...) {
+                    for (auto& l : made) if (l.handle) impl_->session.ctx.destroy(l);
+                    throw;
+                }
+                f.estimator_luma = std::move(made);
+            }
+        } else {
+            impl_->unnamed_temporal_used = true;
+            impl_->select_history(cmd, nullptr);
+        }
     }
     ControlMaskResult result{};
     auto& info=result.frame;
@@ -2570,12 +2830,12 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     if (engine && temporal)
         impl_->incheck.begin(s.ctx, cmd, frame, *engine, temporal->feature, impl_->recordings,
                              impl_->temporal.lw[0], impl_->temporal.lh[0], impl_->mw, impl_->mh);
-    // The network extent (Model Resolution); the frame is frame.width x frame.height.
+    // The network extent: the frame's.
     const uint32_t nw = impl_->mw, nh = impl_->mh;
-    const uint32_t passes = std::min<uint32_t>(std::max(effective.passes, 1), impl_->max_passes);
+    const uint32_t passes = 1;
     // a separate answer image (EngineFrame::target).
     const ColourFrame* tgt = engine && engine->target.image && engine->target.image != frame.image ? &engine->target : nullptr;
-    if (tgt && (!c.apply_model || passes != 1 || mask || tgt->format != frame.format ||
+    if (tgt && (!c.apply_model || mask || tgt->format != frame.format ||
                 tgt->width != frame.width || tgt->height != frame.height || !tgt->before_stage || !tgt->after_stage ||
                 tgt->before == VK_IMAGE_LAYOUT_PREINITIALIZED || tgt->after == VK_IMAGE_LAYOUT_UNDEFINED ||
                 tgt->after == VK_IMAGE_LAYOUT_PREINITIALIZED))
@@ -2584,10 +2844,9 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // The caller's colour (and depth) sampled in place, when this frame allows
     // it: see Impl::DirectSrc. Null means the copies below, as always.
     const Impl::DirectSrc* ds = nullptr;
-    // post_alpha: native compose, one pass, scale 1, and no alpha pass - after
-    // the network only the write-back touches the frame.
+    // post_alpha: no alpha pass - after the network only the write-back touches the frame.
     const bool colour_direct =
-        NR_DIRECT_SAMPLE && !impl_->direct_src_failed && impl_->post_alpha && !impl_->prep && engine &&
+        NR_DIRECT_SAMPLE && !impl_->direct_src_failed && impl_->post_alpha && engine &&
         temporal && !mask && passes == 1 &&
         impl_->temporal.pingpong && impl_->transfer != Transfer::Encoded &&
         (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && frame.width == nw && frame.height == nh;
@@ -2615,56 +2874,54 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     static const int direct_store_env = std::getenv("NR_DIRECT_STORE") ? std::atoi(std::getenv("NR_DIRECT_STORE")) : -1;
     const bool wide = frame.format == VK_FORMAT_R16G16B16A16_SFLOAT || frame.format == VK_FORMAT_R16G16B16A16_UNORM;
     const bool store_direct = colour_direct && impl_->direct_out && c.apply_model && frame.format == s.surf0.format &&
-        !impl_->scaled && direct_store_env != 0 &&
+        direct_store_env != 0 &&
         (tgt ? (tgt->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0
              : (direct_store_env == 1 || wide) && (frame.usage & VK_IMAGE_USAGE_STORAGE_BIT));
     // the plain path (no temporal, no engine frame) samples the caller's colour in place
     // too - the input copy goes. Research switch NR_PLAIN_DIRECT=0 turns it off.
     static const bool plain_env = !(std::getenv("NR_PLAIN_DIRECT") && !std::atoi(std::getenv("NR_PLAIN_DIRECT")));
     const bool plain_direct = plain_env && !temporal && !engine && !mask && passes == 1 && impl_->plain_pre &&
-        impl_->plain_post && !impl_->direct_src_failed && impl_->post_alpha && !impl_->prep && !impl_->linear &&
+        impl_->plain_post && !impl_->direct_src_failed && impl_->post_alpha &&
         impl_->transfer != Transfer::Encoded && (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
         frame.width == nw && frame.height == nh;
     const bool plain_store = plain_direct && impl_->direct_out && c.apply_model && frame.format == s.surf0.format &&
-        !impl_->scaled && direct_store_env != 0 && (direct_store_env == 1 || wide) &&
+        direct_store_env != 0 && (direct_store_env == 1 || wide) &&
         (frame.usage & VK_IMAGE_USAGE_STORAGE_BIT);
+    // What this frame copies through our own images: made now, before the in-place sets below bind them.
+    impl_->materialize(cmd, !colour_direct && !plain_direct, !store_direct && !plain_store);
+    if (impl_->want_noise) impl_->make_noise(cmd);
+    // [Network] History Precision changed: before anything binds the history (the pair chosen again)
+    if (impl_->switch_history(cmd) && temporal && impl_->temporal.enabled) {
+        auto it = temporal->feature ? impl_->features.find(temporal->feature) : impl_->features.end();
+        impl_->select_history(cmd, it != impl_->features.end() ? &it->second : nullptr);
+    }
     const Impl::DirectSrc* sets = nullptr;
     if (plain_direct)
         sets = impl_->direct_source(frame.image, frame.format, VK_NULL_HANDLE, VK_NULL_HANDLE,
-                                    VK_FORMAT_UNDEFINED, 0, plain_store, VK_NULL_HANDLE, true);
+                                    VK_FORMAT_UNDEFINED, 0, 1, plain_store, VK_NULL_HANDLE, true);
     else if (colour_direct || motion_direct)
         sets = impl_->direct_source(colour_direct ? frame.image : VK_NULL_HANDLE, frame.format,
                                     depth_in_place ? engine->depth.image : VK_NULL_HANDLE,
                                     motion_direct ? engine->motion.image : VK_NULL_HANDLE,
-                                    engine->motion.format, impl_->temporal.hcur, store_direct,
+                                    engine->motion.format, impl_->temporal.hread, impl_->temporal.hwrite, store_direct,
                                     tgt ? tgt->image : VK_NULL_HANDLE);
     if (sets && sets->cview) ds = sets;
-    // Model resolution with the frame read and written in place (Impl::FrameRw). NR_FRAME_RW=0: never.
-    static const bool frame_rw_env = !(std::getenv("NR_FRAME_RW") && !std::atoi(std::getenv("NR_FRAME_RW")));
-    const Impl::FrameRw* fr = frame_rw_env && impl_->store_native && impl_->scaled && !tgt && !mask &&
-        (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && (frame.usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
-        frame.format == impl_->keep_full.format && frame.width == impl_->keep_full.w && frame.height == impl_->keep_full.h
-        ? impl_->frame_rw_source(frame.image, frame.format) : nullptr;
-    const bool stored = (ds && ds->store) || fr;
+    if (!ds) impl_->materialize(cmd, true, true);   // the frame could not be sampled in place: the copies
+    const bool stored = ds && ds->store;
     const bool depth_direct = ds && ds->dview != VK_NULL_HANDLE;   // the caller's depth bound in place
     const bool mv_direct = sets && sets->mview;
-    barrier(cmd, frame.image, frame.before, ds || fr ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    barrier(cmd, frame.image, frame.before, ds ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             frame.before_stage, frame.before_access,
-            ds || fr ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
+            ds ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
             stored && !tgt ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
                    : ds ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT);
     if (stored && tgt)
         barrier(cmd, tgt->image, tgt->before, VK_IMAGE_LAYOUT_GENERAL, tgt->before_stage, tgt->before_access,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
-    // Where tex_in stands once the frame is in it: a copy or blit leaves it a transfer
-    // destination, runtime_downscale.comp (keep_native) a storage image.
-    const bool down_native = impl_->scaled && impl_->keep_native;
-    const VkImageLayout tin_layout = down_native ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    const VkPipelineStageFlags tin_stage = down_native ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
-    const VkAccessFlags tin_access = down_native ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
     if (!ds)
-    barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, tin_layout,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT, tin_stage, tin_access);
+    barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT);
     VkImageCopy region{};
     region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.extent = {frame.width, frame.height, 1};
@@ -2672,23 +2929,8 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     blit.srcSubresource=blit.dstSubresource=region.srcSubresource;
     blit.srcOffsets[1]=blit.dstOffsets[1]={int32_t(frame.width),int32_t(frame.height),1};
     auto& encoded=impl_->encoded;
-    // Model Resolution: the frame lands in keep_full at its own size first,
-    // then is filtered down into tex_in. Whatever the frame's format, the
-    // downscale is one RGBA32F -> RGBA32F blit.
-    VkImage colour_dst = s.tex_in.handle;
-    if (impl_->scaled && !fr) {
-        colour_dst = impl_->keep_full.handle;
-        barrier(cmd, impl_->keep_full.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-    }
-    if (fr) {
-        // Nothing to copy: the downscale and the transfer pass read the frame itself.
-    } else if (down_native) {
-        // The frame's bits as they are (an *_SRGB frame into its UNORM twin).
-        vkCmdCopyImage(cmd, frame.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       colour_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    } else if (ds) {
+    const VkImage colour_dst = s.tex_in.handle;
+    if (ds) {
         // Nothing to copy: the pre and post blocks sample the frame itself.
     } else if (impl_->direct_in) {
         // The bits as they are (an *_SRGB frame into its UNORM twin: the same
@@ -2705,90 +2947,26 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         barrier(cmd,encoded.handle,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
-        vkCmdBlitImage(cmd,encoded.handle,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       colour_dst,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_NEAREST);
+        nrvk::blit(s.ctx.physical, s.ctx.device, cmd, encoded.handle, encoded.format, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   colour_dst, s.tex_in.format, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
         barrier(cmd,encoded.handle,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT);
     } else if (impl_->transfer == Transfer::DirectBlit) {
         // FP16 / 16-bit UNORM / 10-bit packed: no sRGB transfer function to route
         // around, so the blit's own format conversion is the whole of it.
-        vkCmdBlitImage(cmd, frame.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       colour_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        nrvk::blit(s.ctx.physical, s.ctx.device, cmd, frame.image, frame.format, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   colour_dst, s.tex_in.format, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
     } else {
         vkCmdCopyImage(cmd, frame.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        colour_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     }
-    if (down_native) {
-        if (!fr)
-            barrier(cmd, impl_->keep_full.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-        const uint32_t model[] = {nw, nh};
-        dispatch(cmd, impl_->downscale, (nw + 7) / 8, (nh + 7) / 8, 1, model, sizeof model, fr ? fr->down : VK_NULL_HANDLE);
-    } else if (impl_->scaled) {
-        barrier(cmd, impl_->keep_full.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    if (!ds)
+        barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        VkImageBlit down{};
-        down.srcSubresource = down.dstSubresource = region.srcSubresource;
-        down.srcOffsets[1] = {int32_t(frame.width), int32_t(frame.height), 1};
-        down.dstOffsets[1] = {int32_t(nw), int32_t(nh), 1};
-        vkCmdBlitImage(cmd, impl_->keep_full.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       s.tex_in.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &down, impl_->downscale_filter);
-        barrier(cmd, impl_->keep_full.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-    }
-    if (impl_->linear) {
-        // Linear light: make the proxy in place and keep the original. The
-        // network reads tex_in in SHADER_READ_ONLY like every other frame.
-        barrier(cmd, s.tex_in.handle, tin_layout, VK_IMAGE_LAYOUT_GENERAL, tin_stage, tin_access,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        struct { uint32_t w, h; float white, knee; } push{nw, nh, impl_->white_point, 0.75f};
-        dispatch(cmd, impl_->encode, (nw + 7) / 8, (nh + 7) / 8, 1, &push, sizeof push);
-        barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-    } else if (!ds) {
-        barrier(cmd, s.tex_in.handle, tin_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, tin_stage, tin_access,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-    }
-    // Preprocess: meter the frame, keep it, and put what the network is to see
-    // in tex_in. A change of settings resets the meter and, below, the history.
-    const Preprocess& pp = c.preprocess;
-    const bool prep_on = impl_->prep && pp.active() && !mask;
-    const Preprocess& was = impl_->prep_last;
-    if (impl_->prep && (prep_on != impl_->prep_was_on || (prep_on && pp != was))) ++impl_->prep_gen;
-    PrepPush prep_push{};
-    if (prep_on) {
-        const uint32_t curve = uint32_t(std::clamp(pp.curve, 0, 6));
-        const bool metered = pp.exposure == 1;
-        prep_push = {nw, nh, 0u,
-                     (metered ? kPrepAuto : 0u) | (impl_->prep_unknee ? kPrepUnknee : 0u) |
-                         (impl_->prep_was_on ? 0u : kPrepReset),
-                     curve, pp.exposure == 0 ? 0.0f : std::clamp(pp.bias_ev, -8.0f, 8.0f),
-                     std::clamp(pp.contrast, 0.5f, 2.0f), std::clamp(pp.saturation, 0.05f, 2.0f),
-                     kPrepAnchor[curve], 4.0f, 0.0f};
-        const auto now = std::chrono::steady_clock::now();
-        if (impl_->prep_was_on)
-            prep_push.dt = std::chrono::duration<float>(now - impl_->prep_metered).count();
-        impl_->prep_metered = now;
-        barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        if (metered) {
-            dispatch(cmd, impl_->prep_k, 1, 1, 1, &prep_push, sizeof prep_push);
-            compute_barrier(cmd);
-        }
-        prep_push.mode = 1;
-        dispatch(cmd, impl_->prep_k, (nw + 15) / 16, (nh + 15) / 16, 1, &prep_push, sizeof prep_push);
-        barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-    }
-    impl_->prep_was_on = prep_on;
-    impl_->prep_last = pp;
+    // The input domain the history was made under (a change restarts it).
+    const Impl::InputDomain input{true, reversible_of(c)};
     // A GENERAL -> GENERAL copy between two of our own images, fenced for the
     // compute work on either side. Model-sized, used by the multi-pass loop.
     auto copy_general = [&](const nrvk::Context::Image& src, const nrvk::Context::Image& dst) {
@@ -2809,41 +2987,15 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     };
-    if (impl_->max_passes > 1) {
-        // What the first pass sees, for the transfer pass and the alpha
-        // restore; tex_in is overwritten by every pass after the first.
-        barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        barrier(cmd, impl_->shown_keep.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-        VkImageCopy c{};
-        c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        c.extent = {nw, nh, 1};
-        vkCmdCopyImage(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       impl_->shown_keep.handle, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-        barrier(cmd, impl_->shown_keep.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-        barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-    }
     compute_barrier(cmd);
     auto& t = impl_->temporal;
     // This frame's feature, if the caller named one. Its state is host-side
-    // bookkeeping plus one image; nothing is recorded yet.
+    // bookkeeping and its history images; nothing is recorded yet.
     Impl::FeatureState* fs = nullptr;
     if (temporal && t.enabled && temporal->feature) {
         auto it = impl_->features.find(temporal->feature);
         if (it == impl_->features.end()) {
-            Impl::FeatureState made{};
-            // No settling transition: that is a submit and a fence wait, and
-            // this is the render thread inside a recording. The barrier below
-            // does it in the command buffer instead.
-            made.history = s.ctx.image(t.history.w, t.history.h, t.history.format, true, false);
-            it = impl_->features.emplace(temporal->feature, made).first;
+            it = impl_->features.emplace(temporal->feature, impl_->make_feature()).first;
         }
         fs = &it->second;
     }
@@ -2853,19 +3005,29 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         // The original's gate, all three terms, resolved here and nowhere else:
         // the first-frame latch, DLSSNR.Reset, and a motion source existing at
         // all.
-        uint32_t& gen = fs ? fs->prep_gen : impl_->prep_gen_single;
-        gate = (fs ? fs->latch : t.latch) && !temporal->reset && gen == impl_->prep_gen;
-        gen = impl_->prep_gen;
+        Impl::InputDomain& previous = fs ? fs->input : impl_->input_single;
+        const bool domain_changed = !(input == previous);
+        gate = (fs ? fs->latch : t.latch) && !temporal->reset && !domain_changed;
+        previous = input;
         // The pre block's noise seed, the DLL's rule: a counter in the pre node
         // (+0xc8) handed to the kernel and then incremented (0x180060f44), zeroed
         // by Reset (0x1800616e0). The first frame and a reset use seed 0, so
         // their noise is the precomputed field's; it moves every frame after.
         uint32_t& counter = fs ? fs->seed : t.seed;
-        if (!(fs ? fs->latch : t.latch) || temporal->reset) counter = 0;
+        if (!(fs ? fs->latch : t.latch) || temporal->reset || domain_changed) counter = 0;
         pre_seed = counter++;
+        if (c.seed_fixed) pre_seed = 0;
         // diagnostics (wrong picture): price the per-frame noise and the history.
-        if (std::getenv("NR_DIAG_SEED0")) pre_seed = 0;
-        if (std::getenv("NR_DIAG_TGATE0")) gate = false;
+        static const bool diag_seed0 = [] {
+            const char* e = std::getenv("NR_DIAG_SEED0");
+            return e && e[0] && e[0] != '0';
+        }();
+        static const bool diag_tgate0 = [] {
+            const char* e = std::getenv("NR_DIAG_TGATE0");
+            return e && e[0] && e[0] != '0';
+        }();
+        if (diag_seed0) pre_seed = 0;
+        if (diag_tgate0) gate = false;
         const uint32_t p = fs ? fs->parity : t.parity;
         if (engine) {
             // Engine motion: sampled in place (mv_direct, put back after the
@@ -2889,8 +3051,9 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             mv.srcOffsets[1] = {int32_t(engine->motion_x + engine->motion.width),
                                 int32_t(engine->motion_y + engine->motion.height), 1};
             mv.dstOffsets[1] = {int32_t(t.lw[0]), int32_t(t.lh[0]), 1};
-            vkCmdBlitImage(cmd, engine->motion.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           t.flow[0].handle, VK_IMAGE_LAYOUT_GENERAL, 1, &mv, VK_FILTER_LINEAR);
+            nrvk::blit(s.ctx.physical, s.ctx.device, cmd, engine->motion.image, engine->motion.format,
+                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.flow[0].handle, t.flow[0].format, VK_IMAGE_LAYOUT_GENERAL,
+                       1, &mv, VK_FILTER_LINEAR);
             barrier(cmd, t.flow[0].handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -2956,8 +3119,9 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 // a depth that is on neither surface, which is precisely the
                 // edge this tap exists to get right. Vulkan also forbids linear
                 // filtering on a depth aspect.
-                vkCmdBlitImage(cmd, engine->depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               t.depth.handle, VK_IMAGE_LAYOUT_GENERAL, 1, &d, VK_FILTER_NEAREST);
+                nrvk::blit(s.ctx.physical, s.ctx.device, cmd, engine->depth.image, engine->depth.format,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.depth.handle, t.depth.format, VK_IMAGE_LAYOUT_GENERAL,
+                           1, &d, VK_FILTER_NEAREST);
                 barrier(cmd, t.depth.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -2965,6 +3129,19 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                         engine->depth.after, VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VK_ACCESS_TRANSFER_READ_BIT, engine->depth.after_stage,
                         engine->depth.after_access);
+            }
+        }
+        if (fs && !engine) {
+            gate = gate && fs->estimated_previous;
+            for (unsigned k = 0; k < kTemporalLevels; ++k) {
+                auto& l = fs->estimator_luma[k];
+                if (l.layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+                    barrier(cmd, l.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_ACCESS_TRANSFER_WRITE_BIT);
+                    l.layout = VK_IMAGE_LAYOUT_GENERAL;
+                    gate = false;
+                } else if (gate) copy_general(l, t.luma[p ^ 1u][k]);
             }
         }
         for (unsigned k = 0; !engine && k < kTemporalLevels; ++k) {
@@ -2985,6 +3162,9 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 compute_barrier(cmd);
             }
         }
+        if (fs && !engine)
+            for (unsigned k = 0; k < kTemporalLevels; ++k) copy_general(t.luma[p][k], fs->estimator_luma[k]);
+        if (fs) fs->estimated_previous = !engine;
         // The estimator writes normalized backward motion, so the consumer's
         // MVecScale pair is 1.0.
         const bool have_depth = engine && engine->depth.image && !impl_->depth_unread && !impl_->motion_without_depth;
@@ -2998,7 +3178,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         const float params[12] = {gate ? 1.0f : 0.0f,
                                   engine ? engine->motion_scale_x : 1.0f,
                                   engine ? engine->motion_scale_y : 1.0f,
-                                  t.history_strength * impl_->post_blend_scale,
+                                  (c.history_strength >= 0.f ? std::clamp(c.history_strength, 0.f, 1.f) : t.history_strength) * impl_->post_blend_scale,
                                   float(t.history.w), float(t.history.h),
                                   have_depth ? 1.0f : 0.0f,
                                   have_depth && engine->depth_inverted ? 1.0f : 0.0f,
@@ -3017,17 +3197,61 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     }
     if (!temporal && !mask) {
         // No motion source: the seed is 0 unless Controls::noise_every_frame, then the DLL's counter.
-        if (c.noise_every_frame) pre_seed = impl_->plain_seed++;
-        else impl_->plain_seed = 0;
+        static const bool diag_seed0 = [] {
+            const char* e = std::getenv("NR_DIAG_SEED0");
+            return e && e[0] && e[0] != '0';
+        }();
+        uint32_t& seed = c.feature ? impl_->plain_seeds[c.feature] : impl_->plain_seed;
+        if (c.noise_every_frame && !c.seed_fixed && !diag_seed0) pre_seed = seed++;
+        else seed = 0;
     }
     // Bind this feature's history: copy the previously bound feature's state out
     // and this one's in. Only on a change, so the single-feature case records
     // nothing at all here.
-    if (fs && impl_->bound_feature != temporal->feature) {
+    if (fs && impl_->rotation()) {
+        // no copies - the feature's own image is read where it is; one without history yet reads a cleared one
+        if (t.hfresh) {
+            const nrvk::Context::Image& h = t.hist(t.hread);
+            barrier(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkClearColorValue zero{};
+            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            barrier(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+            fs->cleared = true;
+        }
+        impl_->bound_feature = temporal->feature;
+    } else if (fs && impl_->bound_feature != temporal->feature) {
         if (impl_->bound_feature) {
             auto prev = impl_->features.find(impl_->bound_feature);
-            if (prev != impl_->features.end()) copy_general(t.hist(t.hcur), prev->second.history);
+            if (prev != impl_->features.end() && prev->second.history.handle) {
+                if (!prev->second.cleared) {   // made at the start of this recording: still UNDEFINED
+                    barrier(cmd, prev->second.history.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                    prev->second.history.layout = VK_IMAGE_LAYOUT_GENERAL;
+                    prev->second.cleared = true;
+                }
+                copy_general(t.hist(t.hcur), prev->second.history);
+            }
         }
+        if (!fs->history.handle) {
+            // Never swapped out: it starts from zeros - what copying its cleared image in gave.
+            const nrvk::Context::Image& h = t.hist(t.hcur);
+            barrier(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkClearColorValue zero{};
+            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            barrier(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+            fs->cleared = true;
+            impl_->bound_feature = temporal->feature;
+        } else {
         if (!fs->cleared) {
             // A fresh feature's image is whatever the allocator left there. The
             // gate is closed on its first frame so nothing reads it, but an
@@ -3048,57 +3272,44 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         }
         copy_general(fs->history, t.hist(t.hcur));
         impl_->bound_feature = temporal->feature;
+        }
     }
-    // The passes. Pass k > 0 takes pass k-1's answer (surf0, the blended
-    // output) as its colour, the same motion and depth, and its own history:
-    // store[k] is copied into the bound history image before the pass and
-    // the model's write (surf1) copied back after it. With one pass the
-    // history round trip is the single copy it always was.
+    // EngineFrame::history: the caller's history for this run, into the image this recording reads.
+    if (engine && engine->history.image && fs && gate) {
+        nrvk::Context::Image& dst = t.hist(impl_->rotation() ? t.hread : t.hcur);
+        auto& s = impl_->session;
+        barrier(cmd, engine->history.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[1] = {int32_t(engine->history.width), int32_t(engine->history.height), 1};
+        b.dstOffsets[1] = {int32_t(dst.w), int32_t(dst.h), 1};
+        nrvk::blit(s.ctx.physical, s.ctx.device, cmd, engine->history.image, engine->history.format, VK_IMAGE_LAYOUT_GENERAL,
+                   dst.handle, dst.format, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    }
+    // The pass (one: a caller stacks passes as runs of its own).
     for (uint32_t pass = 0; pass < passes; ++pass) {
-        if (pass > 0 && impl_->cascade_detail) {
-            // Detail only: the first pass's input with the previous pass's
-            // local structure on it (windows/shaders/passes/cascade_feed.comp).
-            barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
-            struct { uint32_t w, h; float floor_; } lp{nw, nh, 1.0f / 512.0f};
-            dispatch(cmd, impl_->cascade_lograt, (nw + 7) / 8, (nh + 7) / 8, 1, &lp, sizeof lp);
-            compute_barrier(cmd);
-            struct { uint32_t w, h; int32_t radius; uint32_t dir; } bp{nw, nh, impl_->cascade_radius, 0u};
-            dispatch(cmd, impl_->cascade_blur_h, (nw + 7) / 8, (nh + 7) / 8, 1, &bp, sizeof bp);
-            compute_barrier(cmd);
-            bp.dir = 1u;
-            dispatch(cmd, impl_->cascade_blur_v, (nw + 7) / 8, (nh + 7) / 8, 1, &bp, sizeof bp);
-            compute_barrier(cmd);
-            struct { uint32_t w, h; float guard; } fp{nw, nh, 2.0f};
-            dispatch(cmd, impl_->cascade_feed, (nw + 7) / 8, (nh + 7) / 8, 1, &fp, sizeof fp);
-            barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-            compute_barrier(cmd);
-            if (temporal) copy_general(impl_->history_store[pass], t.history);
-        } else if (pass > 0) {
-            barrier(cmd, s.surf0.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-            VkImageCopy c{};
-            c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            c.extent = {nw, nh, 1};
-            vkCmdCopyImage(cmd, s.surf0.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           s.tex_in.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-            barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-            barrier(cmd, s.surf0.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-            if (temporal) copy_general(impl_->history_store[pass], t.history);
+        ColourFrame shot_in{}, shot_out{};
+        const bool snapshot = c.model_capture && pass + 1 == passes;
+        if (snapshot) {
+            shot_in.image = ds ? frame.image : s.tex_in.handle;
+            shot_in.format = ds ? frame.format : s.tex_in.format;
+            shot_in.width = shot_out.width = nw; shot_in.height = shot_out.height = nh;
+            shot_in.before = shot_in.after = ds ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            shot_out.image = ds && ds->store ? wb : s.surf0.handle;
+            shot_out.format = ds && ds->store ? frame.format : s.surf0.format;
+            shot_out.before = shot_out.after = VK_IMAGE_LAYOUT_GENERAL;
+            c.model_capture(cmd, shot_in, shot_out, false);
         }
         const bool time_net = impl_->timing_ok && impl_->split_timing;
         const uint32_t net_query = timing_slot * impl_->timing_stride + 2 + 2 * pass;
+        if (c.network_timestamp) c.network_timestamp(cmd, true);
         if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query);
         for (size_t i = 0; i < s.steps.size(); ++i) {
             const auto& step = s.steps[i];
@@ -3109,18 +3320,13 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             else if (!temporal && ds && step.k==impl_->plain_pre) set = ds->pre[0];
             else if (!temporal && ds && step.k==impl_->plain_post) set = ds->post[0];
             else if (temporal && step.k==t.original_pre) {
-                use = t.pingpong ? &t.pre_pp[t.hcur] : &t.pre;
-                if (sets) set = sets->pre[t.hcur];
+                use = t.pingpong ? &impl_->pre_for(t.hread, t.hwrite) : &t.pre;
+                if (sets) set = sets->pre[0];
             } else if (temporal && step.k==t.original_post) {
-                use = t.pingpong ? &t.post_pp[t.hcur] : &t.post;
-                if (sets) set = sets->post[t.hcur];
+                use = !t.pingpong ? &t.post : &impl_->post_for(t.hread, t.hwrite, t.h16);
+                if (sets) set = sets->post[0];
             }
-            // Each pass has its own controls; see `pass_push`. An empty entry
-            // means that dispatch carries none, so pass 1's push stands.
             const void* push = step.push;
-            if (pass > 0 && pass < impl_->pass_push.size() &&
-                i < impl_->pass_push[pass].size() && !impl_->pass_push[pass][i].empty())
-                push = impl_->pass_push[pass][i].data();
             // A Style in the post block's push (bits 28-29, set only when the grade pipelines exist): its grade
             // twin, over the set the plain one would bind.
             if (impl_->style_grade && step.k == impl_->graph_post) {
@@ -3130,21 +3336,28 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                     if (!set) set = use->set;
                     if (use == impl_->graph_post) use = &impl_->post_grade;
                     else if (use == &t.post) use = &t.post_grade;
-                    else if (use == &t.post_pp[0] || use == &t.post_pp[1]) use = &t.post_grade_pp[use - t.post_pp];
+                    else if (nrvk::Kernel* g = impl_->grade_of(use)) use = g;
                     else throw std::runtime_error("Style grade: no grade pipeline for this post block");
                 }
             }
             // This frame's noise seed, computed in the shader: the precomputed
             // field is seed 0's.
             uint8_t pre_push[kPrePushBytes];
-            if ((temporal ? step.k == t.original_pre : !mask && step.k == impl_->plain_pre) && pre_seed) {
+            const bool pre_step = temporal ? step.k == t.original_pre
+                                           : mask ? step.k == impl_->original_pre : step.k == impl_->plain_pre;
+            if (pre_step && (pre_seed || (s.noise_real && !s.noise_jobs.empty()))) {
                 if (step.push_bytes != kPrePushBytes)
                     throw std::runtime_error("temporal pre block: unexpected push size");
-                const uint32_t no_field = 0;
+                // seed 0 reads the table when there is one (NrSession::noise_buf); any other seed computes
+                const uint32_t field = pre_seed ? 0u : s.noise_jobs.front().off;
                 std::memcpy(pre_push, push, kPrePushBytes);
-                std::memcpy(pre_push + kPreSeedAt, &pre_seed, 4);
-                std::memcpy(pre_push + kPreNoiseFieldAt, &no_field, 4);
+                if (pre_seed) std::memcpy(pre_push + kPreSeedAt, &pre_seed, 4);
+                std::memcpy(pre_push + kPreNoiseFieldAt, &field, 4);
                 push = pre_push;
+            }
+            if (pre_step && !s.noise_real && !s.noise_jobs.empty()) {
+                impl_->seed0_run = pre_seed ? 0u : impl_->seed0_run + 1u;
+                if (impl_->seed0_run >= 2u) impl_->want_noise = true;
             }
             dispatch(cmd, *use, step.gx, step.gy, step.gz, push, step.push_bytes, set);
             // Execution-only between network steps when the arena is coherent,
@@ -3159,41 +3372,19 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                             s.runner.inv_barrier && !last);
         }
         if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query + 1);
-        if (temporal && !t.pingpong) {
-            // History is a copy of what the MODEL wrote - the temporal post variant
-            // puts that on the second surface, before the application strength -
-            // and it is taken independently of whatever composition follows.
-            const nrvk::Context::Image& dst = passes > 1 ? impl_->history_store[pass] : t.history;
-            barrier(cmd, s.surf1.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-            VkImageCopy history_copy{};
-            history_copy.srcSubresource = history_copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
-            history_copy.extent = {nw, nh, 1};
-            vkCmdCopyImage(cmd, s.surf1.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           dst.handle, VK_IMAGE_LAYOUT_GENERAL, 1, &history_copy);
-            barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-            barrier(cmd, s.surf1.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        }
+        if (c.network_timestamp) c.network_timestamp(cmd, false);
+        if (snapshot) c.model_capture(cmd, shot_in, shot_out, true);
     }
     if (temporal) {
-        // Leave the bound history holding the FIRST pass's, which is what the
-        // next frame's first pass reads.
-        if (passes > 1) copy_general(impl_->history_store[0], t.history);
         // The latch is set after every recorded frame and `reset` never clears
         // it: reset suppresses consumption, it does not un-write the buffer.
         if (fs) { fs->latch = true; fs->parity ^= 1u; }
         else { t.latch = true; t.parity ^= 1u; }
-        // The post variant wrote this frame's history into the other image.
-        if (t.pingpong) t.hcur ^= 1u;
+        // The post variant wrote this frame's history into the other image (hwrite, now the feature's).
+        if (t.pingpong) {
+            t.hcur = t.hwrite;
+            if (fs && impl_->rotation()) fs->slot = int(t.hwrite);
+        }
         if (history_consumed) *history_consumed = gate;
     }
     impl_->check_record(cmd);
@@ -3201,67 +3392,20 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // submission holding their last use cannot still be executing.
     ++impl_->recordings;
     for (size_t i = impl_->retiring.size(); i-- > 0;) {
-        if (impl_->recordings < impl_->retiring[i].second) continue;
+        if (impl_->recordings < impl_->retiring[i].second || !impl_->retiring[i].uses.ready()) continue;
         s.ctx.destroy(impl_->retiring[i].first);
         impl_->retiring.erase(impl_->retiring.begin() + long(i));
     }
     info.network_dispatches = uint32_t(s.steps.size()) * passes;
-    if (prep_on) {
-        // The answer back into the frame's own domain. With later passes the
-        // first pass's input is in shown_keep, and the frame goes back there.
-        const bool multi = impl_->max_passes > 1;
-        if (!multi)
-            barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        compute_barrier(cmd);
-        prep_push.mode = 2;
-        prep_push.flags = (prep_push.flags & ~kPrepReset) | (multi ? kPrepRestore : 0u);
-        dispatch(cmd, multi ? impl_->prep_back_k : impl_->prep_k, (nw + 15) / 16, (nh + 15) / 16, 1,
-                 &prep_push, sizeof prep_push);
-        compute_barrier(cmd);
-        if (!multi)
-            barrier(cmd, s.tex_in.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-    }
     if (c.apply_model) {
         if (mask) {
             struct { uint32_t w,h;float intensity; } push{frame.width,frame.height,c.intensity};
             dispatch(cmd,impl_->mask_resolve,(frame.width+7)/8,(frame.height+7)/8,1,&push,sizeof push);
             compute_barrier(cmd);
         }
-        if (!mask && !impl_->native_compose) {
-            // The model's answer onto the frame, as OptiScaler DLSS-NR's
-            // resolve; see the shader. At the frame extent; the model-sized
-            // answer is sampled.
-            const bool prep_variant = prep_on && impl_->transfer_prep.device;
-            // runtime_transfer.comp's mode: 0 classic, 1 matched residual, 2 edge-aware
-            static const uint32_t kShaderMode[3] = {1u, 2u, 0u};
-            const int enlargement = std::clamp(c.transfer, 0, 2);
-            const uint32_t mode = kShaderMode[enlargement];
-            const uint32_t scaler = uint32_t(std::clamp(c.classic_scaler, 0, 3));
-            const bool enlarge = impl_->scaled && enlargement == kEnlargeClassic && scaler != 0;
-            if (enlarge) {
-                const uint32_t up[] = {frame.width, frame.height, nw, nh, scaler};
-                dispatch(cmd, prep_variant ? impl_->upscale_prep : impl_->upscale_pass,
-                         (frame.width + 7) / 8, (frame.height + 7) / 8, 1, up, sizeof up);
-                compute_barrier(cmd);
-            }
-            const TransferPush push{frame.width, frame.height, nw, nh, impl_->linear ? 0u : 1u,
-                                    c.detail_strength, c.colour_strength, c.max_ratio, impl_->white_point, mode,
-                                    (enlarge ? kTransferEnlarged : 0u) | (c.transfer_guided ? kTransferGuided : 0u) |
-                                        (impl_->store_native && impl_->round_u8 ? kTransferRoundU8 : 0u),
-                                    c.transfer_sigma};
-            const nrvk::Kernel& transfer = prep_variant ? impl_->transfer_prep : impl_->transfer_pass;
-            dispatch(cmd, transfer, (frame.width + 7) / 8, (frame.height + 7) / 8, 1, &push, sizeof push,
-                     fr ? (prep_variant ? fr->transfer_prep : fr->transfer) : VK_NULL_HANDLE);
-            compute_barrier(cmd);
-        }
-        const VkImage out = impl_->store_native ? impl_->keep_full.handle
-                            : impl_->scaled ? impl_->full_out.handle : s.surf0.handle;
+        const VkImage out = s.surf0.handle;
         const uint32_t extent[] = {frame.width, frame.height, uint32_t(impl_->round_u8)};
-        if ((!impl_->post_alpha || mask) && !impl_->store_native)
+        if (!impl_->post_alpha || mask)
             dispatch(cmd, impl_->alpha, (frame.width + 7) / 8, (frame.height + 7) / 8, 1, extent, sizeof extent);
         if (stored) {
             // The post block's store was the write-back.
@@ -3278,7 +3422,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 ds ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
                 ds ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-        if (impl_->direct_out || impl_->store_native) {
+        if (impl_->direct_out) {
             // Already the frame's bits (an *_SRGB frame takes its UNORM twin's).
             vkCmdCopyImage(cmd, out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            wb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
@@ -3286,8 +3430,8 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             barrier(cmd,encoded.handle,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
-            vkCmdBlitImage(cmd,out,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           encoded.handle,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_NEAREST);
+            nrvk::blit(s.ctx.physical, s.ctx.device, cmd, out, s.surf0.format, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       encoded.handle, encoded.format, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
             barrier(cmd,encoded.handle,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
@@ -3297,8 +3441,8 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                     VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT);
         } else if (impl_->transfer == Transfer::DirectBlit) {
-            vkCmdBlitImage(cmd, out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           wb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+            nrvk::blit(s.ctx.physical, s.ctx.device, cmd, out, s.surf0.format, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, wb,
+                       tgt ? tgt->format : frame.format, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
         } else {
             vkCmdCopyImage(cmd, out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            wb, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
@@ -3365,9 +3509,310 @@ void set_input_check(bool on, const std::string& folder, int pictures) {
 float Runtime::last_gpu_ms() const { return impl_->gpu_ms; }
 float Runtime::average_gpu_ms() const { return impl_->gpu_ms_avg; }
 float Runtime::average_network_ms() const { return impl_->split_timing ? impl_->net_ms_avg : 0.0f; }
-std::pair<float, float> Runtime::preprocess_meter() const {
-    const float* s = static_cast<const float*>(impl_->prep_state.mapped);
-    if (!s || s[1] != 1.0f) return {NAN, NAN};
-    return {s[0], s[3]};
+void Runtime::discard_timing() { impl_->timings_recorded = 0; }
+
+// ---- the D3D12 passthrough's network (nr_d3d12_net_plan.hpp) ---------------------------------------------------
+//
+// Runtime::Runtime's model choice and build arguments, and NrSession::build with plan_only (the lowering; no device, no
+// pipelines), for a caller that runs the dispatches itself. Divergences from the constructor, all of them about the
+// Vulkan host this has not got: no device checks or adopt, no pipeline binaries check (ACO Mode is the configured
+// directory alone), no --tex-in-format / --out0-format (the D3D12 side hands the network RGBA32F), no int4 network.
+bool plan_d3d12_network(const std::string& root_in, uint32_t mw, uint32_t mh, bool allow_experimental, D3d12NetPlan* out,
+                        std::string* why, int model_choice, nr::arch::GpuArch arch) {
+    try {
+        *out = D3d12NetPlan{};
+        const auto root = std::filesystem::canonical(nr::u8::path(root_in));
+        const auto data = std::filesystem::is_directory(root / "dlssnr-amd") ? root / "dlssnr-amd" : root;
+        if (data == root) { *why = "no dlssnr-amd folder in " + root.string(); return false; }
+        const std::string ini = writable_ini_file(data.parent_path());
+        std::string aco = nr::binary::directory();
+        if (aco.empty()) {
+            *why = "ACO Mode is off" + (nr::binary::disabled_why().empty() ? std::string()
+                                                                           : " (" + nr::binary::disabled_why() + ")");
+            return false;
+        }
+        // The architecture's network: RDNA3 the bundle's own rdna3 folder (its stand-ins name their records; the Vulkan
+        // runtime's aco_rdna3 layout), whether or not a Vulkan device of NR's switched the process's ACO folder to it
+        // already (use_rdna3); RDNA4 the bundle itself; anything else none.
+        bool rdna3 = false;
+        switch (arch) {
+        case nr::arch::GpuArch::rdna3: rdna3 = true; break;
+        case nr::arch::GpuArch::rdna4:
+            if (aco.size() > 6 && aco.compare(aco.size() - 6, 6, "/rdna3") == 0) aco.resize(aco.size() - 6);
+            break;
+        case nr::arch::GpuArch::unknown: case nr::arch::GpuArch::rdna1: case nr::arch::GpuArch::rdna2:
+            *why = std::string("NR has no network for this GPU's architecture (") + nr::arch::name(arch) + ")";
+            return false;
+        }
+        if (rdna3) {
+            if (aco.size() > 6 && aco.compare(aco.size() - 6, 6, "/rdna3") == 0) aco.resize(aco.size() - 6);
+            aco += "/rdna3";
+            std::error_code ec;
+            if (!std::filesystem::is_directory(nr::u8::path(aco + "/records"), ec)) { *why = "the RDNA3 records are missing (" + aco + ")"; return false; }
+        }
+        const auto network_shaders = std::filesystem::path(aco) / "shaders";
+        // The model, as the constructor picks it: DLSSNR_MODEL over dlssnr-amd.ini [Network] Model; none: the small one.
+        NetworkModel network = NetworkModel::Small;
+        bool experimental = false, optimized = false, int4 = false;
+        int level = nr::kLayersQuality;
+        const std::filesystem::path xroot = rdna3 ? std::filesystem::path(aco) / "experimental" : data / "experimental";
+        const std::filesystem::path oroot = rdna3 ? std::filesystem::path(aco) / "optimized" : data / "optimized";
+        std::filesystem::path i4root = data / "int4";
+        // the int4 levels' SPIR-V: i4root's on RDNA4; RDNA3's own stand-ins in aco/rdna3/<level>/shaders (the tables -
+        // vit/, swin/, settings.txt - are i4root's on both, as the Vulkan runtime's i4spv)
+        const auto i4spv = [&] { return rdna3 ? std::filesystem::path(aco) / i4root.filename() / "shaders" : i4root / "shaders"; };
+        std::map<std::string, std::string> int4_cfg;
+        std::string from;
+        {
+            std::string env;
+#ifdef _WIN32
+            { char b[64] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_MODEL", b, sizeof b); if (n && n < sizeof b) env = b; }
+#endif
+            if (env.empty()) if (const char* e = std::getenv("DLSSNR_MODEL")) env = e;
+            const int ev = env.empty() ? -1 : nr::network_value(env);
+            const int iv = model_choice >= 0 || ev >= 0 ? -1 : nr::ini_network(ini);
+            from = model_choice >= 0 ? "caller" : ev >= 0 ? "DLSSNR_MODEL" : iv >= 0 ? "dlssnr-amd.ini" : "default";
+            int v = model_choice >= 0 ? (model_choice == nr::kSmallFp8 ? 1 : model_choice == nr::kSmallFp8Experimental ? 2 : nr::network_optimized(model_choice) ? 3 : 0)
+                                      : (ev >= 0 ? ev : iv);
+            if (v == 0 || v == 3) network = NetworkModel::Original;
+            std::error_code ec;
+            if (v == 3) {
+                const char* missing = !std::filesystem::is_regular_file(oroot / "shaders" / "fixed-attention.txt", ec) ||
+                                      !std::filesystem::is_directory(oroot / "shaders" / "temporal", ec) ? "dlssnr-amd/optimized/ is incomplete"
+                    : !std::filesystem::is_regular_file(data / "CC_SILVER_AARDWOLD_OPTIMIZED.bin", ec)
+                              ? "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED.bin is missing"
+                    : nullptr;
+                if (missing) {
+                    out->note = std::string("CC_SILVER_AARDWOLD_OPTIMIZED, but ") + missing + ": CC_SILVER_AARDWOLD";
+                    v = 0;
+                } else {
+                    optimized = true;
+                }
+            }
+#if NR_INT4
+            if (optimized) {
+                std::string int4_env;
+#ifdef _WIN32
+                { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_INT4", b, sizeof b); if (n && n < sizeof b) int4_env = b; }
+#endif
+                if (int4_env.empty()) if (const char* e = std::getenv("DLSSNR_INT4")) int4_env = e;
+                level = nr::network_optimized(model_choice) ? nr::network_layers(model_choice) : nr::optimized_layers_value(int4_env);
+                if (!nr::network_optimized(model_choice) && int4_env.empty()) {
+                    const int il = nr::ini_optimized_layers(ini);
+                    level = il >= 0 ? il : nr::kLayersDefault;
+                }
+                if (level < 0) level = nr::kLayersQuality;
+                i4root = data / (level == nr::kLayersPerformance ? "int4-performance"
+                                 : level == nr::kLayersUltra ? "int4-ultra" : "int4");
+                const auto i4weights = data / "CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin";
+                if (level >= nr::kLayersBalanced) {
+                    const std::string incomplete = "dlssnr-amd/" + i4root.filename().string() + "/ is incomplete";
+                    const char* missing = !std::filesystem::is_directory(i4spv() / "temporal", ec) || !std::filesystem::is_directory(i4root / "vit", ec) ||
+                                          !std::filesystem::is_regular_file(i4root / "settings.txt", ec) ? incomplete.c_str()
+                        : !std::filesystem::is_regular_file(i4weights, ec) ? "dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin is missing"
+                        : !std::filesystem::is_directory(std::filesystem::path(aco) / "int4/records", ec) ? "the ACO INT4 records are missing"
+                        : nullptr;
+                    if (missing) {
+                        out->note = std::string("optimized layers ") + nr::layers_word(level) + " requested, but " + missing + ": CC_SILVER_AARDWOLD_OPTIMIZED at quality";
+                        level = nr::kLayersQuality;
+                    } else {
+                        int4 = true;
+                        int4_cfg["NR_I4_DIR"] = (i4root / "vit").string();
+                        if (std::filesystem::is_directory(i4root / "swin", ec)) int4_cfg["NR_SWI4_DIR"] = (i4root / "swin").string();
+                        int4_cfg["NR_I4_WEIGHTS"] = i4weights.string();
+                        const auto t = slurp((i4root / "settings.txt").string());
+                        nr::int4_settings(std::string(t.begin(), t.end()), int4_cfg);
+                    }
+                }
+            }
+#endif
+            if (v == 2) {
+                const char* missing = !allow_experimental ? "its kernels have no ACO records"
+                    : !std::filesystem::is_regular_file(xroot / "shaders" / "fixed-attention.txt", ec) ||
+                              !std::filesystem::is_directory(xroot / "shaders" / "temporal", ec) ? "dlssnr-amd/experimental/ is incomplete"
+                    : !std::filesystem::is_regular_file(data / "CC_SMALL_FP8_EXPERIMENTAL.bin", ec)
+                              ? "dlssnr-amd/CC_SMALL_FP8_EXPERIMENTAL.bin is missing"
+                    : nullptr;
+                if (missing) {
+                    out->note = std::string("CC_SMALL_FP8_EXPERIMENTAL, but ") + missing + ": CC_SMALL_FP8";
+                    v = 1;
+                } else {
+                    experimental = true;
+                }
+            }
+            if (network == NetworkModel::Small && !experimental &&
+                !std::filesystem::is_regular_file(data / "CC_SMALL_FP8.bin", ec)) {
+                out->note = "dlssnr-amd/CC_SMALL_FP8.bin is missing: the original model";
+                network = NetworkModel::Original;
+            }
+        }
+        out->model = optimized ? nr::network_label(nr::network_with_layers(nr::kSilverAardwoldOptimized, level))
+                               : network == NetworkModel::Small ? (experimental ? "CC_SMALL_FP8_EXPERIMENTAL" : "CC_SMALL_FP8") : "original";
+        out->model += " (" + from + ")";
+        auto ini_on = [&](const char* key) {
+            std::string v = nr::ini_network_key(ini, key);
+            for (auto& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+            return !(v == "0" || v == "false" || v == "off" || v == "no");
+        };
+        out->style_grade = ini_on("style grade");
+        const auto native = make_native_plan(mw, mh, network);
+        std::istringstream plan_stream(native.text);
+        const auto prepared_plan = parse_plan(plan_stream);
+        auto arena_reuse = [] {
+            const char* e = std::getenv("NR_ARENA_REUSE");
+            return e && *e ? std::atoi(e) != 0 : kArenaReuseDefault;
+        };
+        // --lazy-images as the runtime builds: the pre push says "no noise table" until frames keep seed 0 and the table
+        // is made (Runtime::Impl::make_noise; the D3D12 side does the same).
+        const std::filesystem::path cache_data = writable_cache_base(data);
+        const std::filesystem::path cache_file = cache_data / "pipeline.cache";
+        {
+            std::error_code cec;
+            std::filesystem::create_directories(cache_file.parent_path(), cec);
+        }
+        std::vector<std::string> arguments = {"nr_runtime", "--plan", "compiled native descriptor",
+            "--unpacked", (data / "model").string(),
+            "--spv-dir", network_shaders.string(),
+            "--host-boundary", arena_reuse() ? "--reuse" : "--no-reuse", "--source-width", std::to_string(mw),
+            "--source-height", std::to_string(mh), "--accumulation", "fp32",
+            "--pipeline-cache", cache_file.string(), "--lazy-images"};
+        // This planner has already selected the architecture's ACO folder. Do not let
+        // network_spv_dir replace RDNA3's base shaders with a process-global directory.
+        if (rdna3) arguments.push_back("--spv-dir-aco");
+        if (experimental || optimized) {
+            const std::filesystem::path& var_root = experimental ? xroot : oroot;
+            const std::filesystem::path var_cache = ((cache_data == data) ? var_root : (cache_data / var_root.filename())) / "pipeline.cache";
+            std::error_code cec;
+            std::filesystem::create_directories(var_cache.parent_path(), cec);
+            for (size_t i = 0; i + 1 < arguments.size(); ++i) {
+                if (arguments[i] == "--spv-dir") arguments[i + 1] = (var_root / "shaders").string();
+                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = var_cache.string();
+            }
+            arguments.push_back("--spv-dir-aco");
+        }
+        if (int4) {
+            const std::filesystem::path i4_cache = ((cache_data == data) ? i4root : (cache_data / i4root.filename())) / "pipeline.cache";
+            std::error_code cec;
+            std::filesystem::create_directories(i4_cache.parent_path(), cec);
+            for (size_t i = 0; i + 1 < arguments.size(); ++i) {
+                if (arguments[i] == "--spv-dir") arguments[i + 1] = i4spv().string();
+                if (arguments[i] == "--pipeline-cache") arguments[i + 1] = i4_cache.string();
+            }
+        }
+        {
+            const auto pack = data / (experimental ? "CC_SMALL_FP8_EXPERIMENTAL.bin"
+                                      : optimized ? "CC_SILVER_AARDWOLD_OPTIMIZED.bin"
+                                      : network == NetworkModel::Small ? "CC_SMALL_FP8.bin" : "CC_SILVER_AARDWOLD.bin");
+            if (!std::filesystem::is_regular_file(pack)) { *why = "missing " + pack.string(); return false; }
+            arguments.push_back("--model-pack"); arguments.push_back(pack.string());
+            if (optimized && int4 && level >= nr::kLayersPerformance) {
+                arguments.push_back("--model-pack-variant"); arguments.push_back("performance");
+            }
+        }
+        std::vector<char*> argv;
+        for (auto& a : arguments) argv.push_back(a.data());
+        std::lock_guard<std::mutex> lock(build_mutex);
+#if NR_INT4
+        const nr::BuildCfgScope cfg_scope(&int4_cfg);
+#endif
+        NrSession s;
+        s.ctx.set_arch(arch);   // the architecture's lowering (its FP16 matrices, its packing): the stand-ins' interfaces are its
+        s.plan_only = true;
+        s.weights_out = &out->weights;
+        const int built = s.build(int(argv.size()), argv.data(), &prepared_plan);
+        if (built != 4 || !s.missing.empty() || !s.core) {
+            *why = "the graph's lowering failed (" + std::to_string(built) + (s.missing.empty() ? "" : ", missing files") + ")";
+            return false;
+        }
+        const GraphCore& c = *s.core;
+        out->disp.reserve(c.disp.size());
+        for (size_t i = 0; i < c.disp.size(); ++i) {
+            const Disp& d = c.disp[i];
+            D3d12NetPlan::Dispatch x;
+            x.kern = d.kern; x.gx = d.gx; x.gy = d.gy; x.gz = d.gz; x.push = d.push;
+            x.no_barrier_after = i + 1 < c.disp.size() && i < c.no_barrier_after.size() && c.no_barrier_after[i] != 0;
+            // put_act_address: the arena's address at act_lo (PushVAttn for vitattn, PushGemm for the GEMMs)
+            const size_t gap = int4 ? (d.kern == "vitattn" ? offsetof(PushVAttn, act_lo) : gemm_push_kern(d.kern) ? offsetof(PushGemm, act_lo) : 0) : 0;
+            if (gap && x.push.size() >= gap + 8) { std::memmove(x.push.data() + gap, x.push.data() + gap + 8, x.push.size() - gap - 8); std::memset(x.push.data() + x.push.size() - 8, 0, 8); }
+            else if (d.kern == "vitattn" && d.push.size() >= sizeof(PushVAttn)) x.act_at = int(offsetof(PushVAttn, act_lo));
+            else if (gemm_push_kern(d.kern) && d.push.size() >= sizeof(PushGemm)) x.act_at = int(offsetof(PushGemm, act_lo));
+            out->disp.push_back(std::move(x));
+        }
+        // The temporal path, as Runtime::Runtime sets it up (temporal_config.enable): the ACO bundle's shaders/temporal
+        // (experimental: its own), the no-upper-clamp pre when the graph's pre is fswinimagepreds32nh and the package has
+        // it, the post's Style-grade twin when it exists (else no grading), the RGBA16F history's posts when the folder
+        // has them (and the grade twin where the RGBA32F post has one: the runtime's h16_ok).
+        {
+            auto& t = out->temporal;
+            const bool pre_nh = std::any_of(c.disp.begin(), c.disp.end(), [](const Disp& d) { return d.kern == "fswinimagepreds32nh"; });
+            const std::string pre_name = pre_nh ? "fswinimagepreds32nh" : "fswinimagepreds32";
+            for (size_t i = 0; i < c.disp.size(); ++i) {
+                if (c.disp[i].kern == pre_name && t.pre < 0) t.pre = int(i);
+                if (c.disp[i].kern == "fswinimagepost32") t.post = int(i);
+            }
+            if (t.pre < 0 || t.post < 0) { *why = "the temporal path requires the fused FP32 image kernels"; return false; }
+            if (c.disp[size_t(t.pre)].push.size() != kPrePushBytes) { *why = "temporal pre block: unexpected push size"; return false; }
+            const auto shaders = int4 ? i4spv() / "temporal"
+                               : optimized ? oroot / "shaders" / "temporal"
+                               : experimental ? xroot / "shaders" / "temporal"
+                               : network_shaders / "temporal";
+            std::error_code ec;
+            auto have = [&](const char* name) { return std::filesystem::is_regular_file(shaders / name, ec); };
+            const bool tp_nh = pre_nh && have("temporal_pre_fp32nh.spv");
+            t.pre_spv = (shaders / (tp_nh ? "temporal_pre_fp32nh.spv" : "temporal_pre_fp32.spv")).string();
+            t.post_spv = (shaders / "temporal_post_fp32.spv").string();
+            if (!std::filesystem::is_regular_file(t.pre_spv, ec) || !std::filesystem::is_regular_file(t.post_spv, ec)) {
+                *why = "the temporal shaders are missing in " + shaders.string(); return false;
+            }
+            const bool grade32 = have("temporal_post_fp32_grade.spv");
+            if (grade32) t.post_grade_spv = (shaders / "temporal_post_fp32_grade.spv").string();
+            if (have("temporal_post_fp32h16.spv") && (!grade32 || have("temporal_post_fp32h16_grade.spv"))) {
+                t.post16_spv = (shaders / "temporal_post_fp32h16.spv").string();
+                if (grade32) t.post16_grade_spv = (shaders / "temporal_post_fp32h16_grade.spv").string();
+            }
+            if (!grade32) out->style_grade = false;
+            // [Network] History Precision: 16 (the default) or 32; NR_HIST16 in the environment wins (Runtime::Runtime)
+            {
+                std::string v = nr::ini_network_key(ini, "history precision");
+                for (auto& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+                t.history_f16 = !(v == "32" || v == "fp32" || v == "full" || v == "rgba32f");
+                if (const char* e = std::getenv("NR_HIST16")) t.history_f16 = std::atoi(e) != 0;
+            }
+            t.pre_push_bytes = kPrePushBytes;
+            t.seed_at = kPreSeedAt;
+            t.noise_field_at = kPreNoiseFieldAt;
+            t.blend_scale = network == NetworkModel::Small ? kPostBlendScaleSmall : kPostBlendScale;
+            t.motion_without_depth = ini_on("motion without depth");
+        }
+        for (const NoiseJob& j : c.noise) out->noise.push_back({j.off, j.width, j.height, j.seed, j.noise});
+        out->noise_in_buffer = c.noise_in_buffer;
+        if (c.noise_in_buffer) {   // NrSession::noise_bytes: 16 bytes, then every job's table
+            out->noise_bytes = 16;
+            for (const NoiseJob& j : c.noise) out->noise_bytes += uint64_t(j.width) * j.height * 8u;
+        }
+        out->weights_end = c.weights_end;
+        out->act_total = c.act_total;
+        out->spv_dir = c.spv_dir;
+        out->width = mw; out->height = mh;
+        out->work_w = native.width; out->work_h = native.height;
+        // The tail (the records, and the noise table when it is not in a buffer of its own) at weights_end, as retarget
+        // puts it into the network memory.
+        if (out->weights.size() < c.weights_end + c.tail.size()) out->weights.resize(c.weights_end + c.tail.size(), 0);
+        if (!c.tail.empty()) std::memcpy(out->weights.data() + c.weights_end, c.tail.data(), c.tail.size());
+        return true;
+    } catch (const std::exception& e) {
+        *why = e.what();
+        return false;
+    }
+}
+
+void d3d12_net_controls(D3d12NetPlan::Dispatch& d, const D3d12NetControls& c, bool grade) {
+    // As Runtime::record_all: the post block itself restores the alpha (and the 8-bit rounding) - the automatic
+    // character mask only steers the pre block (its skin / background push); no separate alpha pass (that one is the
+    // Vulkan runtime's for an external control mask, which the D3D12 passthrough has none of).
+    patch_push_controls(d.push, d.kern, c.style, c.intensity, c.local_tone, c.local_structure, c.skin_structure,
+                        c.automatic_mask, true, c.round_u8, grade);
 }
 }  // namespace nr
+
+namespace nr { bool Runtime::recordings_done() const { return impl_->gpu_uses.ready(); } }

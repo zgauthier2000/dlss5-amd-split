@@ -23,16 +23,57 @@
 // x86-64 only.
 #include <d3d12.h>
 
+#include "nr_gpu_completion.hpp"
+
+#include <memory>
+
+#include <cstdint>
+#include <functional>
+#include <vector>
+
 #include <functional>
 #include <memory>
 #include <string>
 
 namespace nr::pe::split {
 
+// The completion evidence this layer already keeps: the per-queue fence signalled after each expansion the hooks
+// execute, and how far the GPU has got through it. A recording made into a list of this queue may be released once
+// the value it was booked at has completed - the same watermark the continuations are reused by, not another one.
+uint64_t queue_value(ID3D12CommandQueue* queue);      // the last value signalled on that queue's fence (0: none)
+uint64_t queue_completed(ID3D12CommandQueue* queue);  // the value the GPU has finished (0: unknown)
+
+// A recording's ticket: booked when work is recorded into the list, stamped by every ExecuteCommandLists that runs
+// it (the plain path included), ended by the list's Reset. completed() is the GPU's answer for all the stamps; a
+// discarded (Reset without execution) recording invalidates its history instead. 0: booking failed.
+// The rule completed() applies, as its own function so the sequences (never submitted, Reset failed, sealed with a
+// pending fence, executed twice, discarded after execution) can be checked without a device. `receipt_done` holds one
+// entry per receipt: whether that execution has finished.
+inline bool tickets_complete(bool sealed, bool discarded, const std::vector<bool>& receipt_done) {
+    // Nothing was ever submitted: the recording is finished once it is over (a successful Reset or a discard).
+    if (receipt_done.empty()) return sealed || discarded;
+    for (bool d : receipt_done) if (!d) return false;   // discarded stops future submissions, not these waits
+    return true;
+}
+
+std::shared_ptr<nr::gpu::Recording> book(ID3D12CommandList* list);
+bool completed(const std::shared_ptr<nr::gpu::Recording>& rec);
+void invalidate(const std::shared_ptr<nr::gpu::Recording>& rec);
+// The step ExecuteCommandLists takes for the lists it runs (the hooks call this), and the one Reset takes when it
+// succeeded - public so a test can drive the same path without the hooks.
+void note_execution(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists);
+void seal(const std::shared_ptr<nr::gpu::Recording>& rec);
+using SplitBeginFn = void (*)();
+using SplitEndFn = void (*)(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists);
+void set_split_execution_hooks(SplitBeginFn begin_fn, SplitEndFn end_fn);
+
 // Hooks the list's class (once per class) and its queues'. False when lists of this class cannot be
 // cut, or when this list's state since its last Reset is not known yet - the hooks were installed
 // after it was reset - in which case the frame passes through and the next one is cut.
 bool prepare(ID3D12GraphicsCommandList* list, std::string* why);
+// The cut is off for good in this process (a class could not be hooked, or a cut list was reset unexecuted):
+// prepare() never succeeds again. False while a refusal is only this list's or this moment's.
+bool disabled();
 
 // The list's recorded state at this moment, for cut().
 struct Snapshot;
@@ -58,5 +99,11 @@ bool cut(ID3D12GraphicsCommandList* list, Job job, const std::shared_ptr<Snapsho
 // NR Control (nr_pe_menu.cpp): a D3D12 swap chain does not say which queue presents it, and a game presents on the
 // thread that has just executed its frame on that queue.
 ID3D12CommandQueue* last_direct_queue();
+
+// Read-only introspection for Direct passthrough coexistence (both orders).
+bool is_split_list(ID3D12GraphicsCommandList* list, bool* active_cut = nullptr);
+void* orig_list_method(void** vt, unsigned slot);
+void* orig_device_create_cl(void** dvt);
+void* orig_queue_execute(void** qvt);
 
 }  // namespace nr::pe::split

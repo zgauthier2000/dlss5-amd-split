@@ -1,21 +1,29 @@
-# DLSSNR-AMD Windows installer (run by install.bat)
+﻿# DLSSNR-AMD Windows installer (run by install.bat)
 #
 #   install.bat                      a window asks for the game's exe, then for the route
-#   install.bat <game exe or its folder> [optiscaler|reshade-feeder|reshade-feeder-dx9|reshade-feeder-vulkan|remove|logs]
-#               [-Dll <nvngx_dlssnr.dll or its zip>] [-Model <network>] [-AcoMode 1|0] [-RenoDX on|off]
+#   install.bat <game exe or its folder> [optiscaler|standalone|reshade-feeder|reshade-feeder-dx9|reshade-feeder-vulkan|remove|logs]
+#               [-Dll <nvngx_dlssnr.dll or its zip>] [-Model <network>] [-RenoDX on|off] [-Lumenite on|off]
 #
-# All three networks are installed and can be switched in game at any time (the drop-down in NR Control or on
+# Unreal Engine games: the folder is <project>\Binaries\Win64 (the *-Shipping.exe), not the top folder with the launcher.
+#
+# All four networks are installed and can be switched in game at any time (the drop-down in NR Control or on
 # ReShade's Add-ons page, or Ctrl+F11 to cycle). The choice only sets the one a game starts with ([Network] Model):
-#   -Model CC_SMALL_FP8                   the default network of NVIDIA's 310.9.16, the fastest (default)
+#   -Model CC_SMALL_FP8                   the default network of NVIDIA's 310.9.16 (default)
+#   -Model CC_SMALL_FP8_EXPERIMENTAL      this project's experimental network: CC_SMALL_FP8 made faster; its weights
+#                                         are made from CC_SMALL_FP8's model at install; ACO Mode only
 #   -Model CC_SILVER_AARDWOLD             the network of 310.8.0 (also preset 1 of 310.9.16)
-#   -Model CC_SILVER_AARDWOLD_INT4_MIXED  CC_SILVER_AARDWOLD with part of the work in int4 and other lower precisions;
-#                                         faster, the picture differs somewhat; runs with ACO Mode = 1 only
+#   -Model CC_SILVER_AARDWOLD_OPTIMIZED   this project's faster CC_SILVER_AARDWOLD; its weights are made from
+#                                         CC_SILVER_AARDWOLD's model at install; ACO Mode only. Optimized layers: Quality /
+#                                         Balanced / Performance / Ultra Performance (default) ([Network] OptimizedLayers
+#                                         in dlssnr-amd.ini; a switch in game)
 # Without it, the installer asks once; Enter = CC_SMALL_FP8. The earlier choices still work: -Model new = CC_SMALL_FP8,
-# -Model old = CC_SILVER_AARDWOLD, -Network aco-int4-mixed = CC_SILVER_AARDWOLD_INT4_MIXED with ACO Mode 1,
-# -Network aco = ACO Mode 1, -Network default = ACO Mode 0.
+# -Model old = CC_SILVER_AARDWOLD; -Model CC_SILVER_AARDWOLD_INT4_MIXED and -Network aco-int4-mixed (the network
+# CC_SILVER_AARDWOLD_OPTIMIZED replaced) = CC_SILVER_AARDWOLD_OPTIMIZED.
 #
-# ACO Mode ([Network] ACO Mode in dlssnr-amd.ini, -AcoMode, 1 by default): the network's machine code made in advance
-# by the ACO compiler and loaded by the AMD driver; 0 = the AMD driver's own compiler. Not asked; NR Control has it.
+# ACO Mode is not a setting (-AcoMode and -Network default / aco of older packages are accepted and do nothing): the
+# network always runs as machine code made in advance by the ACO compiler, loaded by the AMD driver. When the driver
+# cannot take it, NR Control and dlssnr-amd.log say why and an RX 9000 runs the network compiled by the AMD driver
+# instead; RX 7000 and the Radeon 700M / 800M / 8000S graphics have no NR then.
 #
 # LumeniteFX (ReShade routes only, -Lumenite on|off [-LumeniteZip <zip>]; asked at install, Enter = off): motion vectors
 # from LumeniteFX Kernel (by Afzaal (Kaidō), https://github.com/umar-afzaal/LumeniteFX, AGNYA licence). It is not in this
@@ -24,14 +32,16 @@
 # downloaded (Code > Download ZIP on its GitHub page). The files are copied unchanged. On ReShade's Add-ons page (Motion
 # vectors) you can switch back to VORT.
 #
-# RenoDX style (asked at install, -RenoDX on|off; [RenoDX] Enabled in dlssnr-amd.ini): the picture before and after NR
-# is processed the way RenoDX's DLSS5 add-on does it, and every NR setting moves to [RenoDX] (on the OptiScaler route in
-# the NR Control menu, on the ReShade routes on the Add-ons page).
+# The processing of the picture before and after NR (the NR network itself is the same; asked at install, -RenoDX on|off):
+#   -RenoDX on   the RenoDX style (default): processed the way RenoDX's DLSS5 add-on does it.
+#   -RenoDX off  the wilsjo2 style: on the OptiScaler route the original processing of OptiScaler-NR (wilsjo2), ported;
+#                on the ReShade routes OptiScaler-NR's (wilsjo2) settings and names ([DlssNr]), this route's own processing.
+# Later NR Control (End in game) or ReShade's Add-ons page switches it. For stacking use Passes.
 #
 # The package carries no model: on the first install the user gives NVIDIA's nvngx_dlssnr.dll (310.9.16 or
 # 310.8.0) or a zip that contains it, and model-tools\dlssnr_extract_model.exe makes the model files from it:
-# from 310.9.16 dlssnr.bin (CC_SILVER_AARDWOLD, which 310.9.16 also holds) and dlssnr-small.bin (CC_SMALL_FP8), from
-# 310.8.0 dlssnr.bin only. It only reads the weight data; the DLL is never loaded or run. The models are kept in
+# from 310.9.16 CC_SILVER_AARDWOLD.bin (CC_SILVER_AARDWOLD, which 310.9.16 also holds) and CC_SMALL_FP8.bin (CC_SMALL_FP8), from
+# 310.8.0 CC_SILVER_AARDWOLD.bin only. It only reads the weight data; the DLL is never loaded or run. The models are kept in
 # the package's dlssnr-amd\, so later installs from this package need no DLL.
 #
 # Every file put into the game folder is listed in dlssnr-amd-install.txt; existing files it would
@@ -86,15 +96,17 @@ if (-not $Route) {
     Say "Game folder: $game"
     Say 'Choose a route:'
     Say '  1) optiscaler             the game has a DLSS, FSR or XeSS option (DX11 / DX12, OptiScaler)'
-    Say '  2) reshade-feeder         other DX10/11/12 games (ReShade)'
-    Say '  3) reshade-feeder-dx9     old DX9 games (ReShade)'
-    Say '  4) reshade-feeder-vulkan  Vulkan games (ReShade)'
-    Say '  5) Uninstall'
-    Say '  6) Collect logs           when something goes wrong; the zip goes to the desktop'
-    $pick = Read-Host '1-6'
+    Say '  2) standalone             any DX11 / DX12 / Vulkan app, video player, Magpie or capture viewer (no upscaler or ReShade)'
+    Say '  3) reshade-feeder         other DX10/11/12 games (ReShade)'
+    Say '  4) reshade-feeder-dx9     old DX9 games (ReShade)'
+    Say '  5) reshade-feeder-vulkan  Vulkan games (ReShade)'
+    Say '  6) Uninstall'
+    Say '  7) Collect logs           when something goes wrong; the zip goes to the desktop'
+    $pick = Read-Host '1-7'
     switch ($pick) {
-        '1' { $Route = 'optiscaler' } '2' { $Route = 'reshade-feeder' } '3' { $Route = 'reshade-feeder-dx9' }
-        '4' { $Route = 'reshade-feeder-vulkan' } '5' { $Route = 'remove' } '6' { $Route = 'logs' }
+        '1' { $Route = 'optiscaler' } '2' { $Route = 'standalone' } '3' { $Route = 'reshade-feeder' }
+        '4' { $Route = 'reshade-feeder-dx9' } '5' { $Route = 'reshade-feeder-vulkan' } '6' { $Route = 'remove' }
+        '7' { $Route = 'logs' }
         default { Fail 'Invalid choice.' }
     }
 }
@@ -102,43 +114,47 @@ if (-not $Route) {
 $renamed = @{ 'reshade' = 'reshade-feeder'; 'dx9' = 'reshade-feeder-dx9'; 'vulkan' = 'reshade-feeder-vulkan' }
 if ($renamed.ContainsKey($Route)) { Fail "Unknown route: $Route (this route is now called $($renamed[$Route]))" }
 if ($Route -eq 'optiscaler-renodx') { $Route = 'optiscaler'; if (-not $RenoDX) { $RenoDX = 'on' } }
-if ('optiscaler', 'reshade-feeder', 'reshade-feeder-dx9', 'reshade-feeder-vulkan', 'remove', 'logs' -notcontains $Route) {
+if ('optiscaler', 'standalone', 'reshade-feeder', 'reshade-feeder-dx9', 'reshade-feeder-vulkan', 'remove', 'logs' -notcontains $Route) {
     Fail "Unknown route: $Route"
 }
 
-# ---- the network a game starts with (asked after the model files are known) and ACO Mode -----------------------
-$Networks = @('CC_SMALL_FP8', 'CC_SILVER_AARDWOLD', 'CC_SILVER_AARDWOLD_INT4_MIXED')
-switch ($Model) { 'new' { $Model = 'CC_SMALL_FP8' } 'old' { $Model = 'CC_SILVER_AARDWOLD' } }
+# ---- the network a game starts with (asked after the model files are known) -----------------------------------
+$Networks = @('CC_SMALL_FP8', 'CC_SMALL_FP8_EXPERIMENTAL', 'CC_SILVER_AARDWOLD', 'CC_SILVER_AARDWOLD_OPTIMIZED')
+switch ($Model) { 'new' { $Model = 'CC_SMALL_FP8' } 'old' { $Model = 'CC_SILVER_AARDWOLD' }
+                  'CC_SILVER_AARDWOLD_INT4_MIXED' { $Model = 'CC_SILVER_AARDWOLD_OPTIMIZED' } }
 if ($Model -and $Networks -notcontains $Model) {
-    Fail "Unknown network: $Model (CC_SMALL_FP8, CC_SILVER_AARDWOLD or CC_SILVER_AARDWOLD_INT4_MIXED)"
+    Fail "Unknown network: $Model (CC_SMALL_FP8, CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD or CC_SILVER_AARDWOLD_OPTIMIZED)"
 }
 if ($Network -and 'default', 'aco', 'aco-int4-mixed' -notcontains $Network) { Fail "Unknown network choice: $Network" }
 if ($Network -eq 'aco-int4-mixed') {
-    if ($Model -and $Model -ne 'CC_SILVER_AARDWOLD_INT4_MIXED') { Fail "-Network aco-int4-mixed and -Model $Model cannot be used together." }
-    $Model = 'CC_SILVER_AARDWOLD_INT4_MIXED'
-}
-if (-not $AcoMode -and $Network) { $AcoMode = if ($Network -eq 'default') { '0' } else { '1' } }
-if (-not $AcoMode) { $AcoMode = '1' }
-if ('0', '1' -notcontains $AcoMode) { Fail "Unknown ACO Mode: $AcoMode (1 or 0)" }
-if ($Model -eq 'CC_SILVER_AARDWOLD_INT4_MIXED' -and $AcoMode -eq '0') {
-    Fail 'CC_SILVER_AARDWOLD_INT4_MIXED runs with ACO Mode = 1 only; -AcoMode 0 cannot start with it.'
+    if ($Model -and $Model -ne 'CC_SILVER_AARDWOLD_OPTIMIZED') { Fail "-Network aco-int4-mixed and -Model $Model cannot be used together." }
+    $Model = 'CC_SILVER_AARDWOLD_OPTIMIZED'
 }
 $haveInt4 = Test-Path -LiteralPath (Join-Path $here 'dlssnr-amd\int4') -PathType Container
+$haveExperimental = Test-Path -LiteralPath (Join-Path $here 'experimental\dlssnr-small-experimental.delta') -PathType Leaf
+$haveOptimized = Test-Path -LiteralPath (Join-Path $here 'optimized\dlssnr-optimized.delta') -PathType Leaf
 
-# ---- RenoDX style ----------------------------------------------------------------------------
-if ($Route -ne 'remove' -and $Route -ne 'logs' -and -not $RenoDX) {
-    Say ''
-    Say 'RenoDX style (optional): the picture before and after NR is processed the way RenoDX''s DLSS5 add-on does it (the NR network itself is the same).'
-    if ($Route -eq 'optiscaler') {
-        Say '  y: turn it on. Every NR setting is in NR Control (End in game); the OptiScaler menu only handles upscaling and frame generation.'
-    } else {
-        Say '  y: turn it on. Every NR setting is on ReShade''s Add-ons page ([RenoDX] in dlssnr-amd.ini).'
+# ---- the processing before and after NR --------------------------------------------------------
+if ($Route -eq 'standalone') {
+    if ($RenoDX -eq 'off') {
+        Fail 'The standalone route runs guide-less RenoDX at Present (-RenoDX off is not supported; use reshade-feeder for wilsjo2).'
     }
-    Say '  N: leave it off, as before. To turn it on later, set [RenoDX] Enabled = 1 in dlssnr-amd.ini and restart the game.'
-    $pick = Read-Host 'Turn on the RenoDX style? [y/N]'
-    $RenoDX = if ($pick -eq 'y' -or $pick -eq 'Y') { 'on' } else { 'off' }
+    $RenoDX = 'on'
+} elseif ($Route -ne 'remove' -and $Route -ne 'logs' -and -not $RenoDX) {
+    Say ''
+    Say 'The processing before and after NR (the NR network itself is the same):'
+    Say '  1) RenoDX style: processed the way RenoDX''s DLSS5 add-on does it (default)'
+    if ($Route -eq 'optiscaler') {
+        Say '  2) wilsjo2 style: the original processing of OptiScaler-NR (wilsjo2), ported'
+        Say 'In game NR Control (End) switches it at any time.'
+    } else {
+        Say '  2) wilsjo2 style: OptiScaler-NR''s (wilsjo2) settings and names ([DlssNr]), this route''s own processing'
+        Say 'In game, ReShade''s Add-ons page switches it (after a game restart).'
+    }
+    $pick = Read-Host 'Which one? [1/2, Enter = 1]'
+    $RenoDX = if ($pick -eq '2') { 'off' } else { 'on' }
 }
-if (-not $RenoDX) { $RenoDX = 'off' }
+if (-not $RenoDX) { $RenoDX = 'on' }
 if ('on', 'off' -notcontains $RenoDX) { Fail "Unknown RenoDX choice: $RenoDX (on or off)" }
 
 # ---- LumeniteFX (ReShade routes) -------------------------------------------------------------
@@ -154,8 +170,8 @@ if ($Route -like 'reshade-feeder*' -and -not $Lumenite) {
 }
 if (-not $Lumenite) { $Lumenite = 'off' }
 if ('on', 'off' -notcontains $Lumenite) { Fail "Unknown LumeniteFX choice: $Lumenite (on or off)" }
-if ($Lumenite -eq 'on' -and $Route -eq 'optiscaler') {
-    Fail 'LumeniteFX is for the ReShade routes only (the OptiScaler route uses the game''s own motion vectors).'
+if ($Lumenite -eq 'on' -and ($Route -eq 'optiscaler' -or $Route -eq 'standalone')) {
+    Fail 'LumeniteFX is for the ReShade routes only.'
 }
 
 # ---- games under Program Files need administrator rights -------------------------------------
@@ -168,7 +184,7 @@ if ($Route -ne 'logs') {
         Say 'This folder needs administrator rights, asking for them...'
         # the chosen exe, not its folder: from a folder the first exe would be taken again (another bitness)
         $again = if ($exe) { $exe } else { $game }
-        $elevated = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Target `"$again`" -Route $Route -AcoMode $AcoMode -RenoDX $RenoDX -Pause"
+        $elevated = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -Target `"$again`" -Route $Route -RenoDX $RenoDX -Pause"
         if ($Model) { $elevated += " -Model $Model" }
         $elevated += " -Lumenite $Lumenite"
         if ($LumeniteZip) { $elevated += " -LumeniteZip `"$LumeniteZip`"" }
@@ -249,6 +265,12 @@ if ($Route -eq 'logs') {
     $info = @("game: $game", "exe: $exe", "exe bits: $(Get-ExeBits $exe)", "package: $here", '')
     $info += Get-CimInstance Win32_VideoController | ForEach-Object { "GPU: $($_.Name) driver $($_.DriverVersion) ($($_.DriverDate))" }
     $info += Get-CimInstance Win32_OperatingSystem | ForEach-Object { "OS: $($_.Caption) $($_.Version)" }
+    $cs = Get-CimInstance Win32_ComputerSystem
+    $os = Get-CimInstance Win32_OperatingSystem
+    $info += "RAM: $([math]::Round($cs.TotalPhysicalMemory / 1GB, 1)) GB; commit limit now $([math]::Round($os.TotalVirtualMemorySize / 1MB, 1)) GB, free $([math]::Round($os.FreeVirtualMemory / 1MB, 1)) GB"
+    $info += "page file: $(if ($cs.AutomaticManagedPagefile) { 'system managed' } else { 'set by hand' })"
+    $info += Get-CimInstance Win32_PageFileUsage | ForEach-Object { "page file $($_.Name): $($_.AllocatedBaseSize) MB now, peak use $($_.PeakUsage) MB" }
+    $info += Get-CimInstance Win32_PageFileSetting | ForEach-Object { "page file setting $($_.Name): initial $($_.InitialSize) MB, maximum $($_.MaximumSize) MB" }
     $info += ''
     $info += Get-ChildItem -LiteralPath $game | ForEach-Object { '{0,12} {1}' -f $_.Length, $_.Name }
     $info | Set-Content -LiteralPath (Join-Path $tmp 'system.txt') -Encoding UTF8
@@ -382,14 +404,14 @@ $bits = Get-ExeBits $exe
 if ($bits -eq 32) { Fail "This is a 32-bit game ($exe); this package supports 64-bit games only." }
 # ---- model -----------------------------------------------------------------------------------
 # The package's models, or ones extracted now from the user's nvngx_dlssnr.dll; checked by SHA256.
-# dlssnr.bin = CC_SILVER_AARDWOLD (310.8.0, also preset 1 of 310.9.16), dlssnr-small.bin = CC_SMALL_FP8 (310.9.16's default).
+# CC_SILVER_AARDWOLD.bin = CC_SILVER_AARDWOLD (310.8.0, also preset 1 of 310.9.16), CC_SMALL_FP8.bin = CC_SMALL_FP8 (310.9.16's default).
 $ModelSha = '2B41C888CF4155B8958C665BA64018AB0BD25C85FC71A2B6DB86D0D04D1F7FBD'
 $SmallSha = '7E966E2639DBEC6596AA0BAC3B8761137D2C40CA8CB4ACA30DF7CA10043C6E33'
 function Test-Sha([string]$path, [string]$sha) {
     (Test-Path -LiteralPath $path -PathType Leaf) -and (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -eq $sha
 }
-$modelPath = Join-Path $here 'dlssnr-amd\dlssnr.bin'
-$smallPath = Join-Path $here 'dlssnr-amd\dlssnr-small.bin'
+$modelPath = Join-Path $here 'dlssnr-amd\CC_SILVER_AARDWOLD.bin'
+$smallPath = Join-Path $here 'dlssnr-amd\CC_SMALL_FP8.bin'
 $modelFrom = $modelPath; $smallFrom = $smallPath
 if (($Dll -and -not ((Test-Sha $modelPath $ModelSha) -and (Test-Sha $smallPath $SmallSha))) -or -not (Test-Path -LiteralPath $modelPath)) {
     if (-not $Dll) {
@@ -420,7 +442,7 @@ if (($Dll -and -not ((Test-Sha $modelPath $ModelSha) -and (Test-Sha $smallPath $
         $out = Join-Path $work 'out'
         New-Item -ItemType Directory -Path $out | Out-Null
         & (Join-Path $here 'model-tools\dlssnr_extract_model.exe') $src $out
-        $tmpModel = Join-Path $out 'dlssnr.bin'; $tmpSmall = Join-Path $out 'dlssnr-small.bin'
+        $tmpModel = Join-Path $out 'CC_SILVER_AARDWOLD.bin'; $tmpSmall = Join-Path $out 'CC_SMALL_FP8.bin'
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmpModel)) { Fail 'Extracting the model failed (see above).' }
         if (-not (Test-Sha $tmpModel $ModelSha)) { Fail 'The extracted model has the wrong checksum; nothing was installed.' }
         $pairs = @(,@($tmpModel, $modelPath))
@@ -454,60 +476,167 @@ if ((Test-Path -LiteralPath $smallPath) -and -not (Test-Sha $smallPath $SmallSha
 }
 $haveSmall = Test-Sha $smallFrom $SmallSha
 if (-not $haveSmall) {
-    Say 'Note: the package has no model for CC_SMALL_FP8 (dlssnr-small.bin, in the 310.9.16 nvngx_dlssnr.dll); it is greyed out in game.'
+    Say 'Note: the package has no model for CC_SMALL_FP8 (CC_SMALL_FP8.bin, in the 310.9.16 nvngx_dlssnr.dll); it is greyed out in game.'
     Say 'To add it, install again with -Dll pointing at the 310.9.16 nvngx_dlssnr.dll or its zip.'
 }
-# The network a game starts with: all three are installed, this only sets [Network] Model in dlssnr-amd.ini.
+# The network a game starts with: all four are installed, this only sets [Network] Model in dlssnr-amd.ini.
 if (-not $Model) {
-    $default = if ($haveSmall) { 1 } else { 2 }
+    $default = if ($haveSmall) { 1 } else { 3 }
     Say ''
-    Say 'All three networks are installed and can be switched in game at any time (the drop-down in NR Control or on'
+    Say 'All four networks are installed and can be switched in game at any time (the drop-down in NR Control or on'
     Say 'ReShade''s Add-ons page, or Ctrl+F11 to cycle). Choose only the one a game starts with:'
-    if ($haveSmall) { Say '  1) CC_SMALL_FP8                    the default network of 310.9.16, the fastest (default)' }
+    if ($haveSmall) { Say '  1) CC_SMALL_FP8                    the default network of 310.9.16 (default)' }
     else { Say '  1) CC_SMALL_FP8                    not available: needs the 310.9.16 nvngx_dlssnr.dll (install again with -Dll)' }
-    Say '  2) CC_SILVER_AARDWOLD              the network of 310.8.0 (also preset 1 of 310.9.16)'
-    if ($haveInt4 -and $AcoMode -eq '1') { Say '  3) CC_SILVER_AARDWOLD_INT4_MIXED   2) with part of the work in int4; faster, the picture differs somewhat' }
-    elseif ($haveInt4) { Say '  3) CC_SILVER_AARDWOLD_INT4_MIXED   not available: runs with ACO Mode = 1 only' }
-    else { Say '  3) CC_SILVER_AARDWOLD_INT4_MIXED   not available: this package has no int4 mixed' }
+    if (-not $haveSmall) { Say '  2) CC_SMALL_FP8_EXPERIMENTAL       not available: needs the 310.9.16 nvngx_dlssnr.dll (install again with -Dll)' }
+    elseif (-not $haveExperimental) { Say '  2) CC_SMALL_FP8_EXPERIMENTAL       not available: this package does not have it' }
+    else { Say '  2) CC_SMALL_FP8_EXPERIMENTAL       this project''s experimental network: 1) made faster' }
+    Say '  3) CC_SILVER_AARDWOLD              the network of 310.8.0 (also preset 1 of 310.9.16)'
+    if ($haveOptimized) { Say '  4) CC_SILVER_AARDWOLD_OPTIMIZED    this project''s network: 3) made faster' }
+    else { Say '  4) CC_SILVER_AARDWOLD_OPTIMIZED    not available: this package does not have it' }
     Say 'Later: [Network] Model in dlssnr-amd.ini.'
-    $pick = Read-Host "Start with which one? [1/2/3, Enter = $default]"
+    $pick = Read-Host "Start with which one? [1/2/3/4, Enter = $default]"
     if ($pick -eq '') { $pick = "$default" }
     switch ($pick) {
-        '1' { $Model = 'CC_SMALL_FP8' } '2' { $Model = 'CC_SILVER_AARDWOLD' } '3' { $Model = 'CC_SILVER_AARDWOLD_INT4_MIXED' }
+        '1' { $Model = 'CC_SMALL_FP8' } '2' { $Model = 'CC_SMALL_FP8_EXPERIMENTAL' } '3' { $Model = 'CC_SILVER_AARDWOLD' }
+        '4' { $Model = 'CC_SILVER_AARDWOLD_OPTIMIZED' }
         default { Say "Invalid choice, using $default."; $Model = $Networks[$default - 1] }
     }
 }
-if ($Model -eq 'CC_SMALL_FP8' -and -not $haveSmall) {
-    Say 'CC_SMALL_FP8 is not available (no model for it); games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD'
+if (($Model -eq 'CC_SMALL_FP8' -or $Model -eq 'CC_SMALL_FP8_EXPERIMENTAL') -and -not $haveSmall) {
+    Say "$Model is not available (no CC_SMALL_FP8 model); games start with CC_SILVER_AARDWOLD."; $Model = 'CC_SILVER_AARDWOLD'
 }
-if ($Model -eq 'CC_SILVER_AARDWOLD_INT4_MIXED' -and -not $haveInt4) {
-    Say 'This package has no int4 mixed; games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD'
+if ($Model -eq 'CC_SILVER_AARDWOLD_OPTIMIZED' -and -not $haveOptimized) {
+    Say 'This package has no CC_SILVER_AARDWOLD_OPTIMIZED; games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD'
 }
-if ($Model -eq 'CC_SILVER_AARDWOLD_INT4_MIXED' -and $AcoMode -eq '0') {
-    Say 'CC_SILVER_AARDWOLD_INT4_MIXED runs with ACO Mode = 1 only; games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD'
+# CC_SMALL_FP8_EXPERIMENTAL's weights are not in the package: made here from CC_SMALL_FP8's model and the package's
+# difference file (each changed entry XOR the small model's, so it holds none of NVIDIA's weights), installed only when
+# their SHA-256 matches. When that fails the other networks are installed as usual and it is greyed out in game.
+function New-ExperimentalWeights([string]$small, [string]$delta, [string]$out) {
+    # An entry the pack does not have is ADDED (CC_SILVER_AARDWOLD_OPTIMIZED's levels in one pack: "performance/<name>"):
+    # its bytes XOR the pack's entry named by the rest after the first "/", as the pack was; the result has the added
+    # entries after the pack's own (index and data; the pack's own entries move by the added index lines).
+    # (experimental_weights.py apply, the same.)
+    $pack = [System.IO.File]::ReadAllBytes($small)
+    if ([System.Text.Encoding]::ASCII.GetString($pack, 0, 8) -ne 'NRMODEL1') { throw "$small is not a model pack" }
+    $countPack = [BitConverter]::ToUInt32($pack, 8)
+    $index = @{}; $at = 16
+    for ($k = 0; $k -lt $countPack; $k++) {
+        $n = [BitConverter]::ToUInt32($pack, $at)
+        $name = [System.Text.Encoding]::UTF8.GetString($pack, $at + 4, $n)
+        $index[$name] = @([BitConverter]::ToUInt64($pack, $at + 4 + $n), [BitConverter]::ToUInt64($pack, $at + 12 + $n))
+        $at += 4 + $n + 16
+    }
+    $indexEnd = $at
+    $d = [System.IO.File]::ReadAllBytes($delta)
+    if ([System.Text.Encoding]::ASCII.GetString($d, 0, 8) -ne 'NRXDIFF1') { throw "$delta is not a weights difference" }
+    $count = [BitConverter]::ToUInt32($d, 8)
+    $orig = $null; $at = 12   # the pack as it was, kept only when the difference adds entries
+    for ($k = 0; $k -lt $count; $k++) {
+        $n = [BitConverter]::ToUInt32($d, $at)
+        if (-not $index.ContainsKey([System.Text.Encoding]::UTF8.GetString($d, $at + 4, $n))) { $orig = [byte[]]$pack.Clone(); break }
+        $at += 4 + $n + 8 + [int64][BitConverter]::ToUInt64($d, $at + 4 + $n)
+    }
+    $added = New-Object System.Collections.Generic.List[object]
+    $at = 12
+    for ($k = 0; $k -lt $count; $k++) {
+        $n = [BitConverter]::ToUInt32($d, $at)
+        $name = [System.Text.Encoding]::UTF8.GetString($d, $at + 4, $n)
+        $size = [BitConverter]::ToUInt64($d, $at + 4 + $n)
+        $at += 4 + $n + 8
+        if (-not $index.ContainsKey($name)) {
+            $slash = $name.IndexOf('/')
+            $base = if ($slash -ge 0) { $name.Substring($slash + 1) } else { '' }
+            if (-not $index.ContainsKey($base) -or $index[$base][1] -ne $size) { throw "${name}: an added entry without $base of $size bytes in $small" }
+            $boff = [int64]$index[$base][0]
+            $bytes = New-Object byte[] $size
+            for ($i = 0; $i -lt $size; $i++) { $bytes[$i] = $orig[$boff + $i] -bxor $d[$at + $i] }
+            $added.Add(@($name, $bytes))
+        } else {
+            if ($index[$name][1] -ne $size) { throw "${name}: not in $small with $size bytes" }
+            $off = [int64]$index[$name][0]
+            for ($i = 0; $i -lt $size; $i++) { $pack[$off + $i] = $pack[$off + $i] -bxor $d[$at + $i] }
+        }
+        $at += [int64]$size
+    }
+    if ($at -ne $d.Length) { throw "${delta}: $($d.Length - $at) bytes left over" }
+    if ($added.Count -gt 0) {
+        $grow = 0; foreach ($e in $added) { $grow += 4 + [System.Text.Encoding]::UTF8.GetByteCount($e[0]) + 16 }
+        $ms = New-Object System.IO.MemoryStream; $bw = New-Object System.IO.BinaryWriter($ms)
+        $bw.Write($pack, 0, 8); $bw.Write([uint32]($countPack + $added.Count)); $bw.Write($pack, 12, 4)
+        $at = 16
+        for ($k = 0; $k -lt $countPack; $k++) {
+            $n = [BitConverter]::ToUInt32($pack, $at)
+            $bw.Write($pack, $at, 4 + $n)
+            $bw.Write([uint64]([BitConverter]::ToUInt64($pack, $at + 4 + $n) + $grow))
+            $bw.Write([uint64]([BitConverter]::ToUInt64($pack, $at + 12 + $n)))
+            $at += 4 + $n + 16
+        }
+        $end = [uint64]($pack.Length + $grow)
+        foreach ($e in $added) {
+            $nb = [System.Text.Encoding]::UTF8.GetBytes($e[0])
+            $bw.Write([uint32]$nb.Length); $bw.Write($nb); $bw.Write([uint64]$end); $bw.Write([uint64]$e[1].Length); $end += [uint64]$e[1].Length
+        }
+        $bw.Write($pack, $indexEnd, $pack.Length - $indexEnd)
+        foreach ($e in $added) { $bw.Write([byte[]]$e[1]) }
+        $bw.Flush(); $pack = $ms.ToArray()
+    }
+    [System.IO.File]::WriteAllBytes($out, $pack)
 }
-# int4 mixed's weights: made from this model with the package's data, checked against the tested result. If that
-# fails, the other two networks are installed and int4 mixed is greyed out in game (with the reason).
+$expModelFrom = $null
+if ($haveExperimental -and $haveSmall) {
+    Say 'Making CC_SMALL_FP8_EXPERIMENTAL''s weights ...'
+    $expSha = ((Get-Content -LiteralPath (Join-Path $here 'experimental\CC_SMALL_FP8_EXPERIMENTAL.bin.sha256') -Raw).Trim() -split '\s+')[0]
+    $expModelFrom = Join-Path ([System.IO.Path]::GetTempPath()) ("dlssnr-small-experimental-$([guid]::NewGuid().ToString('N')).bin")
+    try {
+        New-ExperimentalWeights $smallFrom (Join-Path $here 'experimental\dlssnr-small-experimental.delta') $expModelFrom
+        if ((Get-FileHash -LiteralPath $expModelFrom -Algorithm SHA256).Hash -ne $expSha) { throw 'the weights have the wrong checksum (model or package incomplete?)' }
+    } catch {
+        Remove-Item -LiteralPath $expModelFrom -Force -ErrorAction SilentlyContinue
+        $expModelFrom = $null
+        Say "Note: CC_SMALL_FP8_EXPERIMENTAL's weights could not be made ($($_.Exception.Message)); it is not available in game. The other networks are installed as usual."
+    }
+}
+if (-not $expModelFrom -and $Model -eq 'CC_SMALL_FP8_EXPERIMENTAL') { Say 'Games start with CC_SMALL_FP8 instead.'; $Model = 'CC_SMALL_FP8' }
+# CC_SILVER_AARDWOLD_OPTIMIZED's weights the same way, from CC_SILVER_AARDWOLD's model and the package's difference file.
+$optModelFrom = $null
+if ($haveOptimized) {
+    Say 'Making CC_SILVER_AARDWOLD_OPTIMIZED''s weights ...'
+    $optSha = ((Get-Content -LiteralPath (Join-Path $here 'optimized\CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256') -Raw).Trim() -split '\s+')[0]
+    $optModelFrom = Join-Path ([System.IO.Path]::GetTempPath()) ("dlssnr-optimized-$([guid]::NewGuid().ToString('N')).bin")
+    try {
+        New-ExperimentalWeights $modelFrom (Join-Path $here 'optimized\dlssnr-optimized.delta') $optModelFrom
+        if ((Get-FileHash -LiteralPath $optModelFrom -Algorithm SHA256).Hash -ne $optSha) { throw 'the weights have the wrong checksum (model or package incomplete?)' }
+    } catch {
+        Remove-Item -LiteralPath $optModelFrom -Force -ErrorAction SilentlyContinue
+        $optModelFrom = $null
+        Say "Note: CC_SILVER_AARDWOLD_OPTIMIZED's weights could not be made ($($_.Exception.Message)); it is not available in game. The other networks are installed as usual."
+    }
+}
+if (-not $optModelFrom -and $Model -eq 'CC_SILVER_AARDWOLD_OPTIMIZED') { Say 'Games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD' }
+# Its int4 layers' weights: made from CC_SILVER_AARDWOLD_OPTIMIZED's weights (just made) with the package's data, checked
+# against the tested result. One file for its three levels with int4 layers (Balanced, Performance, Ultra Performance),
+# made with Ultra Performance's tables (dlssnr-amd\int4-ultra), which cover the others'. If that fails, it runs at Quality
+# (the other levels greyed out in game, with the reason).
 $int4ModelFrom = $null
-$int4Data = Join-Path $here 'dlssnr-amd\int4'
-if ($haveInt4) {
+$int4Data = Join-Path $here 'dlssnr-amd\int4-ultra'
+if ($haveInt4 -and $optModelFrom) {
     $generator = Join-Path $here 'model-tools\dlssnr-int4-weights.exe'
     $hashFile = Join-Path $here 'model-tools\dlssnr-int4.sha256'
     if (-not (Test-Path -LiteralPath $generator) -or -not (Test-Path -LiteralPath $hashFile)) {
-        Fail 'The int4 mixed files of the package are incomplete; unpack the package again.'
+        Fail 'The int4 files of the package are incomplete; unpack the package again.'
     }
     $int4Sha = ((Get-Content -LiteralPath $hashFile -Raw).Trim() -split '\s+')[0]
     $int4ModelFrom = Join-Path ([System.IO.Path]::GetTempPath()) ("dlssnr-int4-$([guid]::NewGuid().ToString('N')).bin")
-    Say 'Making the CC_SILVER_AARDWOLD_INT4_MIXED weights from the model ...'
-    & $generator $modelFrom $int4Data $int4ModelFrom
+    Say 'Making the weights of CC_SILVER_AARDWOLD_OPTIMIZED''s int4 layers ...'
+    & $generator $optModelFrom $int4Data $int4ModelFrom
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $int4ModelFrom) -or
         (Get-FileHash -LiteralPath $int4ModelFrom -Algorithm SHA256).Hash -ne $int4Sha) {
         Remove-Item -LiteralPath $int4ModelFrom -Force -ErrorAction SilentlyContinue
         $int4ModelFrom = $null
-        Say 'Note: making or checking the int4 mixed weights failed; it is not available in game. The other two networks are installed.'
-        if ($Model -eq 'CC_SILVER_AARDWOLD_INT4_MIXED') { Say 'Games start with CC_SILVER_AARDWOLD.'; $Model = 'CC_SILVER_AARDWOLD' }
+        Say 'Note: making or checking the int4 layers'' weights failed; CC_SILVER_AARDWOLD_OPTIMIZED runs at Quality only.'
     }
 }
+
 # LumeniteFX is fetched and its interface checked before anything is installed: if anything is wrong, nothing is.
 $lumeniteFx = $null
 if ($Lumenite -eq 'on') {
@@ -543,13 +672,32 @@ if ($Lumenite -eq 'on') {
 }
 if (Test-Path -LiteralPath $manifest) { Say 'Found a previous installation, removing it first.'; Remove-Installed }
 
+$otherProxies = @()
+foreach ($dllName in @('winmm.dll', 'version.dll', 'dwmapi.dll', 'dinput8.dll', 'dsound.dll', 'ReShade64.dll')) {
+    if (Test-Path -LiteralPath (Join-Path $game $dllName)) { $otherProxies += $dllName }
+}
+if ($Route -notin @('optiscaler', 'standalone', 'reshade-feeder') -and (Test-Path -LiteralPath (Join-Path $game 'dxgi.dll'))) {
+    $otherProxies += 'dxgi.dll'
+}
+if ($otherProxies.Count -gt 0) {
+    Say ("Note: existing injector/proxy DLL(s) detected in ${game}: $($otherProxies -join ', '). Chaining multiple overlays or Present hooks (e.g., winmm mod loaders or external ReShade) alongside this route can conflict; remove extras or set [NRControl] SystemPresentHook = 0 if startup crashes.")
+}
+
 Set-Content -LiteralPath $manifest -Value "F $ManifestName" -Encoding UTF8
 Put-Tree (Join-Path $here 'dlssnr-amd') 'dlssnr-amd'
-if ($modelFrom -ne $modelPath) { Copy-Item -LiteralPath $modelFrom -Destination (Join-Path $game 'dlssnr-amd\dlssnr.bin') -Force }
-if ($haveSmall -and $smallFrom -ne $smallPath) { Copy-Item -LiteralPath $smallFrom -Destination (Join-Path $game 'dlssnr-amd\dlssnr-small.bin') -Force }
+if ($modelFrom -ne $modelPath) { Copy-Item -LiteralPath $modelFrom -Destination (Join-Path $game 'dlssnr-amd\CC_SILVER_AARDWOLD.bin') -Force }
+if ($haveSmall -and $smallFrom -ne $smallPath) { Copy-Item -LiteralPath $smallFrom -Destination (Join-Path $game 'dlssnr-amd\CC_SMALL_FP8.bin') -Force }
 if ($int4ModelFrom) {
-    try { Put-File $int4ModelFrom 'dlssnr-amd\dlssnr-int4.bin' }
+    try { Put-File $int4ModelFrom 'dlssnr-amd\CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin' }
     finally { Remove-Item -LiteralPath $int4ModelFrom -Force -ErrorAction SilentlyContinue }
+}
+if ($expModelFrom) {
+    try { Put-File $expModelFrom 'dlssnr-amd\CC_SMALL_FP8_EXPERIMENTAL.bin' }
+    finally { Remove-Item -LiteralPath $expModelFrom -Force -ErrorAction SilentlyContinue }
+}
+if ($optModelFrom) {
+    try { Put-File $optModelFrom 'dlssnr-amd\CC_SILVER_AARDWOLD_OPTIMIZED.bin' }
+    finally { Remove-Item -LiteralPath $optModelFrom -Force -ErrorAction SilentlyContinue }
 }
 $exeName = [System.IO.Path]::GetFileNameWithoutExtension($exe)
 Record-Logs @('dlssnr-amd.log', 'dlssnr-amd-crash.dmp')
@@ -574,45 +722,59 @@ function Put-ReShade([bool]$asLayer) {
 }
 
 if ($Route -eq 'optiscaler') {
-    # The game keeps the system's own D3D11/D3D12; NR runs on a Vulkan device of its own and shares the frame with it.
-    foreach ($item in Get-ChildItem -LiteralPath (Join-Path $here 'optiscaler\game')) {
-        if ($item.Name -eq 'OptiScaler.dll') { continue }
-        if ($item.PSIsContainer) { Put-Tree $item.FullName $item.Name } else { Put-File $item.FullName $item.Name }
-    }
-    Put-File (Join-Path $here 'optiscaler\game\OptiScaler.dll') 'dxgi.dll'
-    foreach ($f in 'dlssnr_core.dll', 'nvngx.dll_dlssnr.dll', 'nvngx_dlssnr.dll') { Put-File (Join-Path $here "optiscaler\$f") $f }
+    # OptiScaler as released (its files unmodified): OptiScaler.dll as dxgi.dll, its ini, its OptiScaler\ folder; its
+    # licences go into that folder (a Licenses folder of the game's own is not touched). Our NR plugin into
+    # OptiScaler\plugins; NR Control's probe into dlssnr-amd\. The game keeps the system's own D3D11 / D3D12: NR runs
+    # on a Vulkan device of its own and shares the frame with it.
+    $rel = Join-Path $here 'optiscaler\release'
+    Put-File (Join-Path $rel 'OptiScaler.dll') 'dxgi.dll'
+    Put-File (Join-Path $rel 'OptiScaler.ini') 'OptiScaler.ini'
+    Put-Tree (Join-Path $rel 'OptiScaler') 'OptiScaler'
+    $lic = Join-Path $game 'OptiScaler\Licenses'
+    New-Item -ItemType Directory -Force -Path $lic | Out-Null
+    if (Test-Path -LiteralPath (Join-Path $rel 'Licenses')) { Copy-Item -Path (Join-Path $rel 'Licenses\*') -Destination $lic -Recurse -Force }
+    Copy-Item -LiteralPath (Join-Path $here 'optiscaler\OptiScaler_LICENSE.txt') -Destination $lic -Force
+    New-Item -ItemType Directory -Force -Path (Join-Path $game 'OptiScaler\plugins') | Out-Null
+    Copy-Item -LiteralPath (Join-Path $here 'optiscaler\asi\dlssnr-amd.asi') -Destination (Join-Path $game 'OptiScaler\plugins\dlssnr-amd.asi') -Force
+    Copy-Item -LiteralPath (Join-Path $here 'optiscaler\asi\nr_present_probe.exe') -Destination (Join-Path $game 'dlssnr-amd') -Force
     Record-Logs @('OptiScaler.log')
 
+    # OptiScaler loads the .asi plugins in OptiScaler\plugins only when asked to; its own log (OptiScaler.log, which the
+    # Logs choice collects) is written only when asked for too. Its frame generation on / off key is End by default,
+    # NR Control's key too (one press would open the menu and switch frame generation): no key, frame generation is
+    # switched in OptiScaler's menu (Insert). Every key here ships in the release's OptiScaler.ini and is rewritten in
+    # place: a key renamed upstream shows up rather than being silently ignored.
     $ini = Join-Path $game 'OptiScaler.ini'
     $wanted = [ordered]@{
-        'DlssNr|Enabled'               = 'true'
-        'Libraries|NvngxPath'          = (Join-Path $game 'dlssnr_core.dll')
-        # DX11 games: the upscaler runs on OptiScaler's D3D12 device (FSR, DX11 on 12), which is where NR runs.
-        'Upscalers|Dx11Upscaler'       = 'ffx_12'
-        # OptiScaler's own log is on while this is experimental.
-        'Log|LogToFile'                = 'true'
-        'Log|LogLevel'                 = '1'
+        'Plugins|LoadAsiPlugins' = 'true'
+        'Log|LogToFile'          = 'true'
+        'Log|LogLevel'           = '1'
+        'Menu|FGShortcutKey'     = '-1'
     }
-    # Rewritten when present, no note when absent: the white point follows the game's own exposure (v0.8.4's default;
-    # from v0.8.5 the default is a fixed white point).
-    $optional = [ordered]@{
-        'DlssNr|WhitePointSource'      = '1'
-    }
-    $lines = [System.IO.File]::ReadAllLines($ini)
+    $raw = [System.IO.File]::ReadAllText($ini)
+    $newline = if ($raw.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $lines = $raw -split [regex]::Escape($newline)
     $section = $null; $seen = @{}
     for ($i = 0; $i -lt $lines.Length; $i++) {
         if ($lines[$i] -match '^\s*\[([^\]]+)\]') { $section = $Matches[1]; continue }
         if ($section -and $lines[$i] -match '^\s*([A-Za-z0-9_]+)\s*=') {
             $key = "$section|$($Matches[1])"
-            if ($wanted.Contains($key) -and -not $seen.ContainsKey($key)) {
-                $lines[$i] = "$($Matches[1])=$($wanted[$key])"; $seen[$key] = 1
-            } elseif ($optional.Contains($key) -and -not $seen.ContainsKey($key)) {
-                $lines[$i] = "$($Matches[1])=$($optional[$key])"; $seen[$key] = 1
-            }
+            if ($wanted.Contains($key) -and -not $seen.ContainsKey($key)) { $lines[$i] = "$($Matches[1])=$($wanted[$key])"; $seen[$key] = 1 }
         }
     }
-    [System.IO.File]::WriteAllLines($ini, $lines)
-    foreach ($key in $wanted.Keys) { if (-not $seen.ContainsKey($key)) { Say "Note: $key not found in OptiScaler.ini" } }
+    [System.IO.File]::WriteAllText($ini, ($lines -join $newline))
+    foreach ($key in $wanted.Keys) { if (-not $seen.ContainsKey($key)) { Fail "OptiScaler.ini has no $key; this OptiScaler is not the one this package was made with." } }
+} elseif ($Route -eq 'standalone') {
+    # Any DX11 / DX12 / Vulkan app, player or capture viewer without OptiScaler or ReShade: our standalone dxgi.dll
+    # loads dlssnr-amd.asi for DX11 / DX12, vulkan-1.dll loads dlssnr-amd.asi as an implicit layer (vk-override\) for
+    # Vulkan, NR runs guide-less RenoDX at Present, and NR Control's probe + licences go into dlssnr-amd\.
+    Put-File (Join-Path $here 'standalone\dxgi.dll') 'dxgi.dll'
+    Put-File (Join-Path $here 'standalone\dlssnr-amd.asi') 'dlssnr-amd.asi'
+    Put-File (Join-Path $here 'vulkan\vulkan-1.dll') 'vulkan-1.dll'
+    Put-Tree (Join-Path $here 'standalone\vk-override') 'vk-override'
+    Copy-Item -LiteralPath (Join-Path $here 'standalone\nr_present_probe.exe') -Destination (Join-Path $game 'dlssnr-amd') -Force
+    Copy-Item -LiteralPath (Join-Path $here 'standalone\Inter-LICENSE.txt') -Destination (Join-Path $game 'dlssnr-amd') -Force
+    Copy-Item -LiteralPath (Join-Path $here 'standalone\DearImGui-LICENSE.txt') -Destination (Join-Path $game 'dlssnr-amd') -Force
 } elseif ($Route -eq 'reshade-feeder') {
     # DX10/11/12 games keep the system's own D3D; ReShade goes in as dxgi.dll.
     Put-ReShade $false
@@ -653,65 +815,62 @@ if ($lumeniteFx) {
 # again). Uninstall deletes it.
 if ($Route -eq 'optiscaler' -and $RenoDX -eq 'on') { $iniSrc = 'ini\dlssnr-amd-optiscaler-renodx.ini' }
 elseif ($Route -eq 'optiscaler') { $iniSrc = 'ini\dlssnr-amd-optiscaler.ini' }
+elseif ($Route -eq 'standalone') { $iniSrc = 'ini\dlssnr-amd-standalone.ini' }
 else { $iniSrc = 'ini\dlssnr-amd-addon.ini' }
 $iniDst = Join-Path $game 'dlssnr-amd.ini'
-# The RenoDX style ([RenoDX] Enabled = 1 on the ReShade routes; the OptiScaler route has a file of its own), the
-# network a game starts with and ACO Mode ([Network] Model, ACO Mode).
+# The RenoDX style ([RenoDX] Enabled = 1 on the ReShade routes; the OptiScaler and standalone routes have files of their own), the
+# network a game starts with ([Network] Model).
 $lines = [System.IO.File]::ReadAllLines((Join-Path $here $iniSrc), [System.Text.Encoding]::UTF8)
 $section = ''; $done = @{}
 for ($i = 0; $i -lt $lines.Count; $i++) {
     if ($lines[$i] -match '^\[([^\]]+)\]') { $section = $Matches[1]; continue }
-    if ($section -eq 'RenoDX' -and $Route -ne 'optiscaler' -and $RenoDX -eq 'on' -and $lines[$i] -eq 'Enabled = 0') {
+    if ($section -eq 'RenoDX' -and ($Route -notin @('optiscaler', 'standalone')) -and $RenoDX -eq 'on' -and $lines[$i] -eq 'Enabled = 0') {
         $lines[$i] = 'Enabled = 1'; $done['renodx'] = 1
     } elseif ($section -eq 'Network' -and $lines[$i] -match '^Model = ') { $lines[$i] = "Model = $Model"; $done['model'] = 1 }
-    elseif ($section -eq 'Network' -and $lines[$i] -match '^ACO Mode = ') { $lines[$i] = "ACO Mode = $AcoMode"; $done['aco'] = 1 }
     elseif ($lumeniteFx -and $lines[$i] -ceq 'MotionVectors=vort') { $lines[$i] = 'MotionVectors=lumenite'; $done['lumenite'] = 1 }
 }
 if ($lumeniteFx -and -not $done['lumenite']) { Fail 'dlssnr-amd.ini: could not set MotionVectors=lumenite.' }
-if (-not $done['model'] -or -not $done['aco'] -or ($Route -ne 'optiscaler' -and $RenoDX -eq 'on' -and -not $done['renodx'])) {
+if (-not $done['model'] -or (($Route -notin @('optiscaler', 'standalone')) -and $RenoDX -eq 'on' -and -not $done['renodx'])) {
     Fail 'The package''s dlssnr-amd.ini is not as expected; unpack the package again.'
 }
 [System.IO.File]::WriteAllText($iniDst, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+# The same file kept in dlssnr-amd\: a dlssnr-amd.ini that is deleted comes back from it at the next start, with the
+# choices made here (NR writes its built-in defaults only when this copy is missing too).
+[System.IO.File]::WriteAllText((Join-Path $game 'dlssnr-amd\dlssnr-amd.default.ini'), (($lines -join "`r`n") + "`r`n"),
+    (New-Object System.Text.UTF8Encoding($false)))
 Record-Logs @('dlssnr-amd.ini')
 
 Say ''
-Say "Installed into: $game$(if ($RenoDX -eq 'on') { ' (RenoDX style)' })"
-Say "Networks installed: $(if ($haveSmall) { 'CC_SMALL_FP8, ' })CC_SILVER_AARDWOLD$(if ($int4ModelFrom) { ', CC_SILVER_AARDWOLD_INT4_MIXED' }); games start with $Model."
-Say "Switch the network in game at any time: the drop-down in $(if ($Route -eq 'optiscaler') { 'NR Control (End)' } else { 'ReShade''s Add-ons page' }), or Ctrl+F11 to cycle; settings: [Network] in dlssnr-amd.ini."
-if ($AcoMode -eq '1') {
-    Say 'ACO Mode = 1: the network runs machine code made in advance by the ACO compiler. If it causes problems with your'
-    Say "driver, set ACO Mode = 0 in $(if ($Route -eq 'optiscaler') { 'NR Control' } else { 'ReShade''s Add-ons page' }) or in dlssnr-amd.ini (the AMD driver's own compiler; CC_SILVER_AARDWOLD_INT4_MIXED needs 1)."
-} else {
-    Say 'ACO Mode = 0: the AMD driver compiles the network; CC_SILVER_AARDWOLD_INT4_MIXED is not available with it.'
-}
+$style = if ($RenoDX -eq 'on') { 'RenoDX style' } else { 'wilsjo2 style' }
+Say "Installed the $Route route into: $game ($style)"
+Say "Networks installed: $(if ($haveSmall) { 'CC_SMALL_FP8, ' })$(if ($expModelFrom) { 'CC_SMALL_FP8_EXPERIMENTAL, ' })CC_SILVER_AARDWOLD$(if ($optModelFrom) { ', CC_SILVER_AARDWOLD_OPTIMIZED' + $(if (-not $int4ModelFrom) { ' (without its int4 layers)' }) }); games start with $Model."
+Say "Switch the network in game at any time: the drop-down in $(if ($Route -in @('optiscaler', 'standalone')) { 'NR Control (End)' } else { 'ReShade''s Add-ons page' }), or Ctrl+F11 to cycle; settings: [Network] in dlssnr-amd.ini."
+Say 'The network runs as machine code made in advance by the ACO compiler (ACO Mode). When your driver cannot take it,'
+Say "$(if ($Route -in @('optiscaler', 'standalone')) { 'NR Control' } else { 'ReShade''s Add-ons page' }) and dlssnr-amd.log say why; an RX 9000 then runs the network compiled by the AMD driver"
+Say '(without CC_SMALL_FP8_EXPERIMENTAL and CC_SILVER_AARDWOLD_OPTIMIZED); RX 7000 and Radeon 700M / 800M / 8000S graphics have no NR then.'
 if ($Route -eq 'optiscaler') {
-    if ($RenoDX -eq 'on') {
-        Say 'In the game, turn on DLSS (or FSR / XeSS) in the graphics settings. Insert opens the OptiScaler menu (with the RenoDX style on, it only handles upscaling and frame generation).'
-    } else {
-        Say 'In the game, turn on DLSS (or FSR / XeSS) in the graphics settings. Insert opens the OptiScaler menu;'
-        Say 'the NR settings are on the DLSS Neural Rendering page.'
-    }
+    Say 'In game, turn on DLSS, FSR or XeSS in the game''s settings. End opens NR Control (DirectX 11 / 12 and Vulkan games: every'
+    Say 'NR setting: processing, network, Passes); Insert opens the OptiScaler menu (upscaling and frame generation only).'
+    Say 'If NR Control keeps waiting for the game''s upscaler, set [Spoofing] Dxgi=false in OptiScaler.ini and try again.'
     Say 'If colours turn green or grainy after NR (007 First Light, for example), try [Preprocess] in dlssnr-amd.ini, or press Ctrl+F10 in the game.'
-    Say "End opens NR Control (this project's NR menu: networks, Preprocess$(if ($RenoDX -eq 'on') { ', and every NR setting of the RenoDX style' }))."
-    if ($RenoDX -eq 'on') {
-        Say 'The RenoDX style is on ([RenoDX] Enabled = 1 in dlssnr-amd.ini). With it on, every NR setting is in NR Control ([RenoDX]);'
-        Say 'the OptiScaler menu only handles upscaling and frame generation, and its NR page has no effect. Turning the RenoDX style off'
-        Say '(Enabled = 0, restart the game) brings back the previous behaviour, with the NR settings in the OptiScaler menu.'
-        Say 'F5 saves a screenshot (the same frame without and with NR) to NR Screenshots in the game folder.'
-    }
+    Say 'F5 takes screenshots (the same frame without and with NR) into NR Screenshots in the game folder.'
+} elseif ($Route -eq 'standalone') {
+    Say 'In the program or game, NR runs automatically at DXGI Present (no DLSS, FSR, XeSS or ReShade needed).'
+    Say 'End opens NR Control (network, Passes, processing, Compare); F6 turns NR off/on; F5 saves screenshots into NR Screenshots.'
 } else {
-    Say 'In the game, Home opens ReShade; the settings are on the Add-ons page, or edit dlssnr-amd.ini in the game folder.'
+    Say 'In the game, Home opens ReShade; the settings are on the Add-ons page, or edit dlssnr-amd.ini directly.'
     if ($lumeniteFx) {
         Say 'Motion vectors: LumeniteFX Kernel (by Afzaal (Kaidō), https://github.com/umar-afzaal/LumeniteFX, AGNYA licence;'
         Say '  not part of this project, installed unchanged from its author''s GitHub). Motion vectors on the Add-ons page switches back to VORT;'
         Say '  when LumeniteFX cannot be used in game, VORT runs that time and dlssnr-amd.log says why.'
     }
     if ($RenoDX -eq 'on') {
-        Say 'The RenoDX style is on ([RenoDX] Enabled = 1 in dlssnr-amd.ini). With it on, every NR setting is in the RenoDX part of the'
-        Say 'Add-ons page ([RenoDX]), and the NR settings of [DlssNr] have no effect. Turning it off (Enabled = 0, restart the game)'
-        Say 'brings back the previous behaviour. F5 saves a screenshot (the same frame without and with NR) to NR Screenshots in the game folder.'
+        Say 'Processing before and after NR: the RenoDX style ([RenoDX] Enabled = 1 in dlssnr-amd.ini), settings on the Add-ons page (that is [RenoDX]).'
+    } else {
+        Say 'Processing before and after NR: the wilsjo2 style ([RenoDX] Enabled = 0), settings on the Add-ons page (that is [DlssNr]).'
     }
+    Say 'For stacking use Passes on the Add-ons page. F5 takes screenshots (the same frame without and with NR) into NR Screenshots in the game folder.'
 }
 Say 'The first time NR runs in a game the network has to compile; it takes effect after about a minute. This happens once for each game.'
-Say 'Uninstall: run install.bat again and choose 5.'
+Say 'Uninstall: run install.bat again and choose 6.'
 Finish 0
