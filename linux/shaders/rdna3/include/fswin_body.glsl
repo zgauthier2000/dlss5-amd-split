@@ -369,6 +369,17 @@
             const uint qb = qix + (uint(nrhw_h * 2) + hh) * 16u;
             float lo_[8], hi_[8];
             for (int j = 0; j < 8; ++j) { lo_[j] = v_[j]; hi_[j] = v_[8 + j]; }
+#if NR_SWI4_ROT == 8
+            // Each gfx11 operand contains all sixteen channels. Rotate its two
+            // consecutive H8 blocks in the same butterfly order as the fitted weights.
+#define NR_BF8_(v, a, b) { const float t_ = v[a]; v[a] = t_ + v[b]; v[b] = t_ - v[b]; }
+#define NR_H8_(v) NR_BF8_(v,0,1) NR_BF8_(v,2,3) NR_BF8_(v,4,5) NR_BF8_(v,6,7) \
+    NR_BF8_(v,0,2) NR_BF8_(v,1,3) NR_BF8_(v,4,6) NR_BF8_(v,5,7) \
+    NR_BF8_(v,0,4) NR_BF8_(v,1,5) NR_BF8_(v,2,6) NR_BF8_(v,3,7)
+            NR_H8_(lo_) NR_H8_(hi_)
+#undef NR_H8_
+#undef NR_BF8_
+#endif
             const uvec2 w2 = uvec2(nr_s4pack(lo_, qb), nr_s4pack(hi_, qb + 8u));
             const uint a4 = NR_LXB_ NR_SWI4_X4 + uint(m) * uint(NR_C * 2) + uint(nrhw_h / 2) * 128u + lane * 4u + uint(nrhw_h % 2) * 2u;
             lds_y4[a4] = w2.x; lds_y4[a4 + 1u] = w2.y;

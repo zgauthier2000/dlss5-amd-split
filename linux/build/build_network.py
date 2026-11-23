@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
 """Build the Linux network for one GPU architecture from linux/shaders/<arch>/pipelines.json.
 
-    build_network.py <arch> [--int4 | --experimental | --expint4] [--x2] [--out DIR] [--check DIR]
+    build_network.py <arch> [--int4 | --performance | --ultra | --optimized | --experimental | --expint4] [--x2] [--out DIR] [--check DIR]
 
-Writes (default build/linux/<arch>/network, with --int4 build/linux/<arch>/network-int4, with --experimental
-build/linux/<arch>/network-experimental):
+Writes (default build/linux/<arch>/network, with --int4 build/linux/<arch>/network-int4, with --performance
+build/linux/<arch>/network-performance, with --optimized
+build/linux/<arch>/network-optimized, with --experimental build/linux/<arch>/network-experimental):
     g_<name>.spv + the four marker files   the network, what --spv-dir points at
     runtime/                                 the arch-neutral passes (linux/shaders/passes)
     g_<name>_grade.spv                      style_grade: the post block with the Natural/Cinematic grade
     temporal/                                the temporal variants (+ their _grade twins) and the motion estimator
 
 The host must be compiled with the same constants: linux/build/arch/<arch>.sh.
---int4: the int4 mixed network (pipelines.json with pipelines-int4.json applied; the host built with NR_INT4=1):
-the network and temporal/ (the runtime passes are the default network's), the host's g_<name>.spv.iu4 markers and
-hs-pipelines.txt (the pipelines built with the hard-swish, for the host's guard).
---experimental: CC_SMALL_FP8_EXPERIMENTAL (pipelines.json with pipelines-experimental.json applied; the same host):
-the network and temporal/, and fixed-attention.txt (the pipelines whose fixed probability tables the host writes).
---expint4: the experimental network with the int4 ViT / attention routes (pipelines-expint4.json; host NR_INT4=1):
-the network, temporal/, the .iu4 markers, an empty hs-pipelines.txt and fixed-attention.txt (ExperimentalInt4 = 1).
---x2: FP8 rounding mix X2 (NR_QUANT_F16_ONLY=1 on X2_STEMS: those layers keep FP16 activations), the
+--optimized: CC_SILVER_AARDWOLD_OPTIMIZED (pipelines.json with pipelines-optimized.json applied; the same host).
+--int4: CC_SILVER_AARDWOLD_OPTIMIZED with its int4 layers (pipelines.json with pipelines-int4.json applied; the host
+built with NR_INT4=1); also the host's g_<name>.spv.iu4 markers and hs-pipelines.txt (the pipelines built with the
+hard-swish, for the host's guard).
+--performance / --ultra: CC_SILVER_AARDWOLD_OPTIMIZED at Optimized layers Performance / Ultra Performance
+(pipelines-performance.json / pipelines-ultra.json; as --int4; out network-performance / network-ultra).
+--experimental: CC_SMALL_FP8_EXPERIMENTAL (pipelines.json with pipelines-experimental.json applied; the same host).
+Each of the three: the network and temporal/ (the runtime passes are the default network's), fixed-attention.txt (the
+pipelines whose fixed probability tables the host writes), and when the overlay says so const-heads.txt (the host
+proves and marks the constant C=512 attention heads, NR_CONSTH) and block-routes.txt (blocks whose layers run on a
+pipeline of their own: "<suffix> <kernel>... : <block>...", from the overlay's "routes").
+--expint4 (ours): CC_SMALL_FP8_EXPERIMENTAL with the legacy int4 ViT / attention routes (pipelines-expint4.json; host
+NR_INT4=1, [Network] ExperimentalInt4 = 1): as --experimental plus the .iu4 markers and hs-pipelines.txt.
+--x2 (ours): FP8 rounding mix X2 (NR_QUANT_F16_ONLY=1 on X2_STEMS: those layers keep FP16 activations), the
 experimental/shaders-x2 folders ([Network] FP16Activations = 1).
-Always: NR_MID_FUSE=1 on the six persistent expand/reduce pipelines (spill fix; byte-identical output).
+Always (ours): NR_MID_FUSE=1 on the six persistent expand/reduce pipelines (spill fix; byte-identical output).
 --check DIR compares every network SPV and marker with DIR byte for byte and
 lists the differences (exit 1 if any).
 """
@@ -34,15 +41,15 @@ from pathlib import Path
 R = Path(__file__).resolve().parents[2]
 # the runtime's own passes around the network (it runs the network only: the composition is RenoDX's stage's and the
 # wilsjo2 flow's): the alpha restore and the depth guide's copy
-RUNTIME = ['runtime_alpha', 'runtime_depth',
+RUNTIME = ['runtime_alpha', 'runtime_depth', 'runtime_blit',
            'runtime_reuse_store', 'runtime_reuse_motion', 'runtime_reuse_warp', 'runtime_reuse_stat',
            'runtime_reuse_motion3', 'runtime_reuse_warp3', 'runtime_reuse_stat3',
            'runtime_reuse_warp4', 'runtime_reuse_cut',
            'runtime_reuse_warp5', 'runtime_reuse_snap_prep', 'runtime_reuse_snap_box', 'runtime_reuse_snap_apply',
            'runtime_reuse_stat_max', 'runtime_reuse_stat_accg', 'runtime_reuse_stat3g',
-           'runtime_reuse_cut_terms', 'runtime_reuse_cut_sum', 'runtime_reuse_moved_prep', 'runtime_reuse_store_ema']   # release/: CutChange, Relit, the campfire fix
-# release/: the v7 answer-into-the-frame twins (NR_ANSWER16=1), loaded as <name>_a16.spv
-RUNTIME_A16 = ['runtime_reuse_warp4', 'runtime_reuse_warp5', 'runtime_reuse_snap_apply']   # save3/: the accumulated mean's exact shortcut   # plugin5   # plugin4: CutDrop   # plugin3: EdgeDrop, Disocclusion
+           'runtime_reuse_cut_terms', 'runtime_reuse_cut_sum', 'runtime_reuse_moved_prep', 'runtime_reuse_store_ema']
+# the answer-into-the-frame twins (NR_ANSWER16=1), loaded as <name>_a16.spv
+RUNTIME_A16 = ['runtime_reuse_warp4', 'runtime_reuse_warp5', 'runtime_reuse_snap_apply']
 MOTION = ['motion_luma', 'motion_estimate']
 # spill fix (dlssnr/spill): each expand group's quantized fragment feeds the middle MMAs at once
 MID_FUSE = {'g_fswinpds64', 'g_fswinpup64', 'g_fswinpds128', 'g_fswinpup128', 'g_fswinpds256', 'g_fswinpup256'}
@@ -73,6 +80,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('arch')
     ap.add_argument('--int4', action='store_true')
+    ap.add_argument('--legacy-int4', action='store_true', help='RDNA3 legacy network for unchanged golden checks')
+    ap.add_argument('--performance', action='store_true')
+    ap.add_argument('--ultra', action='store_true')
+    ap.add_argument('--optimized', action='store_true')
     ap.add_argument('--experimental', action='store_true')
     ap.add_argument('--expint4', action='store_true')
     ap.add_argument('--x2', action='store_true')
@@ -80,11 +91,12 @@ def main():
     ap.add_argument('--check', type=Path)
     a = ap.parse_args()
     table = json.loads((R / 'linux/shaders' / a.arch / 'pipelines.json').read_text())
-    if a.int4 + a.experimental + a.expint4 > 1:
-        sys.exit('one of --int4, --experimental, --expint4')
+    if a.legacy_int4 + a.int4 + a.performance + a.ultra + a.optimized + a.experimental + a.expint4 > 1:
+        sys.exit('one of --int4, --performance, --ultra, --optimized, --experimental, --expint4')
     global X2
     X2 = a.x2
-    overlay = 'int4' if a.int4 else 'experimental' if a.experimental else 'expint4' if a.expint4 else ''
+    overlay = ('int4-legacy' if a.legacy_int4 else 'int4' if a.int4 else 'performance' if a.performance else 'ultra' if a.ultra else 'optimized' if a.optimized
+               else 'experimental' if a.experimental else 'expint4' if a.expint4 else '')
     if overlay:
         i4 = json.loads((R / 'linux/shaders' / a.arch / f'pipelines-{overlay}.json').read_text())
         default = table['pipelines']
@@ -100,6 +112,11 @@ def main():
     (out / 'temporal').mkdir()
 
     pipelines = table['pipelines']
+    # post_no_out1 in the manifest tells the host that the post kernels never write their second output (it makes
+    # that image 1x1): it has to say what they are built with.
+    consts = dict(r.split() for r in table['markers']['shader-constants.txt'][1:])
+    if consts.get('post_no_out1') == '1' and 'NR_POST_NO_OUT1=1' not in pipelines['fswinimagepost32']['defines']:
+        sys.exit('pipelines.json: post_no_out1 1, but fswinimagepost32 is built without NR_POST_NO_OUT1=1')
     for name, e in pipelines.items():
         glslang(a.arch, R / 'linux/shaders' / a.arch / e['source'], e['defines'], out / f'g_{name}.spv')
     for name, text in table['markers'].items():
@@ -120,22 +137,23 @@ def main():
     for k in MOTION:
         glslang(a.arch, R / 'linux/shaders/passes' / f'{k}.comp', [], out / 'temporal' / f'{k}.spv')
     shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
-    if a.int4:
+    if a.legacy_int4 or a.int4 or a.performance or a.ultra or a.expint4:
         for name in i4['iu4']:
             (out / f'g_{name}.spv.iu4').write_text('0\n')
         hs = sorted(k for k, e in pipelines.items() if 'NR_ACT_HS=2' in e['defines'])
         (out / 'hs-pipelines.txt').write_text('\n'.join(hs) + '\n')
-        (out / 'runtime').rmdir()
-    elif a.expint4:
-        for name in i4['iu4']:
-            (out / f'g_{name}.spv.iu4').write_text('0\n')
-        (out / 'hs-pipelines.txt').write_text('\n')
+    if overlay:
         fixp = sorted(k for k, e in pipelines.items() if 'NR_FIXP=1' in e['defines'])
         (out / 'fixed-attention.txt').write_text('\n'.join(fixp) + '\n')
-        (out / 'runtime').rmdir()
-    elif a.experimental:
-        fixp = sorted(k for k, e in pipelines.items() if 'NR_FIXP=1' in e['defines'])
-        (out / 'fixed-attention.txt').write_text('\n'.join(fixp) + '\n')
+        consth = sorted(k for k, e in pipelines.items() if 'NR_CONSTH=1' in e['defines'])
+        if consth:
+            (out / 'const-heads.txt').write_text('\n'.join(consth) + '\n')
+        if i4.get('routes'):
+            lines = []
+            for r in i4['routes']:
+                assert all(f'{k}{r["suffix"]}' in pipelines for k in r['kernels']), r
+                lines.append(' '.join([r['suffix']] + r['kernels'] + [':'] + [str(b) for b in r['blocks']]))
+            (out / 'block-routes.txt').write_text('\n'.join(lines) + '\n')
         (out / 'runtime').rmdir()
     else:
         for k in RUNTIME:
