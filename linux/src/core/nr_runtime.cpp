@@ -1649,8 +1649,10 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         "--spv-dir", network_shaders.string(),
         "--host-boundary", arena_reuse() ? "--reuse" : "--no-reuse", "--source-width", std::to_string(mw),
         "--source-height", std::to_string(mh), "--accumulation", config.accumulation,
-        "--pipeline-cache", (installed ? data / "pipeline.cache" : root / "dlssnr-amd.pipelinecache").string(),
-        "--lazy-images"};
+        "--pipeline-cache", (installed ? data / "pipeline.cache" : root / "dlssnr-amd.pipelinecache").string()};
+    // upstream 0.0.8.2's lazy input copy / answer image (1x1 stand-ins until a frame needs them): not with reuse (ours),
+    // whose kernels bind tex_in / surf0 when the runtime is built and are not retargeted (materialize)
+    if (!config.reuse) arguments.push_back("--lazy-images");
     if (experimental || optimized)   // CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD_OPTIMIZED: their own shaders and pipeline caches
         for (size_t i = 0; i + 1 < arguments.size(); ++i) {
             if (arguments[i] == "--spv-dir") arguments[i + 1] = ((experimental ? xroot : oroot) / "shaders").string();
@@ -1932,7 +1934,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         // the blit converts whatever the game hands over. With Motion Without Depth (the default, as NVIDIA's DLLs,
         // which never bind a depth) nothing copies into it or samples it (game_depth is false, the pre block's depth
         // branch is off): a 1x1 image fills the descriptor (4K: 33 MB).
-        t.depth = impl_->motion_without_depth ? s.ctx.image(1, 1, VK_FORMAT_R32_SFLOAT, true)
+        // Ours: reuse's Disocclusion reads the game's depth here even with Motion Without Depth: full size with reuse.
+        t.depth = impl_->motion_without_depth && !config.reuse ? s.ctx.image(1, 1, VK_FORMAT_R32_SFLOAT, true)
                                               : s.ctx.image(mw, mh, VK_FORMAT_R32_SFLOAT, true);
         vkDestroySampler(s.ctx.device, t.depth.sampler, nullptr);
         t.depth.sampler = linear_sampler();
