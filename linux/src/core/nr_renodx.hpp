@@ -41,7 +41,7 @@ struct Settings {
     // The stack: passes 2..4 with their own controls once "Same as pass 1" is off (NRPass2FollowPass1 ...).
     uint32_t passes = 1;                // NRPasses 1..4 (1..30 with NRUnlockPasses)
     uint32_t passes_mode = 1;           // NRPassesMode: 0 legacy, 1 fast (ours: fast)
-    uint32_t fast_method = 2;           // NRFastMethod: 0 Interleaved, 1 Extrapolation, 2 Feedback, 3 Hybrid, 4 Edit strength (ours: Feedback; upstream's default Interleaved)
+    uint32_t fast_method = fast::kDefaultMethod;   // NRFastMethod: 0 Interleaved, 1 Extrapolation, 2 Feedback, 3 Hybrid, 4 Edit strength (the route's default: Interleaved on OptiScaler; user 11-23 "interleaved looks by far best")
     // Each method's own settings, [0] Extrapolation, [1] Feedback, [2] Hybrid (NRFast<Method>Passes / HaloLimit / Fine)
     float fast_passes[3] = {3.0f, 3.0f, 3.0f};       // 1..8, referred to legacy pass counts
     bool fast_halo_limit[3] = {true, true, true};
@@ -52,6 +52,10 @@ struct Settings {
     uint32_t fast_interleaved_passes = 3;   // NRFastInterleavedPasses 2..8
     // NRFastInterleavedPreset: Interleaved's variant - 1 = the method of 0.0.8.4 , 2 = a later method (the default: nr_fast_passes.hpp)
     uint32_t fast_interleaved_preset = fast::kDefaultInterleavedPreset;
+    // NRFastInterleavedFill (ours, merge/): Interleaved's hole fill (moved increments not used replaced by their usable
+    // neighbours': the pyramid il_pp + step 4). 1 = on (upstream; default), 0 = off: -0.12..-0.17 ms a frame at
+    // 1694x953 under Every 4 + Split (merge/NOTES.md). NR_IL_FILL in the environment wins.
+    bool fast_interleaved_fill = true;
     bool unlock_passes = false;         // NRUnlockPasses: ours, as OptiScaler's UnlockPasses (passes 5.. take pass 4's)
     float pass_intensity[3] = {1.0f, 1.0f, 1.0f};
     bool pass_follow[3] = {true, true, true};

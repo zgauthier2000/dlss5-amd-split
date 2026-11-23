@@ -1432,7 +1432,7 @@ bool history_settings_differ(const Settings& a, const Settings& b) {
            std::memcmp(a.fast_halo_limit, b.fast_halo_limit, sizeof a.fast_halo_limit) != 0 ||
            std::memcmp(a.fast_fine, b.fast_fine, sizeof a.fast_fine) != 0 ||
            a.fast_edit_strength != b.fast_edit_strength || a.fast_interleaved_passes != b.fast_interleaved_passes ||
-           a.fast_interleaved_preset != b.fast_interleaved_preset ||
+           a.fast_interleaved_preset != b.fast_interleaved_preset || a.fast_interleaved_fill != b.fast_interleaved_fill ||
            a.auto_mask != b.auto_mask || a.chained_history != b.chained_history || a.codec_mode != b.codec_mode ||
            a.depth_mode != b.depth_mode || a.feed_mode != b.feed_mode || a.intensity != b.intensity ||
            a.local_structure != b.local_structure || a.local_tone != b.local_tone ||
@@ -2175,7 +2175,9 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
             // (the increments mean the network's own output or the graded answer: a change between them starts over)
             if (il_graded != m.il_graded_last) { m.il_valid = false; m.il_graded_last = il_graded; }
             bool il_moved = false;   // (a normal frame: the slots' increments were moved, the judge may compare)
-            static const bool il_fill = il_switch("NR_IL_FILL");
+            // (ours: NRFastInterleavedFill; NR_IL_FILL in the environment wins)
+            static const int il_fill_env = [] { const char* e = std::getenv("NR_IL_FILL"); return e && e[0] ? int(e[0] != '0') : -1; }();
+            const bool il_fill = il_fill_env >= 0 ? il_fill_env != 0 : il_ag && s.fast_interleaved_fill;
             // NR_IL_BOX=k0,k1 (research): not used where last frame's picture they come from is outside this frame's 3 x 3
             // range by k0..k1 (the judge's k0 / k1 are shared: the two are not tried together)
             static const bool il_box = il_switch("NR_IL_BOX");

@@ -321,7 +321,7 @@ bool draw_renodx(A& a, Route route, bool running, const std::function<void()>& s
                 if (!have_motion && m == 0u) ImGui::TextDisabled(tr("No motion vectors: Interleaved cannot run (one network pass)."));
                 // the chosen method's own settings (each method keeps its own)
                 if (m == 4u) changed |= draw_key(a, key_index("NRFastEditStrength"));
-                else if (m == 0u) { changed |= draw_key(a, key_index("NRFastInterleavedPreset")); changed |= draw_key(a, key_index("NRFastInterleavedPasses")); }
+                else if (m == 0u) { changed |= draw_key(a, key_index("NRFastInterleavedPreset")); changed |= draw_key(a, key_index("NRFastInterleavedPasses")); changed |= draw_key(a, key_index("NRFastInterleavedFill")); }
                 else {
                     const std::string pre = std::string("NRFast") + names[m];
                     changed |= draw_key(a, key_index((pre + "Passes").c_str()));

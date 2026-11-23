@@ -660,6 +660,7 @@ void* renodx_field(RenoDXConfig& r, int index) {
         case 114: return &v.fast_fine[2];
         case 115: return &v.fast_interleaved_passes;
         case 116: return &v.fast_interleaved_preset;
+        case 117: return &v.fast_interleaved_fill;   // ours
         default: return nullptr;
     }
 }
@@ -688,6 +689,7 @@ bool parse_renodx_key(RenoDXConfig& r, const std::string& key, const std::string
     else if (key == "nrfastmethod") v.fast_method = renodx_enum(value, d.fast_method, 0, 4);
     else if (key == "nrfastinterleavedpasses") v.fast_interleaved_passes = renodx_enum(value, d.fast_interleaved_passes, 2, 8);
     else if (key == "nrfastinterleavedpreset") v.fast_interleaved_preset = renodx_enum(value, d.fast_interleaved_preset, 1, 2);
+    else if (key == "nrfastinterleavedfill") { if (auto b = parse_bool(value)) v.fast_interleaved_fill = *b; }   // ours
     else if (fast_method_key("nrfast", key, value, v.fast_passes, v.fast_halo_limit, v.fast_fine, true)) {}
     else if (key == "nrfasteditstrength") v.fast_edit_strength = renodx_float(value, d.fast_edit_strength, 0.f, 4.f);
     else if (key == "nrpasses") v.passes = renodx_enum(value, d.passes, 1, 30);
@@ -867,6 +869,9 @@ void write_renodx(FILE* f, const RenoDXConfig& r) {
         "; Interleaved: 2 .. 8 (default 3) legacy passes, one of them each frame. Every pass more holds two more pictures at the network's size in video memory.\n"
         "NRFastInterleavedPreset = %u\n"
         "; Interleaved's processing method: 1 or 2 (default %u).\n"
+        "NRFastInterleavedFill = %d\n"
+        "; Interleaved's hole fill: where a moved increment cannot be used (something uncovered, an edge), it is filled from its\n"
+        "; usable neighbours. 1 = on (default); 0 = off, about 0.15 ms a frame faster (a 7800 XT at 1694x953), the picture almost the same.\n"
         "\n"
         "NRPasses = %u\n"
         "; 1 .. 4, default 1; 1 .. 30 with NRUnlockPasses = 1\n"
@@ -1117,7 +1122,7 @@ void write_renodx(FILE* f, const RenoDXConfig& r) {
         v.local_tone, v.local_structure, v.skin_structure, v.auto_mask ? 1 : 0, v.skin_independent ? 1 : 0, v.passes_mode == 1u ? "fast" : "legacy", v.fast_method,
         fast::kDefaultMethod == 0u ? " (default)" : "", fast::kDefaultMethod == 1u ? " (default)" : "",
         v.fast_passes[0], v.fast_halo_limit[0] ? 1 : 0, v.fast_fine[0], v.fast_passes[1], v.fast_halo_limit[1] ? 1 : 0,
-        v.fast_fine[1], v.fast_passes[2], v.fast_halo_limit[2] ? 1 : 0, v.fast_fine[2], double(v.fast_edit_strength), v.fast_interleaved_passes, v.fast_interleaved_preset, fast::kDefaultInterleavedPreset, v.passes,
+        v.fast_fine[1], v.fast_passes[2], v.fast_halo_limit[2] ? 1 : 0, v.fast_fine[2], double(v.fast_edit_strength), v.fast_interleaved_passes, v.fast_interleaved_preset, fast::kDefaultInterleavedPreset, v.fast_interleaved_fill ? 1 : 0, v.passes,
         v.unlock_passes ? 1 : 0, v.chained_history ? 1 : 0, v.noise_every_frame ? 1 : 0, v.pass_transfer[0], v.pass_color[0], v.pass_intensity[0],
         v.pass_follow[0] ? 1 : 0, v.pass_style[0], v.pass_local_tone[0], v.pass_local_structure[0],
         v.pass_skin_structure[0], v.pass_auto_mask[0] ? 1 : 0, v.pass_transfer[1], v.pass_color[1],
