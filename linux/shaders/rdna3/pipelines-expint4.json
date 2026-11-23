@@ -1,0 +1,272 @@
+{
+ "about": [
+  "int4/ work copy (2026-11-21): CC_SMALL_FP8_EXPERIMENTAL (pipelines-experimental.json) + the int4 mixed ViT / C=512 attention",
+  "pipelines of pipelines-int4.json (no hard-swish, no Swin int4). build_network.py --expint4."
+ ],
+ "change": {
+  "fswin128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswin256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswin32": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswin32nh": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswin64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinds128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinds256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinds32": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinds64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp32": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp32nh": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswindsp64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinfusedup128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinfusedup256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinfusedup32": {
+   "add": [
+    "NR_SACT=1",
+    "NR_FIXP=1",
+    "NR_VOMERGE=1",
+    "NR_FIXP_PLAIN=1"
+   ]
+  },
+  "fswinfusedup32nh": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinfusedup64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinimagepost32": {
+   "add": [
+    "NR_SACT=1",
+    "NR_FIXP=1",
+    "NR_VOMERGE=1",
+    "NR_FIXP_PLAIN=1"
+   ]
+  },
+  "fswinimagepreds32": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinp128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinp256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinp64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpds128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpds256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpds64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpup128": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpup256": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  },
+  "fswinpup64": {
+   "add": [
+    "NR_SACT=1"
+   ]
+  }
+ },
+ "new": {
+  "fswin32nhd": {
+   "base": "fswin32nh",
+   "add": [
+    "NR_SACT=1",
+    "NR_FIXP=1",
+    "NR_VOMERGE=1",
+    "NR_FIXP_PLAIN=1"
+   ]
+  },
+  "gemmvact4": {
+   "base": "gemmvact",
+   "add": [
+    "NR_I4_OUT=1",
+    "NR_SWAP_AB=1"
+   ]
+  },
+  "gemmvact4c": {
+   "base": "gemmvact",
+   "add": [
+    "NR_SWAP_AB=1",
+    "NR_I4=1",
+    "NR_I4_OUT=1",
+    "NR_I4_NREC=16"
+   ]
+  },
+  "gemmproj4": {
+   "base": "gemmproj",
+   "add": [
+    "NR_I4=1"
+   ]
+  },
+  "gemmprojw4": {
+   "base": "gemmprojw",
+   "add": [
+    "NR_I4=1"
+   ]
+  },
+  "gemmproj4s": {
+   "base": "gemmproj",
+   "add": [
+    "NR_SWAP_AB=1",
+    "NR_I4=1",
+    "NR_I4_SIDE=1",
+    "NR_I4_NREC=56"
+   ]
+  },
+  "gemmprojw4s": {
+   "base": "gemmprojw",
+   "add": [
+    "NR_SWAP_AB=1",
+    "NR_I4=1",
+    "NR_I4_SIDE=1"
+   ]
+  },
+  "gemmprojs": {
+   "base": "gemmproj",
+   "add": [
+    "NR_SWAP_AB=1",
+    "NR_I4_SIDE=1"
+   ]
+  },
+  "gemmprojws": {
+   "base": "gemmprojw",
+   "add": [
+    "NR_SWAP_AB=1",
+    "NR_I4_SIDE=1"
+   ]
+  },
+  "gemmvqkvnorms4": {
+   "base": "gemmvqkvnorms",
+   "add": [
+    "NR_I4=1",
+    "NR_I4_NREC=16"
+   ]
+  },
+  "gemmvqkvnorm4": {
+   "base": "gemmvqkvnorm",
+   "add": [
+    "NR_I4=1"
+   ]
+  },
+  "attn4": {
+   "base": "attn",
+   "add": [
+    "NR_ATTN_I4=1",
+    "NR_I4=1",
+    "NR_A4_NREC=8"
+   ]
+  },
+  "gemmprojcs": {
+   "base": "gemmprojc",
+   "add": [
+    "NR_I4_SIDE=1",
+    "NR_KCONST=512"
+   ]
+  }
+ },
+ "iu4": [
+  "attn4",
+  "gemmproj4",
+  "gemmproj4s",
+  "gemmprojw4",
+  "gemmprojw4s",
+  "gemmvact4c",
+  "gemmvqkvnorm4",
+  "gemmvqkvnorms4"
+ ]
+}

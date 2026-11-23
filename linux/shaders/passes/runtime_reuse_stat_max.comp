@@ -1,0 +1,36 @@
+#version 460
+// save3/ (2026-11-22): the accumulated motion's largest length, for the exact shortcut of the accumulated mean (runtime_reuse_stat_accg /
+// stat3g). Each texel's length as runtime_reuse_stat(3).comp computes it (NaN / inf, and with `sentinel` |uv| > 8, count as 0); the
+// largest one goes into word 5 of the stat buffer as an atomic max of the float bits (all values >= +0, so the bit order is the value
+// order). Word 5 is 0 before (the buffer starts zeroed; the stat_accg pass that reads it clears it). 4096 texels a workgroup.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Stat { uint words[]; };
+layout(set = 0, binding = 1, rg32f) uniform readonly image2D motion;
+layout(push_constant) uniform Push {
+    uint width, height;       // the field
+    float scale_x, scale_y;   // engine units -> uv
+    float pixels_x, pixels_y; // the model's extent
+    uint word;                // (the mean's word: unused here)
+    float limit;              // (the fade limit: unused here)
+    uint sentinel;            // 1: EdgeDrop's sentinels count as no motion (stat3)
+} pc;
+
+float texel_length(uint i) {
+    const vec2 u = imageLoad(motion, ivec2(i % pc.width, i / pc.width)).xy * vec2(pc.scale_x, pc.scale_y);
+    const vec2 m = u * vec2(pc.pixels_x, pc.pixels_y);
+    const float l = length(m);
+    return (isnan(l) || isinf(l) || (pc.sentinel != 0u && any(greaterThan(abs(u), vec2(8.0))))) ? 0.0 : l;
+}
+
+void main() {
+    const uint count = pc.width * pc.height;
+    const uint base = gl_WorkGroupID.x * 4096u + gl_LocalInvocationID.x;
+    float mx = 0.0;
+    for (uint k = 0u; k < 16u; ++k) {
+        const uint i = base + 256u * k;
+        if (i < count) mx = max(mx, texel_length(i));
+    }
+    mx = subgroupMax(mx);
+    if (subgroupElect()) atomicMax(words[5], floatBitsToUint(mx));
+}

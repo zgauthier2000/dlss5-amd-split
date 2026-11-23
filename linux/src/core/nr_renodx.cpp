@@ -11,6 +11,7 @@
 #include "nr_renodx.hpp"
 #include "nr_gpu_completion.hpp"
 #include "nr_log.hpp"
+#include "nr_native_plan.hpp"
 #include "nr_vram_tag.hpp"
 #include "renodx/codec_gain.hpp"
 
@@ -267,6 +268,9 @@ struct NormStream {
     int64_t last_ns = 0, last_reset_ns = 0;
 };
 constexpr int64_t kNormResetQuietNs = 250'000'000;
+// fbfast/ (11-22): the Feedback programs that run 32-wide (RADV's compute default is 64) unless NR_ST_W32 says otherwise (a comma
+// list of program names, "0": none). st_prep: 32-wide measured faster; the others slower. Same output (checked byte for byte).
+constexpr const char* kStW32Default = "st_prep";
 
 struct ScalePlan {
     uint32_t governor[5] = {};   // slew_stops .. governor_mode
@@ -549,6 +553,7 @@ struct Stage::Impl {
              kDecodeReduceL,   // legacy_decode + the black-level reduce in one pass (the SDR frame in place)
              kComposeDecode,   // look_compose + legacy_decode + the reduce (SDR, the network at the frame's extent)
              kStFbIn, kStPrep, kStBox, kStApply,
+             kStGf2,   // fbfast/: optional, the radius-2 guided filter in one dispatch (st_gf2.comp)
              kCount };
     Program programs[kCount];
 
@@ -573,6 +578,7 @@ struct Stage::Impl {
     Preprocess prep_last{};
     int64_t prep_metered_ns = 0;
     bool area_input = false, area_known = false, history_reset = false;
+    bool fb_drop = false;   // burn/: Stage::drop_feedback
     // NR was off (NeuralUplift, or every pass at zero strength): turning it on again is RenoDX's RecreateFeatures -
     // its RequestHistoryReset (every history from the start) and the reset-epoch snap of the governor.
     bool recreate = false;
@@ -585,6 +591,8 @@ struct Stage::Impl {
     Image motion;                  // the game's motion vectors, copied (region at the origin)
     Image st_fineh, st_fbadd, st_d0, st_d1, st_t0, st_t1, st_g0, st_g1, st_f0[2], st_f1[2];
     uint32_t st_cur = 0; bool st_valid = false;
+    bool vf_hold = false;   // visfix/ FeedbackHold: this frame's history = its feedback add / w (Stage::note_network)
+    bool st_gf2 = false;   // fbfast/: kStGf2 loaded
     // Passes (fast)'s images: the fine part (RG16F: the edit's fine part and the answer's lightness) and the guided
     // filter's quarter-size work images; with `feedback` (the method is Feedback / Hybrid) also the feedback's add and
     // its history, which go when the method is Extrapolation.
@@ -592,6 +600,12 @@ struct Stage::Impl {
         if (!programs[kStFbIn].pipeline) {
             load(programs[kStFbIn], "st_fb_in", 60); load(programs[kStPrep], "st_prep", 20); load(programs[kStBox], "st_box", 20);
             load(programs[kStApply], "st_apply", 84);
+            // fbfast/ (11-22): the one-dispatch guided filter, used only when its file is in the shader folder (an older folder: the
+            // two st_box passes as before) and NR_FB_GF2 is not 0.
+            const char* e = std::getenv("NR_FB_GF2");
+            if (!(e && e[0] == '0') && std::ifstream(cfg.shaders + "/renodx_st_gf2.spv", std::ios::binary)) {
+                load(programs[kStGf2], "st_gf2", 20); st_gf2 = true;
+            }
         }
         const VkImageUsageFlags rw = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
         const uint32_t lw = (nw + 3) / 4, lh = (nh + 3) / 4;
@@ -614,9 +628,21 @@ struct Stage::Impl {
     }
     // The guided filter's rest, from its 4 x 4 cell means in (st_d0, st_d1): the box mean, the coefficients, their box
     // mean into (outa, outb)
-    void st_gf(VkCommandBuffer cmd, uint32_t nw, uint32_t nh, const Image& outa, const Image& outb, uint32_t radius, float eps) {
+    // fbfast/ (11-22): radius 2 with st_gf2 loaded: both box passes in one dispatch (the same sums in the same order; st_t0 / st_t1
+    // not written). `overlap` (the history's filter, read the next frame only): then no barrier after it, so it runs alongside the
+    // dispatches that follow (none of them touches st_d0 / st_d1 or the history; every later dispatch's barrier orders it before the
+    // next frame's st_fb_in). NR_FB_OVERLAP=0: the barrier as before.
+    void st_gf(VkCommandBuffer cmd, uint32_t nw, uint32_t nh, const Image& outa, const Image& outb, uint32_t radius, float eps,
+               bool overlap = false) {
         struct { uint32_t low[2], radius, coef; float eps; } g{{(nw + 3) / 4, (nh + 3) / 4}, radius, 1u, eps};
         const uint32_t gx = (g.low[0] + 15) / 16, gy = (g.low[1] + 15) / 16;
+        if (radius == 2u && st_gf2) {
+            static const bool overlap_on = [] { const char* e = std::getenv("NR_FB_OVERLAP"); return !(e && e[0] == '0'); }();
+            const VkDescriptorSet set = S(kStGf2, {{0, st_d0.view}, {1, st_d1.view}, {4, outa.view}, {5, outb.view}});
+            if (overlap && overlap_on) dispatch_unordered(cmd, kStGf2, set, &g, sizeof g, gx, gy);
+            else dispatch(cmd, kStGf2, set, &g, sizeof g, gx, gy);
+            return;
+        }
         dispatch(cmd, kStBox, S(kStBox, {{0, st_d0.view}, {1, st_d1.view}, {4, st_t0.view}, {5, st_t1.view}}), &g, sizeof g, gx, gy);
         g.coef = 0u;
         dispatch(cmd, kStBox, S(kStBox, {{0, st_t0.view}, {1, st_t1.view}, {4, outa.view}, {5, outb.view}}), &g, sizeof g, gx, gy);
@@ -721,6 +747,14 @@ struct Stage::Impl {
             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
         robustness.images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
         if (pipeline_robustness) ci.pNext = &robustness;
+        // fbfast/ (11-22): the Feedback programs named in NR_ST_W32 (default kStW32Default) 32-wide. The device has subgroupSizeControl
+        // (nrvk.hpp requires it for the network's 32-lane pipelines).
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo w32{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+        w32.requiredSubgroupSize = 32;
+        {
+            static const std::string list = [] { const char* e = std::getenv("NR_ST_W32"); return std::string(e ? e : kStW32Default); }();
+            if (name.rfind("st_", 0) == 0 && ("," + list + ",").find("," + name + ",") != std::string::npos) ci.stage.pNext = &w32;
+        }
         check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipeline), name.c_str());
     }
 
@@ -900,6 +934,16 @@ struct Stage::Impl {
         memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    }
+    // fbfast/: a dispatch with no barrier after it (its writes are ordered by the next dispatch's barrier; only for work nothing
+    // reads until then).
+    void dispatch_unordered(VkCommandBuffer cmd, P p, VkDescriptorSet set, const void* push, uint32_t bytes, uint32_t x, uint32_t y) {
+        const Program& pr = programs[p];
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pr.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pr.layout, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cmd, pr.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, std::min(bytes, pr.push_bytes), push);
+        vkCmdDispatch(cmd, x, y, 1);   // no barrier after it
+        mark(cmd, pr.name);
     }
     static void memory_barrier(VkCommandBuffer cmd, VkPipelineStageFlags src, VkAccessFlags sa, VkPipelineStageFlags dst,
                                VkAccessFlags da) {
@@ -1288,6 +1332,9 @@ bool recreate_settings_differ(const Settings& a, const Settings& b) {
 }
 }  // namespace
 
+void Stage::drop_feedback() { impl_->fb_drop = true; }   // burn/
+void Stage::note_network(bool reused, bool fresh, bool hold) { impl_->vf_hold = hold && reused && !fresh; }   // visfix/
+
 void Stage::set(const Settings& s) {
     Impl& m = *impl_;
     if (recreate_settings_differ(m.settings, s)) m.recreate = true;
@@ -1315,6 +1362,7 @@ Stage::Facts Stage::facts() const {
 
 void working_resolution(const Settings& s, uint32_t rw, uint32_t rh, uint32_t gw, uint32_t gh, uint32_t* nw,
                         uint32_t* nh) {
+    nr::set_plan_pad_like(rw, rh);   // scale/ fix: a network below the frame pads like the frame (nr_native_plan.cpp)
     if (s.follow_input_res && gw != 0 && gh != 0) {
         *nw = std::min(gw, rw);
         *nh = std::min(gh, rh);
@@ -1726,7 +1774,8 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
         motion_copied = true;
     }
     const bool reset_all = fr.reset || m.history_reset;
-    if (reset_all || !fast_feedback) m.st_valid = false;
+    if (reset_all || !fast_feedback || m.fb_drop) m.st_valid = false;
+    m.fb_drop = false;
     m.history_reset = false;
     m.recreate = false;
     ColourFrame p;
@@ -1819,6 +1868,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                    16u | 2u | (m.st_valid ? 1u : 0u), 4u, 0.f, 0.45f};
             const bool borrowed = borrow && borrow->motion;
             if (borrowed) { fp.mbase[0] = fr.motion_x; fp.mbase[1] = fr.motion_y; }
+            if (s.fb_motion_edge > 0.f) { fp.flags |= 32u; fp.cstop = s.fb_motion_edge; fp.block = std::max(s.fb_motion_edge_radius, 1u); }   // armfix/
             const std::map<uint32_t, VkImageView> views{{0, m.st_f0[m.st_cur].view}, {2, m.st_f1[m.st_cur].view},
                 {1, borrowed ? borrow->motion : m.motion.view}, {4, fast_input}, {5, m.st_fbadd.view}};
             m.dispatch(cmd, Impl::kStFbIn, borrowed ? m.set_for(m.programs[Impl::kStFbIn], views, {}, borrow->pool)
@@ -1828,6 +1878,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
         const bool reset = reset_all || (k > 0 && !s.chained_history);
         p.image = prep_apart ? m.prep_keep.handle : m.proxy.handle;
         m.mark(cmd, "before-network");
+        m.vf_hold = false;   // visfix/: set by Stage::note_network inside the callback, if the caller makes it
         network(k, p, n, reset);
         m.mark(cmd, "network");
         ++ran;
@@ -1854,6 +1905,8 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                 else { ap.halo *= fine; ap.fine = fine; }   // Hybrid: feedback branch and overlay's fine part
             }
             ap.restored = fb ? 1u : 0u;   // with feedback also P given back and this frame's edit's cell means
+            // visfix/ FeedbackHold: 2 + w x 1000 = the history gets the feedback add / w (st_apply.comp), not the total edit
+            if (fb && m.vf_hold && fast_w > 0.f) ap.restored = 2u + uint32_t(std::lround(fast_w * 1000.f));
             const bool edit = s.fast_method == 3u;   // Edit strength: the apply alone (no fine part, no guided filter)
             if (edit) { ap.mode = 10u; ap.k = std::clamp(s.fast_edit_strength, 0.f, 4.f); }
             const uint32_t pp[5] = {NW, NH, (NW + 3) / 4, (NH + 3) / 4, fb ? 1u : 0u};
@@ -1867,7 +1920,7 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                  {6, m.st_d0.view}, {7, m.st_d1.view}}),
                 &ap, sizeof ap, nx, ny);
             if (fb) {   // filtered into the next frame's history
-                m.st_gf(cmd, NW, NH, m.st_f0[m.st_cur ^ 1u], m.st_f1[m.st_cur ^ 1u], 2u, 1e9f);
+                m.st_gf(cmd, NW, NH, m.st_f0[m.st_cur ^ 1u], m.st_f1[m.st_cur ^ 1u], 2u, 1e9f, true);
                 m.st_cur ^= 1u; m.st_valid = true;
             }
             m.mark(cmd, "fast-apply");
@@ -2107,7 +2160,12 @@ uint32_t Stage::record(VkCommandBuffer cmd, const StageFrame& fr, const Network&
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     m.mark(cmd, "copy-out");
     // the engine-data panel's divisor (Facts::divisor): the scale texel, every 32nd frame
-    if (v6 && !m.units.absolute && m.scale.handle && (m.recordings & 31u) == 1u) {
+    // guard/ (2026-11-23, research): NR_SCALE_TRACE=1 probes the scale texel every frame and prints the previous frame's (the harness waits per frame)
+    static const bool scale_trace = [] { const char* e = std::getenv("NR_SCALE_TRACE"); return e && e[0] == '1'; }();
+    if (scale_trace && m.probe_mapped)
+        std::fprintf(stderr, "SCALE rec %llu texel %.6f %.6f %.6f %.6f\n", (unsigned long long)m.recordings, double(m.probe_mapped[0]),
+                     double(m.probe_mapped[1]), double(m.probe_mapped[2]), double(m.probe_mapped[3]));
+    if (v6 && !m.units.absolute && m.scale.handle && (scale_trace || (m.recordings & 31u) == 1u)) {
         if (!m.probe) {
             VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             bi.size = 256; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;

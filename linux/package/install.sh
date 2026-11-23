@@ -35,6 +35,8 @@
 # OptiScaler route:
 #   --renodx     the RenoDX style (default): processed the way RenoDX's DLSS5 add-on does it.
 #   --wilsjo2    the wilsjo2 style: the original processing of OptiScaler-NR (wilsjo2), ported. --no-renodx means the same.
+#   --no-lite    keep OptiScaler's own FSR: without it, FSR 4 Lite lossy (this project's faster FSR 4 build) is installed
+#                as the DX12 upscaler and OptiScaler is set to use it (Dx12Upscaler = fsr31).
 #   With neither, the installer asks once after the network; Enter = the RenoDX style (not asked when not run in a terminal: RenoDX).
 #   Later NR Control (End in game) switches it at any time and can stack several layers.
 # ReShade routes:
@@ -71,6 +73,7 @@ lumenite="" lumenite_zip=""
 lumenite_commit=f80e98d716ad72e12af6f7baa727bcfeb4be5094
 model=""        # the network a game starts with ([Network] Model)
 renodx=""
+lite=1         # release/: FSR 4 Lite lossy as the DX12 upscaler (optiscaler route); --no-lite keeps OptiScaler's own
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dll) dll=${2:?--dll needs a file path}; shift 2;;
@@ -88,6 +91,7 @@ while [[ $# -gt 0 ]]; do
             shift;;
         --no-lumenite) lumenite=0; shift;;
         --no-renodx|--wilsjo2) renodx=0; shift;;
+        --no-lite) lite=0; shift;;
         -h|--help) sed -n '2,54p' "$0"; exit 0;;
         *) if [[ -z "$game" ]]; then game=$1; elif [[ -z "$route" ]]; then route=$1;
            else echo "unexpected argument: $1" >&2; exit 1; fi; shift;;
@@ -202,18 +206,18 @@ int4=0; [[ -x "$here/int4/dlssnr-int4-weights" ]] && int4=1   # both the x86_64 
 experimental=0; [[ -f "$here/experimental/dlssnr-small-experimental.delta" ]] && experimental=1
 # the network a game starts with: all four are installed, this only sets [Network] Model in dlssnr-amd.ini
 if [[ -z "$model" ]]; then
-    model=CC_SMALL_FP8; [[ $have_small == 0 ]] && model=CC_SILVER_AARDWOLD
+    model=CC_SMALL_FP8; [[ $experimental == 1 ]] && model=CC_SMALL_FP8_EXPERIMENTAL; [[ $have_small == 0 ]] && model=CC_SILVER_AARDWOLD
     if [[ -t 0 ]]; then
         echo
         echo "All four networks are installed and can be switched in game at any time (the drop-down in NR Control or on ReShade's Add-ons page, or Ctrl+F11 to cycle)."
         echo "Choose only the one a game starts with:"
         if [[ $have_small == 1 ]]; then
-            echo "  1) CC_SMALL_FP8                    the default network of 310.9.16 (default)"
+            echo "  1) CC_SMALL_FP8                    the default network of 310.9.16"
         else
             echo "  1) CC_SMALL_FP8                    not available: needs the 310.9.16 nvngx_dlssnr.dll (install again with --dll)"
         fi
         if [[ $have_small == 1 && $experimental == 1 ]]; then
-            echo "  2) CC_SMALL_FP8_EXPERIMENTAL       this project's experimental network: 1) made faster"
+            echo "  2) CC_SMALL_FP8_EXPERIMENTAL       this project's experimental network: 1) made faster (default)"
         elif [[ $have_small == 1 ]]; then
             echo "  2) CC_SMALL_FP8_EXPERIMENTAL       not available: this package does not have it"
         else
@@ -226,7 +230,7 @@ if [[ -z "$model" ]]; then
             echo "  4) CC_SILVER_AARDWOLD_INT4_MIXED   not available: this package has no int4 mixed"
         fi
         echo "Later: [Network] Model in dlssnr-amd.ini."
-        def=1; [[ $have_small == 0 ]] && def=3
+        def=1; [[ $experimental == 1 ]] && def=2; [[ $have_small == 0 ]] && def=3
         read -r -p "Start with which one? [1/2/3/4, Enter = $def] " pick || pick=""
         case "${pick:-$def}" in
             1) model=CC_SMALL_FP8;; 2) model=CC_SMALL_FP8_EXPERIMENTAL;; 3) model=CC_SILVER_AARDWOLD;;
@@ -378,6 +382,10 @@ case "$kind" in
         put_file "$rel/OptiScaler.dll" dxgi.dll
         put_file "$rel/OptiScaler.ini" OptiScaler.ini
         put_tree "$rel/OptiScaler" OptiScaler
+        if [[ $lite == 1 && -f "$here/optiscaler/lite/amd_fidelityfx_upscaler_dx12.dll" ]]; then   # release/: FSR 4 Lite lossy
+            cp -- "$here/optiscaler/lite/amd_fidelityfx_upscaler_dx12.dll" "$game/OptiScaler/amd_fidelityfx_upscaler_dx12.dll"
+            echo "FSR 4 Lite lossy is the DX12 upscaler (install again with --no-lite for OptiScaler's own FSR)."
+        fi
         if [[ -d "$rel/Licenses" ]]; then mkdir -p -- "$game/OptiScaler/Licenses"; cp -r -- "$rel/Licenses"/. "$game/OptiScaler/Licenses/"; fi
         cp -- "$here/optiscaler/OptiScaler_LICENSE.txt" "$game/OptiScaler/Licenses/OptiScaler_LICENSE.txt"
         mkdir -p -- "$game/OptiScaler/plugins"
@@ -391,7 +399,7 @@ case "$kind" in
         else
             put_file "$here/optiscaler/vulkan-1.dll" vulkan-1.dll
         fi
-        python3 "$here/optiscaler/patch_ini.py" "$game"
+        NR_LITE=$lite python3 "$here/optiscaler/patch_ini.py" "$game"
         record OptiScaler.log; record dlssnr-amd.log; record dlssnr-amd.ini
         overrides="dxgi=n,b"
         ;;

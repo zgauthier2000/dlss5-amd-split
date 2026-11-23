@@ -302,12 +302,12 @@ sed 's/^PreprocessorDefinitions=.*/&,RESHADE_DEPTH_INPUT_IS_REVERSED=0/' "$rs/Re
 # wilsjo2 processing's shaders are in dlssnr-amd\shaders\wilsjo2 for every route, assemble_product_data.sh). The plugin
 # is built with the int4 mixed network (it adds that network's device extensions itself: no Vulkan layer on this route).
 if [[ "$arch" == x86_64 ]]; then
-    opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261028.7z}
-    opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261028/LICENSE}
+    opti_7z=${NR_OPTI_ARCHIVE:-artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261118_2df7ad9f.7z}   # release/: the nightly SOTTR / Elden Ring run
+    opti_license=${NR_OPTI_LICENSE:-artifacts/ref/optiscaler-nightly-20261118/LICENSE}   # release/: GPL-3.0 text from its source tree
     [[ -f "$opti_7z" && -f "$opti_license" ]] || { echo "missing $opti_7z or $opti_license" >&2; exit 1; }
     if [[ -z "${NR_OPTI_ARCHIVE:-}" ]]; then   # the archive the package was tested with
-        [[ "$(sha256sum -- "$opti_7z" | cut -d' ' -f1)" == e3a4f533d19a5818a821093f7dcbd9698b96b9b60dcb0e577c569a0b33c94a33 ]] ||
-            { echo "$opti_7z is not the tested OptiScaler nightly-20261028" >&2; exit 1; }
+        [[ "$(sha256sum -- "$opti_7z" | cut -d' ' -f1)" == 2f202abf0da4ebac5b43b3d5571073261c2e1ece34d97d5d5b67242782f12817 ]] ||
+            { echo "$opti_7z is not the tested OptiScaler nightly-20261118 (2df7ad9f)" >&2; exit 1; }
     fi
     command -v 7z >/dev/null || { echo "7z is needed to unpack $opti_7z" >&2; exit 1; }
     rm -rf -- "$pkg/optiscaler"
@@ -324,6 +324,15 @@ if [[ "$arch" == x86_64 ]]; then
     cmp -s <(cd artifacts/optiscaler/asi/shaders/wilsjo2 && sha256sum -- *.spv) <(cd "$pkg/dlssnr-amd/shaders/wilsjo2" && sha256sum -- *.spv) ||
         { echo "the plugin's wilsjo2 shaders are not dlssnr-amd/shaders/wilsjo2's" >&2; exit 1; }
     cp -- linux/package/optiscaler/patch_ini.py "$pkg/optiscaler/"
+    # release/: FSR 4 Lite lossy (the FSR 4 project's upscaler build, 1119r-4.1.2l-lossy-r3) as the default DX12 upscaler: put over
+    # OptiScaler\amd_fidelityfx_upscaler_dx12.dll at install (install.sh --no-lite keeps the release's own)
+    lite=${NR_LITE_DLL:-artifacts/ref/lite/amd_fidelityfx_upscaler_dx12.dll}
+    [[ -f "$lite" ]] || { echo "missing $lite (FSR 4 Lite lossy)" >&2; exit 1; }
+    if [[ -z "${NR_LITE_DLL:-}" ]]; then
+        [[ "$(sha256sum -- "$lite" | cut -d' ' -f1)" == 95878c86a0c4d90ae0e67b628adf9d92b6e1790e624f2179570b74d0de9b4600 ]] ||
+            { echo "$lite is not the tested Lite lossy 1119r-4.1.2l-lossy-r3" >&2; exit 1; }
+    fi
+    mkdir -p -- "$pkg/optiscaler/lite"; cp -- "$lite" "$pkg/optiscaler/lite/amd_fidelityfx_upscaler_dx12.dll"
     # vulkan-1.dll for the game folder, its exports forwarded to winevulkan.dll (linux/vulkan-loader/vulkan1_forwarder.c)
     "$cc" -shared -o "$pkg/optiscaler/vulkan-1.dll" linux/vulkan-loader/vulkan1_forwarder.c \
         linux/vulkan-loader/vulkan1_forwarder.def

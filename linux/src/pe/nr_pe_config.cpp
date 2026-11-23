@@ -353,6 +353,32 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
         if (name == "reuse") {
             if (key == "every") c.controls.reuse_every = std::clamp(std::atoi(value.c_str()), 0, 8);
             else if (key == "gate") c.controls.reuse_gate = number(value, 1, 400, c.controls.reuse_gate);
+            else if (key == "split") c.controls.reuse_split = std::atoi(value.c_str()) != 0;
+            else if (key == "phase") c.controls.reuse_phase = std::clamp(std::atoi(value.c_str()), 0, 2);
+            else if (key == "edgedrop") c.controls.reuse_edge_drop = std::clamp(std::atoi(value.c_str()), 0, 2);
+            else if (key == "edgefeather") c.controls.reuse_edge_feather = number(value, 0, 64, c.controls.reuse_edge_feather);
+            else if (key == "disocclusion") c.controls.reuse_disocc = std::atoi(value.c_str()) != 0;
+            else if (key == "disoccthreshold") c.controls.reuse_disocc_threshold = number(value, 0.005f, 4, c.controls.reuse_disocc_threshold);
+            else if (key == "gaterun") c.controls.reuse_gate_run = std::atoi(value.c_str()) != 0;
+            else if (key == "cutdrop") c.controls.reuse_cut_drop = number(value, 0, 100000, c.controls.reuse_cut_drop);
+            else if (key == "cutchange") c.controls.reuse_cut_change = number(value, 0.001f, 1, c.controls.reuse_cut_change);
+            else if (key == "snap") c.controls.reuse_snap = std::clamp(std::atoi(value.c_str()), 0, 1);
+            else if (key == "snapradius") c.controls.reuse_snap_radius = uint32_t(std::clamp(std::atoi(value.c_str()), 1, 8));
+            else if (key == "snapeps") c.controls.reuse_snap_eps = number(value, 1.0e-7f, 1, c.controls.reuse_snap_eps);
+            else if (key == "snapmix") c.controls.reuse_snap_mix = number(value, 0, 1, c.controls.reuse_snap_mix);
+            else if (key == "disoccfill") c.controls.reuse_disocc_fill = std::clamp(std::atoi(value.c_str()), 0, 5);   // visfix/: + 4, 5
+            else if (key == "disoccfillsigma") c.controls.reuse_disocc_fill_sigma = number(value, 0.005f, 1, c.controls.reuse_disocc_fill_sigma);   // visfix/
+            else if (key == "disoccfillmix") c.controls.reuse_disocc_fill_mix = number(value, 0, 1, c.controls.reuse_disocc_fill_mix);   // visfix/
+            else if (key == "relit") c.controls.reuse_relit = std::clamp(std::atoi(value.c_str()), 0, 9);   // armfix/
+            else if (key == "relitk0") c.controls.reuse_relit_k0 = number(value, 0, 1, c.controls.reuse_relit_k0);   // armfix/
+            else if (key == "relitk1") c.controls.reuse_relit_k1 = number(value, 0.0001f, 4, c.controls.reuse_relit_k1);   // armfix/
+            else if (key == "historygate") c.controls.reuse_hist_gate = std::clamp(std::atoi(value.c_str()), 0, 2);   // campfire/
+            else if (key == "blend") c.controls.reuse_blend = number(value, 0, 1, c.controls.reuse_blend);   // campfire/
+            else if (key == "blendk0") c.controls.reuse_blend_k0 = number(value, 0, 1, c.controls.reuse_blend_k0);   // campfire/
+            else if (key == "blendk1") c.controls.reuse_blend_k1 = number(value, 0, 4, c.controls.reuse_blend_k1);   // campfire/
+            else if (key == "disoccmotion") c.controls.reuse_disocc_motion = int(number(value, 0, 1, float(c.controls.reuse_disocc_motion)));   // rim/
+            else if (key == "disoccfillrim") c.controls.reuse_fill_rim = int(number(value, 0, 1, float(c.controls.reuse_fill_rim)));   // rim/
+            else if (key == "disoccfillradius") c.controls.reuse_disocc_fill_radius = number(value, 1, 64, c.controls.reuse_disocc_fill_radius);
             continue;
         }
         if (name == "log") {
@@ -367,6 +393,8 @@ bool parse(const std::string& path, Config& c, bool& legacy) {
                 if (m >= 0) { n.model = m; model_old_word = lower(value) == "small" || lower(value) == "original"; }
             }
             else if (key == "hotkey") { n.hotkey = value; have_hotkey = true; }
+            else if (key == "experimentalint4") { if (auto b = parse_bool(value)) n.experimental_int4 = *b; }
+            else if (key == "fp16activations") { if (auto b = parse_bool(value)) n.fp16_activations = *b; }
             else if (key == "sound") { if (auto b = parse_bool(value)) { n.sound = *b; have_sound = true; } }
             else if (key == "residency") {
                 const std::string v = lower(value);
@@ -439,6 +467,32 @@ bool parse_preprocess_file(const std::string& path, PreprocessConfig& p) {
         else if (name == "reuse") {
             if (key == "every") p.reuse_every = std::clamp(std::atoi(value.c_str()), 0, 8);
             else if (key == "gate") p.reuse_gate = number(value, 1, 400, p.reuse_gate);
+            else if (key == "split") p.reuse_split = std::atoi(value.c_str()) != 0;
+            else if (key == "phase") p.reuse_phase = std::clamp(std::atoi(value.c_str()), 0, 2);
+            else if (key == "edgedrop") p.reuse_edge_drop = std::clamp(std::atoi(value.c_str()), 0, 2);
+            else if (key == "edgefeather") p.reuse_edge_feather = number(value, 0, 64, p.reuse_edge_feather);
+            else if (key == "disocclusion") p.reuse_disocc = std::atoi(value.c_str()) != 0;
+            else if (key == "disoccthreshold") p.reuse_disocc_threshold = number(value, 0.005f, 4, p.reuse_disocc_threshold);
+            else if (key == "gaterun") p.reuse_gate_run = std::atoi(value.c_str()) != 0;
+            else if (key == "cutdrop") p.reuse_cut_drop = number(value, 0, 100000, p.reuse_cut_drop);
+            else if (key == "cutchange") p.reuse_cut_change = number(value, 0.001f, 1, p.reuse_cut_change);
+            else if (key == "snap") p.reuse_snap = std::clamp(std::atoi(value.c_str()), 0, 1);
+            else if (key == "snapradius") p.reuse_snap_radius = uint32_t(std::clamp(std::atoi(value.c_str()), 1, 8));
+            else if (key == "snapeps") p.reuse_snap_eps = number(value, 1.0e-7f, 1, p.reuse_snap_eps);
+            else if (key == "snapmix") p.reuse_snap_mix = number(value, 0, 1, p.reuse_snap_mix);
+            else if (key == "disoccfill") p.reuse_disocc_fill = std::clamp(std::atoi(value.c_str()), 0, 5);   // visfix/: + 4, 5
+            else if (key == "disoccfillsigma") p.reuse_disocc_fill_sigma = number(value, 0.005f, 1, p.reuse_disocc_fill_sigma);   // visfix/
+            else if (key == "disoccfillmix") p.reuse_disocc_fill_mix = number(value, 0, 1, p.reuse_disocc_fill_mix);   // visfix/
+            else if (key == "relit") p.reuse_relit = std::clamp(std::atoi(value.c_str()), 0, 9);   // armfix/
+            else if (key == "relitk0") p.reuse_relit_k0 = number(value, 0, 1, p.reuse_relit_k0);   // armfix/
+            else if (key == "relitk1") p.reuse_relit_k1 = number(value, 0.0001f, 4, p.reuse_relit_k1);   // armfix/
+            else if (key == "historygate") p.reuse_hist_gate = std::clamp(std::atoi(value.c_str()), 0, 2);   // campfire/
+            else if (key == "blend") p.reuse_blend = number(value, 0, 1, p.reuse_blend);   // campfire/
+            else if (key == "blendk0") p.reuse_blend_k0 = number(value, 0, 1, p.reuse_blend_k0);   // campfire/
+            else if (key == "blendk1") p.reuse_blend_k1 = number(value, 0, 4, p.reuse_blend_k1);   // campfire/
+            else if (key == "disoccmotion") p.reuse_disocc_motion = int(number(value, 0, 1, float(p.reuse_disocc_motion)));   // rim/
+            else if (key == "disoccfillrim") p.reuse_fill_rim = int(number(value, 0, 1, float(p.reuse_fill_rim)));   // rim/
+            else if (key == "disoccfillradius") p.reuse_disocc_fill_radius = number(value, 1, 64, p.reuse_disocc_fill_radius);
         }
     }
     std::fclose(file);
@@ -1466,6 +1520,14 @@ void write_network(FILE* f, const NetworkConfig& n) {
         ";                                 faster, the picture differs somewhat; start the game with the INT4 launch options the installer printed\n"
         "; A network that cannot run (e.g. no 310.9.16 model file) is greyed out in the menus with the reason, and the hotkey skips it.\n"
         "\n"
+        "ExperimentalInt4 = %d\n"
+        "; CC_SMALL_FP8_EXPERIMENTAL only: 1 = part of its work in int4 (faster; default), 0 = off. Applied when the\n"
+        "; network is built (game start or switch)\n"
+        "\n"
+        "FP16Activations = %d\n"
+        "; CC_SMALL_FP8_EXPERIMENTAL only: 1 = activations kept at FP16 in the layers where FP8 rounding does not change\n"
+        "; the picture (about 4%% faster network, within 0.5 dB; default), 0 = off. Applied at the next game start\n"
+        "\n"
         "Hotkey = %s\n"
         "; Cycles through the networks that can run, to compare them on the same picture. Empty = no hotkey. Ctrl,\n"
         "; Shift, Alt and one key, e.g. Alt+F9\n"
@@ -1510,7 +1572,7 @@ void write_network(FILE* f, const NetworkConfig& n) {
         "; always = all the time\n"
         "; cost   = all the time, with each layer's GPU time split into the network and its processing, and the sums\n"
         "; off    = never\n"
-        "\n", nr::network_codename(n.model), n.hotkey.c_str(), n.sound ? 1 : 0, residency_name(n.residency),
+        "\n", nr::network_codename(n.model), n.experimental_int4 ? 1 : 0, n.fp16_activations ? 1 : 0, n.hotkey.c_str(), n.sound ? 1 : 0, residency_name(n.residency),
         n.motion_without_depth ? 1 : 0, n.resize_history ? 1 : 0, n.style_grade ? 1 : 0, osd_name(n.osd));
 }
 
@@ -1650,7 +1712,10 @@ void write_log(FILE* f, bool enabled, bool clear) {
         enabled ? 1 : 0, clear ? 1 : 0);
 }
 
-void write_reuse(FILE* f, int every, float gate) {
+// [Reuse]: every key of the temporal reuse, with its description and the value it has (release/: the tuned preset is the
+// default). One writer for both the OptiScaler route's PreprocessConfig and the add-on's Controls (same member names).
+template <class R>
+void write_reuse(FILE* f, const R& k) {
     std::fprintf(f,
         "\n[Reuse]\n"
         "; Temporal reuse of the network's edit. The network runs on every Every-th frame and the frames between\n"
@@ -1658,13 +1723,99 @@ void write_reuse(FILE* f, int every, float gate) {
         "; of the cost. Changing Every from 0 to 2 or more the first time rebuilds the network once.\n"
         "\n"
         "Every = %d\n"
-        "; 0 or 1 = the network on every frame (default); 2 = every second frame (about half the cost);\n"
-        "; 3 = every third frame. Up to 8\n"
+        "; 4 = the network on every fourth frame (default); 2 = every second frame (better in fast motion, about twice\n"
+        "; the cost); 3 = every third; up to 8. 0 or 1 = the network on every frame\n"
+        "\n"
+        "Split = %d\n"
+        "; 1 = with Every 2..8, the network's work is spread over Every frames (one part per frame) instead of all of it\n"
+        "; on one frame: the same cost per Every frames, even frame times; the edit shown is Every-1 frames older\n"
+        "; (default). 0 = off\n"
+        "\n"
+        "Phase = %d\n"
+        "; with Every 2..8: 1 = the network (or each split cycle's input frame) on frames where FSR 4 Lite lossy skips its\n"
+        "; own network, from the frame's jitter (default; odd Every: gaps of Every-1 and Every+1, the same rate);\n"
+        "; 0 = no alignment; 2 = Lite's other frames (for testing)\n"
         "\n"
         "Gate = %.1f\n"
-        "; how far the picture may have moved since the network last ran, in pixels of a 1080p-wide frame,\n"
-        "; for a frame to skip it. Past it the network runs; past twice it the stored edit is dropped.\n",
-        every, gate);
+        "; how far the picture may have moved since the network last ran (pixels of a 1080p-wide frame, 1..400). With\n"
+        "; GateRun 1 a frame past it runs the network; past twice it the stored edit is dropped\n"
+        "\n"
+        "GateRun = %d\n"
+        "; 0 = never force a network run: the schedule stays strict, even frame times (default); 1 = a frame that moved\n"
+        "; more than Gate runs the network\n"
+        "\n"
+        "EdgeDrop = %d\n"
+        "; where the picture came in from outside the screen since the edit was made (the screen edge a camera pan\n"
+        "; reveals): 2 = the edit of the nearest point inside the old frame (default), 1 = no edit there, 0 = off\n"
+        "\n"
+        "EdgeFeather = %.1f\n"
+        "; with EdgeDrop: pixels over which the carried edit fades out towards the old frame's border\n"
+        "\n"
+        "Disocclusion = %d\n"
+        "; 1 = no carried edit where the depth says the pixel shows something the edit's frame did not see there (around\n"
+        "; moving characters, edges of near objects) (default). Reads the game's depth. 0 = off\n"
+        "\n"
+        "DisoccThreshold = %.3f\n"
+        "; with Disocclusion: the relative depth difference where the edit starts to fade (gone at twice it)\n"
+        "\n"
+        "DisoccMotion = %d\n"
+        "; with Disocclusion: 1 = the threshold grows with the pixel's motion, so a fast-moving surface (a swinging\n"
+        "; ponytail, a wall in a camera turn) keeps its edit while its depth changes (default). 0 = fixed threshold\n"
+        "\n"
+        "DisoccFill = %d\n"
+        "; what the uncovered background gets where Disocclusion drops the edit: 4 = the edit of nearby pixels at the same\n"
+        "; depth, weighted by colour (default); 3 = the same, unweighted; 0 = the plain picture (a visible outline)\n"
+        "\n"
+        "DisoccFillRadius = %.1f\n"
+        "; with DisoccFill: the search radius in pixels (rings at 1..4 times it)\n"
+        "\n"
+        "DisoccFillRim = %d\n"
+        "; with DisoccFill 3/4: 1 = where no same-depth neighbour exists (the ground behind a fast-moving object), the\n"
+        "; edit of the nearest pixels further back (default); 0 = the plain picture there\n"
+        "\n"
+        "DisoccFillSigma = %.3f\n"
+        "DisoccFillMix = %.3f\n"
+        "; with DisoccFill 4: the colour weight's width; how much of the fill is used (1 = all)\n"
+        "\n"
+        "Relit = %d\n"
+        "; fades the carried edit's darkening where the pixel got brighter or darker since the edit was made (a light\n"
+        "; passing over an arm): 8 = on (default), 0 = off\n"
+        "\n"
+        "RelitK0 = %.3f\n"
+        "RelitK1 = %.3f\n"
+        "; with Relit: the brightness change where the fade starts and where the edit is gone\n"
+        "\n"
+        "HistoryGate = %d\n"
+        "Blend = %.3f\n"
+        "BlendK0 = %.3f\n"
+        "BlendK1 = %.3f\n"
+        "; steadier light on surfaces between network runs (the campfire fix): HistoryGate 1 keeps the network's\n"
+        "; history from pumping on every run, Blend mixes the new edit into the carried one where they agree (K0..K1:\n"
+        "; the difference range of the mix). Defaults 1, 0.5, 0.01, 0.05. HistoryGate 0 and Blend 0 = off\n"
+        "\n"
+        "CutDrop = %.1f\n"
+        "; > 0: the carried edit fades out past this much motion (pixels of a 1080p-wide frame; gone at twice it), and on a\n"
+        "; camera cut (a frame that does not follow from the previous one by its motion vectors: a change past CutChange\n"
+        "; and 4x the recent mean) no edit from before the cut is shown until a fresh one lands. 0 = off (default 400)\n"
+        "\n"
+        "CutChange = %.3f\n"
+        "; with CutDrop: the mean brightness change (0..1) against the motion-moved previous frame that counts as a cut\n"
+        "\n"
+        "Snap = %d\n"
+        "; 1 = the carried edit is re-fitted to this frame's edges (a guided filter on its brightness): outlines stay on a\n"
+        "; moving character instead of where it was. About +0.4 ms at 2258x1270. 0 = off (default)\n"
+        "\n"
+        "SnapRadius = %u\n"
+        "SnapEps = %g\n"
+        "SnapMix = %.2f\n"
+        "; with Snap: the filter's window (4-pixel cells each side, 1..8); how strongly it follows the edges (smaller =\n"
+        "; more); 1 = the re-fitted edit alone, 0 = the carried edit\n",
+        k.reuse_every, k.reuse_split ? 1 : 0, k.reuse_phase, double(k.reuse_gate), k.reuse_gate_run ? 1 : 0, k.reuse_edge_drop,
+        double(k.reuse_edge_feather), k.reuse_disocc ? 1 : 0, double(k.reuse_disocc_threshold), k.reuse_disocc_motion, k.reuse_disocc_fill,
+        double(k.reuse_disocc_fill_radius), k.reuse_fill_rim, double(k.reuse_disocc_fill_sigma), double(k.reuse_disocc_fill_mix),
+        k.reuse_relit, double(k.reuse_relit_k0), double(k.reuse_relit_k1), k.reuse_hist_gate, double(k.reuse_blend), double(k.reuse_blend_k0),
+        double(k.reuse_blend_k1), double(k.reuse_cut_drop), double(k.reuse_cut_change), k.reuse_snap, k.reuse_snap_radius,
+        double(k.reuse_snap_eps), double(k.reuse_snap_mix));
 }
 
 bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
@@ -1679,7 +1830,7 @@ bool PreprocessFile::poll(const std::string& path, PreprocessConfig& out) {
             write_renodx(f, RenoDXConfig{});
             write_wilsjo2(f);
             write_log(f, true, true);
-            write_reuse(f, 0, 40.0f);
+            write_reuse(f, PreprocessConfig{});
             std::fclose(f);
             stamp_ = stamp_of(path);
         }
@@ -2032,7 +2183,7 @@ void Config::save(const std::string& path) {
     write_preprocess(f, preprocess);
     write_renodx(f, renodx);
     write_log(f, log_enabled, log_clear);
-    write_reuse(f, controls.reuse_every, controls.reuse_gate);
+    write_reuse(f, controls);
     std::fclose(f);
     stamp_ = stamp_of(path);
 }

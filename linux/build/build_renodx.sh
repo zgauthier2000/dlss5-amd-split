@@ -36,7 +36,7 @@ for k in renodx_prep renodx_prep_encode renodx_debug; do
         > "$tmp/log" || { cat "$tmp/log" >&2; exit 1; }
 done
 # Single-pass strengthening, shared by the two routes' RenoDX Stage.
-for k in st_fb_in st_prep st_box st_apply; do
+for k in st_fb_in st_prep st_box st_apply st_gf2; do
     "$glslang" -V --target-env vulkan1.3 -Ilinux/shaders/renodx-fast linux/shaders/renodx-fast/$k.comp -o "$out/renodx_$k.spv" \
         > "$tmp/log" || { cat "$tmp/log" >&2; exit 1; }
 done

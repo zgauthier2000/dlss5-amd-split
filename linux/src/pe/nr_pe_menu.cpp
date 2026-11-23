@@ -1,4 +1,5 @@
 // See nr_pe_menu.hpp.
+#include <set>
 #include "nr_vk_receipts.hpp"
 #include "nr_number.hpp"
 #include "nr_pe_menu.hpp"
@@ -462,6 +463,7 @@ struct Menu {
         ImGui::Begin("##nr-osd", nullptr,
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+        nr::control_ui::set_xint4(ini.get("Network", "ExperimentalInt4", "0"));
         nr::control_ui::draw_osd_lines(s, osd_mode);
         ImGui::End();
     }
@@ -606,12 +608,13 @@ struct Menu {
                 }
             }
             if (chain_rows(s)) {
+                nr::control_ui::set_xint4(ini.get("Network", "ExperimentalInt4", "0"));
                 draw_layer_status(s);
                 nr::control_ui::draw_flapping();
                 nr::control_ui::draw_missing_data(s->layers, nr::control::kMaxLayers, &ini);
             }
             else ImGui::TextDisabled("No layer is on (the NR chain below): NR does not run.");
-            if (s->net_running < nr::control::kNoNet && !chain_rows(s)) ImGui::Text("Network: %s", nr::network_codename(int(s->net_running)));
+            if (s->net_running < nr::control::kNoNet && !chain_rows(s)) ImGui::Text("Network: %s", nr::control_ui::net_label(int(s->net_running)));
             if (s->building) ImGui::TextDisabled("Building a network...");
             if (s->state[0]) ImGui::TextWrapped("%s", s->state);
             if (s->frame_gen[0]) ImGui::Text("%.*s", int(strnlen(s->frame_gen, sizeof s->frame_gen)), s->frame_gen);   // ImGui takes a "%.*s" length as it is (no stop at the NUL)
@@ -1314,19 +1317,45 @@ struct D3D12Overlay {
 // last executed command lists on (the frame's). ID3D12CommandQueue::ExecuteCommandLists of the game's queue class is
 // hooked to know it (watch_queues).
 using ExecuteFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
-ExecuteFn g_execute = nullptr;
+ExecuteFn g_execute_k[4] = {};   // eldenring/: one original per hooked ExecuteCommandLists (the wrapper's, the real queue's)
 std::atomic<ExecuteObserver> g_execute_observer{nullptr};   // on_execute
 thread_local ID3D12CommandQueue* t_last_direct = nullptr;
+// eldenring/ (11-23): the direct queue any thread last executed on (AddRef'd while held): the menu's queue when the
+// presenting thread executed nothing (Elden Ring + ERSS-FG: the frame is submitted on one thread, presented on another)
+std::mutex g_any_lock;
+ID3D12CommandQueue* g_any_direct = nullptr;
+void note_any_direct(ID3D12CommandQueue* q) {
+    std::lock_guard<std::mutex> g(g_any_lock);
+    if (g_any_direct == q) return;
+    q->AddRef();
+    if (g_any_direct) g_any_direct->Release();
+    g_any_direct = q;
+}
+ID3D12CommandQueue* any_direct() {   // AddRef'd, or null
+    std::lock_guard<std::mutex> g(g_any_lock);
+    if (g_any_direct) g_any_direct->AddRef();
+    return g_any_direct;
+}
 thread_local ID3D12CommandQueue* t_last_seen = nullptr;
+template <int K>
 void STDMETHODCALLTYPE execute_hook(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
     if (q != t_last_seen) {   // asked once per change of queue on this thread
         t_last_seen = q;
-        if (q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) t_last_direct = q;
+        if (q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) { t_last_direct = q; note_any_direct(q); }
     }
-    g_execute(q, n, lists);
+    g_execute_k[K](q, n, lists);
     if (const ExecuteObserver observer = g_execute_observer.load()) observer(q, n, lists);
 }
+void* const g_execute_hooks[4] = {reinterpret_cast<void*>(&execute_hook<0>), reinterpret_cast<void*>(&execute_hook<1>),
+                                   reinterpret_cast<void*>(&execute_hook<2>), reinterpret_cast<void*>(&execute_hook<3>)};
 ID3D12CommandQueue* last_direct_queue() { return t_last_direct; }
+std::mutex g_hint_lock;
+ID3D12CommandQueue* g_hint_queue = nullptr;   // hint_present_queue (AddRef'd)
+ID3D12CommandQueue* hinted_queue() {   // AddRef'd, or null
+    std::lock_guard<std::mutex> g(g_hint_lock);
+    if (g_hint_queue) g_hint_queue->AddRef();
+    return g_hint_queue;
+}
 std::atomic<D3D12PresentHook> g_d3d12_hook{nullptr};   // on_d3d12_present
 std::atomic<D3D11PresentHook> g_d3d11_hook{nullptr};   // on_d3d11_present
 
@@ -1352,7 +1381,7 @@ template <class T> void let_go_idle(std::map<void*, Kept<T>>& m, std::chrono::st
 
 // The menu over this swap chain's back buffer, before its Present. Never throws.
 void draw_on(IDXGISwapChain* sc, UINT flags) {
-    ++g_presents;
+    if (++g_presents == 1) say("eldenring/: the first Present reached NR Control's hook");
     if (t_inside || (flags & DXGI_PRESENT_TEST)) return;
     t_inside = true;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -1385,8 +1414,39 @@ void draw_on(IDXGISwapChain* sc, UINT flags) {
                     if (SUCCEEDED(last->GetDevice(IID_PPV_ARGS(&owner))) && owner == d12dev) { q12 = last; q12->AddRef(); }
                     release(owner);
                 }
+                watch_queues(d12dev);   // eldenring/: a swap chain the .asi never saw made (once per process)
+                for (int pass = 0; pass < 2 && !q12; ++pass) {   // eldenring/: the swap chain's creation queue, else any thread's
+                    if (ID3D12CommandQueue* hint = pass == 0 ? hinted_queue() : any_direct()) {
+                        ID3D12Device* owner = nullptr;
+                        if (SUCCEEDED(hint->GetDevice(IID_PPV_ARGS(&owner))) && owner == d12dev) {
+                            q12 = hint;
+                            static bool told[2] = {};
+                            if (!told[pass]) { told[pass] = true; say(pass == 0 ? "D3D12: the presenting thread executed nothing on the swap chain's device; drawn on the queue the game made its swap chain with"
+                                                                                  : "D3D12: the presenting thread executed nothing on the swap chain's device; drawn on the direct queue another thread last executed on"); }
+                        } else {
+                            static bool told_mis[2] = {};
+                            if (!told_mis[pass]) {
+                                told_mis[pass] = true;
+                                char t[200];
+                                std::snprintf(t, sizeof t, "eldenring/: %s queue %p is on device %p, the swap chain on %p: not used",
+                                              pass == 0 ? "the swap chain's creation" : "the last executed", static_cast<void*>(hint),
+                                              static_cast<void*>(owner), static_cast<void*>(d12dev));
+                                say(t);
+                            }
+                            hint->Release();
+                        }
+                        release(owner);
+                    }
+                }
                 release(d12dev);
-                if (!q12) { t_inside = false; return; }   // no frame executed on this thread yet: next Present
+                if (!q12) {   // no frame executed on this thread yet: next Present
+                    static uint64_t told_at = 0;
+                    if (g_presents == 1 || g_presents >= told_at + 600) {
+                        told_at = g_presents;
+                        say("D3D12: Present " + std::to_string(g_presents.load()) + " reached the hook, but no queue of the swap chain's device is known on this thread; not drawn");
+                    }
+                    t_inside = false; return;
+                }
             }
         }
         if (d11) {
@@ -1643,26 +1703,47 @@ void vulkan_forget(VkDevice device, VkSwapchainKHR sc) {
     nr::pe::receipts::collect();
 }
 
+uint64_t dxgi_presents() { return g_presents.load(); }
+void hint_present_queue(ID3D12CommandQueue* queue) {
+    if (!queue) return;
+    queue->AddRef();
+    ID3D12CommandQueue* old = nullptr;
+    { std::lock_guard<std::mutex> g(g_hint_lock); old = g_hint_queue; g_hint_queue = queue; }
+    if (old) old->Release();
+}
+
 void watch_queues(ID3D12Device* device) {
-    static std::once_flag once;
-    std::call_once(once, [device] {
-        D3D12_COMMAND_QUEUE_DESC qd{};
-        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        ID3D12CommandQueue* q = nullptr;
-        if (!device || FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) || !q) {
-            say("no queue to learn the swap chains' queue from; no menu over D3D12 swap chains");
-            return;
-        }
-        // IUnknown 3, ID3D12Object 4, ID3D12DeviceChild 1, ID3D12CommandQueue: UpdateTileMappings, CopyTileMappings,
-        // ExecuteCommandLists
-        void* fn = (*reinterpret_cast<void***>(q))[10];
-        q->Release();
-        const MH_STATUS init = MH_Initialize();
-        if ((init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) ||
-            MH_CreateHook(fn, reinterpret_cast<void*>(&execute_hook), reinterpret_cast<void**>(&g_execute)) != MH_OK ||
-            MH_EnableHook(fn) != MH_OK)
-            say("ExecuteCommandLists could not be hooked; no menu over D3D12 swap chains");
-    });
+    // eldenring/: once per distinct ExecuteCommandLists function (up to 4), not once per process: in Elden Ring the .asi
+    // learns a wrapper's device (ERSS-FG / Streamline) and the menu then sees the real one from the swap chain
+    static std::mutex lock;
+    static std::set<void*> seen_devices, hooked;
+    if (!device) return;
+    std::lock_guard<std::mutex> guard(lock);
+    if (!seen_devices.insert(device).second) return;
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* q = nullptr;
+    if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) || !q) {
+        say("no queue to learn the swap chains' queue from; no menu over D3D12 swap chains");
+        return;
+    }
+    // IUnknown 3, ID3D12Object 4, ID3D12DeviceChild 1, ID3D12CommandQueue: UpdateTileMappings, CopyTileMappings,
+    // ExecuteCommandLists
+    void* fn = (*reinterpret_cast<void***>(q))[10];
+    q->Release();
+    if (!hooked.insert(fn).second) return;
+    const int k = int(hooked.size()) - 1;
+    if (k >= 4) { say("more than 4 ExecuteCommandLists functions; this one is not watched"); return; }
+    const MH_STATUS init = MH_Initialize();
+    if ((init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) ||
+        MH_CreateHook(fn, g_execute_hooks[k], reinterpret_cast<void**>(&g_execute_k[k])) != MH_OK ||
+        MH_EnableHook(fn) != MH_OK)
+        say("ExecuteCommandLists could not be hooked; no menu over D3D12 swap chains");
+    else if (k > 0) {
+        char t[160];
+        std::snprintf(t, sizeof t, "eldenring/: ExecuteCommandLists of a second queue class watched (device %p)", static_cast<void*>(device));
+        say(t);
+    }
 }
 
 void on_d3d12_present(D3D12PresentHook hook) { g_d3d12_hook.store(hook); }
@@ -1684,6 +1765,7 @@ bool colour_space_of(IDXGISwapChain* swap_chain, int* space) {
 }
 
 void install() {
+    nr::pe::control::set_dxgi_presents_source(&dxgi_presents);   // release/
     static std::once_flag once;
     std::call_once(once, [] {
         // Its own thread: the probe process takes a moment, which must not be spent inside the game's frame.

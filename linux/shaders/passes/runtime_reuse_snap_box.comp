@@ -1,0 +1,46 @@
+#version 460
+// save3/ (11-22; prof/ prototype): plugin5's runtime_reuse_snap_box.comp with the cells of the workgroup's tile and a 4-cell border staged
+// in shared memory once (radius <= 4); the sums are the same terms in the same order as plugin5's shader (cells outside the grid left
+// out, rgba32f values exact), so the output is bit for bit the same. Radius > 4: plugin5's loop on the images as before.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba32f) uniform readonly image2D ina;
+layout(set = 0, binding = 1, rgba32f) uniform readonly image2D inb;
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D outa;
+layout(set = 0, binding = 3, rgba32f) uniform writeonly image2D outb;
+layout(push_constant) uniform Push { uint cw, ch, radius, coef; float eps; } pc;
+shared vec4 s_a[16][16], s_b[16][16];
+void main() {
+    const ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    const int r = int(pc.radius);
+    const bool lds = r <= 4;
+    if (lds) {
+        const ivec2 org = ivec2(gl_WorkGroupID.xy) * 8 - 4;
+        for (uint i = gl_LocalInvocationIndex; i < 256u; i += 64u) {
+            const ivec2 t = org + ivec2(i % 16u, i / 16u);
+            const bool ok = t.x >= 0 && t.y >= 0 && t.x < int(pc.cw) && t.y < int(pc.ch);
+            s_a[i / 16u][i % 16u] = ok ? imageLoad(ina, t) : vec4(0.0);
+            s_b[i / 16u][i % 16u] = ok ? imageLoad(inb, t) : vec4(0.0);
+        }
+        barrier();
+    }
+    if (q.x >= int(pc.cw) || q.y >= int(pc.ch)) return;
+    vec4 sa = vec4(0.0), sb = vec4(0.0); float c = 0.0;
+    for (int y = -r; y <= r; ++y)
+        for (int x = -r; x <= r; ++x) {
+            const ivec2 t = q + ivec2(x, y);
+            if (t.x < 0 || t.y < 0 || t.x >= int(pc.cw) || t.y >= int(pc.ch)) continue;
+            if (lds) { sa += s_a[lid.y + 4 + y][lid.x + 4 + x]; sb += s_b[lid.y + 4 + y][lid.x + 4 + x]; }
+            else { sa += imageLoad(ina, t); sb += imageLoad(inb, t); }
+            c += 1.0;
+        }
+    const vec4 A = sa / c, B = sb / c;
+    if (pc.coef != 0u) {
+        const float mI = A.x, vI = max(A.y - mI * mI, 0.0);
+        const vec3 me = vec3(A.z, A.w, B.x), mIe = B.yzw;
+        const vec3 a = (mIe - mI * me) / (vI + pc.eps);
+        imageStore(outa, q, vec4(a, mI)); imageStore(outb, q, vec4(me - a * mI, vI));
+    } else {
+        imageStore(outa, q, A); imageStore(outb, q, B);
+    }
+}

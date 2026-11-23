@@ -1,0 +1,88 @@
+#version 460
+#ifndef TS
+#define TS 16   // tile (and workgroup) side in cells (8 tried: slower)
+#endif
+// Passes (fast): the whole guided filter of radius R = 2 in ONE dispatch (fbfast/, 11-22) = st_box.comp with coef 1 (InA/InB = the
+// cell means -> the coefficients) followed by st_box.comp with coef 0 (the coefficients' box mean -> OutA/OutB), with the same sums
+// in the same order per cell: each 16 x 16 workgroup makes the coefficients of its tile and a 2-cell border (20 x 20) in shared
+// memory from the horizontal means of a 4-cell border (20 x 24), then their box mean. Cells outside the grid are left out as there.
+// Dispatch: (low + TS - 1) / TS groups (TS 16: as st_box).
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = TS, local_size_y = TS) in;
+layout(set = 0, binding = 0) uniform texture2D InA;
+layout(set = 0, binding = 1) uniform texture2D InB;
+layout(set = 0, binding = 4, rgba32f) uniform writeonly image2D OutA;
+layout(set = 0, binding = 5, rgba32f) uniform writeonly image2D OutB;
+layout(push_constant) uniform Push { uvec2 low; uint radius, coef; float eps; } pc;
+const int R = 2, CW = TS + 2 * R, HR = TS + 4 * R;   // coefficient tile width / height, first horizontal means' rows
+shared vec4 s_a[HR][CW], s_b[HR][CW];                 // first pass's horizontal means; reused for the second pass's
+shared vec4 s_ca[CW][CW], s_cb[CW][CW];               // the coefficients (OutA / OutB of the first pass)
+// The coefficients as st_box makes them. A function of their own: glslang's `precise` (the second pass's means) would otherwise
+// spread back through s_ca / s_cb into this arithmetic and keep ACO from fusing its multiply-adds as it does in st_box (not exact).
+void coefficients(vec4 A, vec4 B, out vec4 oa, out vec4 ob) {
+    const float mI = A.x, vI = max(A.y - mI * mI, 0.0);
+    const vec3 mp = vec3(A.z, A.w, B.x), mIp = B.yzw;
+    const vec3 a = (mIp - mI * mp) / (vI + pc.eps);
+    oa = vec4(a, mI); ob = vec4(mp - a * mI, vI);
+}
+void main() {
+    const ivec2 org = ivec2(gl_WorkGroupID.xy) * TS;
+    const int li = int(gl_LocalInvocationIndex);
+    const ivec2 lo = ivec2(pc.low);
+    // 1. first pass, horizontal: rows org.y - 2R .. org.y + 16 + 2R, columns org.x - R .. org.x + 16 + R
+    for (int e = li; e < HR * CW; e += TS * TS) {
+        const int k = e / CW, cx = e % CW;
+        const int row = org.y - 2 * R + k, col = org.x - R + cx;
+        if (row < 0 || row >= lo.y || col < 0 || col >= lo.x) continue;
+        vec4 A = vec4(0.0), B = vec4(0.0); float c = 0.0;
+        for (int i = -R; i <= R; ++i) {
+            const ivec2 t = ivec2(col + i, row);
+            if (t.x < 0 || t.x >= lo.x) continue;
+            A += texelFetch(InA, t, 0); B += texelFetch(InB, t, 0); c += 1.0;
+        }
+        s_a[k][cx] = A / c; s_b[k][cx] = B / c;
+    }
+    barrier();
+    // 2. first pass, vertical + the coefficients: cells (org - R) .. (org + 16 + R)
+    for (int e = li; e < CW * CW; e += TS * TS) {
+        const int ky = e / CW, cx = e % CW;
+        const ivec2 q = org - R + ivec2(cx, ky);
+        if (q.x < 0 || q.y < 0 || q.x >= lo.x || q.y >= lo.y) continue;
+        vec4 sa = vec4(0.0), sb = vec4(0.0); float c = 0.0;
+        for (int i = -R; i <= R; ++i) {
+            const int row = q.y + i;
+            if (row < 0 || row >= lo.y) continue;
+            sa += s_a[ky + R + i][cx]; sb += s_b[ky + R + i][cx]; c += 1.0;
+        }
+        precise const vec4 A = sa / c, B = sb / c;
+        vec4 oa, ob;
+        coefficients(A, B, oa, ob);
+        s_ca[ky][cx] = oa; s_cb[ky][cx] = ob;
+    }
+    barrier();
+    // 3. second pass, horizontal: rows org.y - R .. org.y + 16 + R, columns org.x .. org.x + 16 (into s_a / s_b rows 0 .. CW)
+    for (int e = li; e < CW * TS; e += TS * TS) {
+        const int ky = e / TS, x = e % TS;
+        const int row = org.y - R + ky, col = org.x + x;
+        if (row < 0 || row >= lo.y || col >= lo.x) continue;
+        vec4 A = vec4(0.0), B = vec4(0.0); float c = 0.0;
+        for (int i = -R; i <= R; ++i) {
+            const int tx = col + i;
+            if (tx < 0 || tx >= lo.x) continue;
+            A += s_ca[ky][x + R + i]; B += s_cb[ky][x + R + i]; c += 1.0;
+        }
+        s_a[ky][x] = A / c; s_b[ky][x] = B / c;
+    }
+    barrier();
+    // 4. second pass, vertical
+    const ivec2 lid = ivec2(gl_LocalInvocationID.xy), q = org + lid;
+    if (any(greaterThanEqual(q, lo))) return;
+    vec4 sa = vec4(0.0), sb = vec4(0.0); float c = 0.0;
+    for (int i = -R; i <= R; ++i) {
+        const int row = q.y + i;
+        if (row < 0 || row >= lo.y) continue;
+        sa += s_a[lid.y + R + i][lid.x]; sb += s_b[lid.y + R + i][lid.x]; c += 1.0;
+    }
+    precise const vec4 A = sa / c, B = sb / c;
+    imageStore(OutA, q, A); imageStore(OutB, q, B);
+}

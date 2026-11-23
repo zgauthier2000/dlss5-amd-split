@@ -162,6 +162,33 @@ void reuse_now(nr::Controls& c) {
     const auto& ini = ini_config();
     c.reuse_every = ini.reuse_every;
     c.reuse_gate = ini.reuse_gate;
+    c.reuse_split = ini.reuse_split;
+    c.reuse_phase = ini.reuse_phase;
+    c.reuse_edge_drop = ini.reuse_edge_drop;
+    c.reuse_edge_feather = ini.reuse_edge_feather;
+    c.reuse_disocc = ini.reuse_disocc;
+    c.reuse_disocc_threshold = ini.reuse_disocc_threshold;
+    c.reuse_gate_run = ini.reuse_gate_run;
+    c.reuse_cut_drop = ini.reuse_cut_drop;
+    c.reuse_cut_change = ini.reuse_cut_change;
+    c.reuse_snap = ini.reuse_snap;
+    c.reuse_snap_radius = ini.reuse_snap_radius;
+    c.reuse_snap_eps = ini.reuse_snap_eps;
+    c.reuse_snap_mix = ini.reuse_snap_mix;
+    c.reuse_box = ini.reuse_box;
+    c.reuse_box_k0 = ini.reuse_box_k0;
+    c.reuse_box_k1 = ini.reuse_box_k1;
+    c.reuse_nearmv = ini.reuse_nearmv;
+    c.reuse_nearmv_sigma = ini.reuse_nearmv_sigma;
+    c.reuse_cut_feedback = ini.reuse_cut_feedback;
+    c.reuse_disocc_fill = ini.reuse_disocc_fill; c.reuse_disocc_fill_radius = ini.reuse_disocc_fill_radius;
+    c.reuse_disocc_fill_sigma = ini.reuse_disocc_fill_sigma; c.reuse_disocc_fill_mix = ini.reuse_disocc_fill_mix;   // visfix/
+    c.reuse_relit = ini.reuse_relit; c.reuse_relit_k0 = ini.reuse_relit_k0; c.reuse_relit_k1 = ini.reuse_relit_k1;   // armfix/
+    c.reuse_hist_gate = ini.reuse_hist_gate; c.reuse_blend = ini.reuse_blend; c.reuse_blend_k0 = ini.reuse_blend_k0; c.reuse_blend_k1 = ini.reuse_blend_k1;   // campfire/
+    c.reuse_fill_rim = ini.reuse_fill_rim; c.reuse_disocc_motion = ini.reuse_disocc_motion;
+    c.reuse_guard = ini.reuse_guard; c.reuse_guard_alpha = ini.reuse_guard_alpha; c.reuse_guard_floor = ini.reuse_guard_floor;   // guard/
+    c.reuse_moved = ini.reuse_moved; c.reuse_moved_k0 = ini.reuse_moved_k0; c.reuse_moved_k1 = ini.reuse_moved_k1;
+    c.reuse_moved_radius = ini.reuse_moved_radius; c.reuse_moved_d0 = ini.reuse_moved_d0; c.reuse_moved_d1 = ini.reuse_moved_d1;
 }
 
 nr::Preprocess preprocess_now() {

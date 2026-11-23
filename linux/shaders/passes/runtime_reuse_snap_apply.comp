@@ -1,0 +1,47 @@
+#version 460
+// plugin5 (2026-11-21) Snap, step 4: the carried edit re-projected onto this frame's structure, e_s = a I + b with the cells' mean
+// coefficients bilinear at the pixel (cell centres at 4 c + 2), mixed with the carried edit itself by `amount` (1: the snapped edit
+// alone); the answer = shown + that. Same rounding as the warp.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D shown;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D carry;
+layout(set = 0, binding = 2, rgba32f) uniform readonly image2D ga;
+layout(set = 0, binding = 3, rgba32f) uniform readonly image2D gb;
+#if defined(NR_ANSWER16)   // v7: the answer straight into the caller's RGBA16F frame (no RGBA32F answer + converting blit)
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D answer;
+#else
+layout(set = 0, binding = 4, rgba32f) uniform writeonly image2D answer;
+#endif
+#if defined(NR_ANSWER16) && NR_ANSWER16 == 2
+// round to the nearest half, ties to even (the blit's conversion, if it rounds that way); the store then converts an exact value
+float nr_rtne16(float x) {
+    const uint u = floatBitsToUint(x), sg = u & 0x80000000u, a = u & 0x7fffffffu;
+    if (a >= 0x7f800000u) return x;
+    if (a >= 0x477ff000u) return uintBitsToFloat(sg | 0x7f800000u);
+    if (a >= 0x38800000u) return uintBitsToFloat(sg | ((a + 0xfffu + ((a >> 13u) & 1u)) & ~0x1fffu));
+    return roundEven(x * 16777216.0) * (1.0 / 16777216.0);
+}
+#define NR_A16(v) vec4(nr_rtne16((v).x), nr_rtne16((v).y), nr_rtne16((v).z), nr_rtne16((v).w))
+#else
+#define NR_A16(v) (v)
+#endif
+layout(push_constant) uniform Push { uint width, height, cw, ch, round_u8; float amount; } pc;
+vec3 cell(bool which_a, ivec2 c) {
+    c = clamp(c, ivec2(0), ivec2(pc.cw, pc.ch) - 1);
+    return which_a ? imageLoad(ga, c).rgb : imageLoad(gb, c).rgb;
+}
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.width) || p.y >= int(pc.height)) return;
+    const vec4 s = texelFetch(shown, p, 0);
+    const float I = dot(s.rgb, vec3(0.2126, 0.7152, 0.0722));
+    const vec2 q = (vec2(p) + 0.5) / 4.0 - 0.5;
+    const vec2 f0 = floor(q), f = q - f0;
+    const ivec2 i = ivec2(f0);
+    const vec3 a = mix(mix(cell(true, i), cell(true, i + ivec2(1, 0)), f.x), mix(cell(true, i + ivec2(0, 1)), cell(true, i + ivec2(1, 1)), f.x), f.y);
+    const vec3 b = mix(mix(cell(false, i), cell(false, i + ivec2(1, 0)), f.x), mix(cell(false, i + ivec2(0, 1)), cell(false, i + ivec2(1, 1)), f.x), f.y);
+    const vec3 e = imageLoad(carry, p).rgb;
+    vec3 o = s.rgb + mix(e, a * I + b, pc.amount);
+    if (pc.round_u8 != 0u) o = round(clamp(o, 0.0, 1.0) * 255.0) / 255.0;
+    imageStore(answer, p, NR_A16(vec4(o, s.a)));
+}

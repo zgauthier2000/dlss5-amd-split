@@ -1,0 +1,60 @@
+#version 460
+// save3/ (2026-11-22): runtime_reuse_stat3.comp with the exact shortcut. Word 5 = the largest texel length of this field (runtime_reuse_stat_max, read
+// and cleared here). When the limit is <= 0 (no fade) or that largest length is below 0.99 x the limit, the warp's fade factor
+// clamp(2 - mean / limit, 0, 1) is exactly 1 whatever the mean is (the summed mean is at most the largest length x (1 + 4e-3) for fields
+// up to 2^24 texels: save3/NOTES.md), so the sum is left out and word 1 = 0 (factor 1 as well). Otherwise the sum below is runtime_reuse_stat3.comp's,
+// the same code in the same order.
+// plugin3 (2026-11-21): runtime_reuse_stat.comp for the accumulator with EdgeDrop's sentinels: an invalid texel (|uv| > 8, the
+// motion3 sentinel) counts as no motion, as NaN and inf already did; the mean still divides by every texel.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Stat { float mean_pixels[]; };
+layout(set = 0, binding = 1, rg32f) uniform readonly image2D motion;
+layout(push_constant) uniform Push {
+    uint width, height;       // the field
+    float scale_x, scale_y;   // engine units -> uv
+    float pixels_x, pixels_y; // the model's extent
+    uint word;
+    float limit;              // save3/: the warp's fade limit (pixels of the model extent)
+    uint sentinel;            // (stat_max's flag; this file's texel_length is fixed)
+} pc;
+shared float partial[256];
+shared bool s_skip;
+
+// plugin6 (2026-11-21, part A trim): the same sum in the same order, its loads issued 16 at a time (one walk of the field
+// by one workgroup was latency-bound: ~0.2 ms a dispatch at 2258x1270). Each invocation still adds its texels i, i+256, i+512, ...
+// one after another, so the float result is bit for bit the v5 shader's.
+float texel_length(uint i) {
+    const vec2 u = imageLoad(motion, ivec2(i % pc.width, i / pc.width)).xy * vec2(pc.scale_x, pc.scale_y);
+    const vec2 m = u * vec2(pc.pixels_x, pc.pixels_y);
+    const float l = length(m);
+    return (isnan(l) || isinf(l) || any(greaterThan(abs(u), vec2(8.0)))) ? 0.0 : l;
+}
+
+void main() {
+    if (gl_LocalInvocationID.x == 0u) {
+        const float mx = mean_pixels[5];
+        mean_pixels[5] = 0.0;
+        s_skip = !(pc.limit > 0.0) || mx < 0.99 * pc.limit;
+    }
+    barrier();
+    if (s_skip) {
+        if (gl_LocalInvocationID.x == 0u) mean_pixels[pc.word] = 0.0;
+        return;
+    }
+    const uint count = pc.width * pc.height;
+    float sum = 0.0;
+    uint i = gl_LocalInvocationID.x;
+    for (; i + 256u * 15u < count; i += 256u * 16u) {
+        float v[16];
+        for (uint k = 0u; k < 16u; ++k) v[k] = texel_length(i + 256u * k);
+        for (uint k = 0u; k < 16u; ++k) sum += v[k];
+    }
+    for (; i < count; i += 256u) sum += texel_length(i);
+    partial[gl_LocalInvocationID.x] = sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (gl_LocalInvocationID.x < s) partial[gl_LocalInvocationID.x] += partial[gl_LocalInvocationID.x + s];
+        barrier();
+    }
+    if (gl_LocalInvocationID.x == 0u) mean_pixels[pc.word] = partial[0] / float(max(count, 1u));
+}

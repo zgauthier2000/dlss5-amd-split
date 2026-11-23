@@ -29,8 +29,41 @@ struct PreprocessConfig {
     bool sound = true;                 // a cue when it switches on or off
     // [Reuse], the same file: temporal reuse of the network's edit (Controls::reuse_every / reuse_gate).
     // The OptiScaler route builds its controls from NGX parameters, which have no key for it.
-    int reuse_every = 0;
-    float reuse_gate = 40.0f;
+    int reuse_every = 4;
+    float reuse_gate = 400.0f;
+    // plugin2: [Reuse] Split (the network spread over Every frames) and Phase (0 none, 1 Lite lossy's skipped frames, 2 the other)
+    bool reuse_split = true;
+    int reuse_phase = 1;
+    // plugin3: [Reuse] EdgeDrop, Disocclusion (+ DisoccThreshold, EdgeFeather): see nr::Controls
+    int reuse_edge_drop = 2;
+    float reuse_edge_feather = 4.0f;
+    bool reuse_disocc = true;
+    float reuse_disocc_threshold = 0.1f;
+    // plugin4: [Reuse] GateRun, CutDrop, CutChange: see nr::Controls
+    bool reuse_gate_run = false;
+    float reuse_cut_drop = 400.0f;
+    float reuse_cut_change = 0.03f;
+    // plugin5: [Reuse] Snap, SnapRadius, SnapEps, SnapMix, Box, BoxK0, BoxK1, NearMV, NearSigma: see nr::Controls
+    int reuse_snap = 0;
+    uint32_t reuse_snap_radius = 2;
+    float reuse_snap_eps = 1.0e-3f;
+    float reuse_snap_mix = 1.0f;
+    int reuse_box = 0;
+    float reuse_box_k0 = 0.02f, reuse_box_k1 = 0.06f;
+    int reuse_nearmv = 0;
+    float reuse_nearmv_sigma = 0.05f;
+    // burn/: [Reuse] Moved, MovedDarkOnly, MovedRelative, MovedRadius, MovedK0, MovedK1, MovedD0, MovedD1: see nr::Controls
+    int reuse_moved = 0;
+    bool reuse_cut_feedback = false;
+    int reuse_disocc_fill = 4;
+    float reuse_disocc_fill_radius = 8.0f;
+    float reuse_disocc_fill_sigma = 0.05f, reuse_disocc_fill_mix = 1.0f;   // visfix/
+    int reuse_relit = 8; float reuse_relit_k0 = 0.01f, reuse_relit_k1 = 0.05f;   // armfix/: [Reuse] Relit, RelitK0, RelitK1: see nr::Controls
+    int reuse_hist_gate = 1; float reuse_blend = 0.5f, reuse_blend_k0 = 0.01f, reuse_blend_k1 = 0.05f;
+    int reuse_fill_rim = 1;   // rim/: [Reuse] DisoccFillRim
+    int reuse_disocc_motion = 1;   // rim/: [Reuse] DisoccMotion
+    float reuse_guard = 0.0f, reuse_guard_alpha = 0.1f, reuse_guard_floor = 1.0f;   // guard/: [Reuse] Guard, GuardAlpha, GuardFloor   // campfire/: [Reuse] HistoryGate, Blend, BlendK0, BlendK1: see nr::Controls
+    float reuse_moved_k0 = 0.03f, reuse_moved_k1 = 0.08f, reuse_moved_radius = 12.0f, reuse_moved_d0 = 0.1f, reuse_moved_d1 = 0.3f;
 };
 // One key of the section into `p`; false when it is not one of its keys.
 bool parse_preprocess_key(PreprocessConfig& p, const std::string& key, const std::string& value);
@@ -40,7 +73,9 @@ void write_preprocess(FILE* f, const PreprocessConfig& p);
 // hotkey that cycles through them, the switch's cue, how networks stay in memory (Residency: 0 auto, 1 resident,
 // 2 offload to RAM, 3 minimal), where the pre block reads the motion vectors, and the history at a new frame size.
 struct NetworkConfig {
-    int model = nr::kSmallFp8;
+    int model = nr::kSmallFp8Experimental;
+    bool experimental_int4 = true;   // release/: [Network] ExperimentalInt4 (read by core/nr_runtime.cpp at build)
+    bool fp16_activations = true;    // release/: [Network] FP16Activations (the same)
     std::string hotkey = "Ctrl+F11";
     bool sound = true;
     int residency = 0;
@@ -176,9 +211,7 @@ void touch_config();
 uint64_t config_epoch();
 // [Log], with its comments (read by nr_pe_log.cpp; every route's file carries it).
 void write_log(FILE* f, bool enabled, bool clear);
-// [Reuse], with its comments: the network on every `every`-th frame (0 or 1: every frame), the frames between
-// carrying its edit forward by the motion; `gate` in pixels of a 1080p-wide frame.
-void write_reuse(FILE* f, int every, float gate);
+// [Reuse] is written by nr_pe_config.cpp's write_reuse (every key, with its comments).
 // [Inspect] (NR Control's comparison and debug tools), with its comments: what the installer writes (every tool off).
 void write_inspect(FILE* f, const InspectConfig& i);
 void write_hudfix(FILE* f, const HudFixConfig& h);

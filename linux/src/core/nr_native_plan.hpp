@@ -13,4 +13,8 @@ struct NativePlan {
 enum class NetworkModel { Original, Small };
 NativePlan make_native_plan(uint32_t source_width, uint32_t source_height,
                             NetworkModel model = NetworkModel::Original);
+// The frame extent the RenoDX stage's network (NRResolutionScale < 1) is a part of: a smaller small-model plan pads its
+// working extent to the frame's count of padded tokens at the last down step (nr_native_plan.cpp). renodx::working_resolution
+// sets it.
+void set_plan_pad_like(uint32_t frame_width, uint32_t frame_height);
 }

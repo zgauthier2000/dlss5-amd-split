@@ -748,6 +748,17 @@ bool read_frame(const NVSDK_NGX_Parameter* p, const Tracked& t, Frame& f) {
         }
     }
     f.reset = get_uint(p, "Reset") != 0;
+    {   // plugin2: the frame's jitter for [Reuse] Phase (OptiScaler hands Jitter.Offset.X / Y to FSR as they are)
+        static uint64_t serial = 0;
+        nr::FrameHint hint;
+        hint.serial = ++serial;
+        float jx = 0.0f, jy = 0.0f;
+        hint.jitter_known = get_float(p, "Jitter.Offset.X", &jx) && get_float(p, "Jitter.Offset.Y", &jy) && std::isfinite(jx) &&
+                            std::isfinite(jy);
+        hint.jitter_x = jx; hint.jitter_y = jy;
+        hint.render_width = f.render_w; hint.display_width = f.out_w;
+        nr::set_frame_hint(hint);
+    }
     if (!get_float(p, "DLSS.Pre.Exposure", &f.pre_exposure) || !(f.pre_exposure > 1e-6f) || !std::isfinite(f.pre_exposure)) f.pre_exposure = 1.0f;
     if (!get_float(p, "DLSS.Exposure.Scale", &f.exposure_scale) || !(f.exposure_scale > 0.0f) || !std::isfinite(f.exposure_scale)) f.exposure_scale = 1.0f;
     if (!get_float(p, "MV.Scale.X", &f.mv_x) || !std::isfinite(f.mv_x) || f.mv_x == 0.0f) f.mv_x = 1.0f;
@@ -2509,6 +2520,7 @@ void adopt_swapchain(IUnknown* device, IDXGISwapChain* sc) {
         if (slot) slot->Release();
         slot = queue;
     }
+    nr::pe::menu::hint_present_queue(queue);   // eldenring/: the menu's fallback queue
     bool hooked = hook_slot(sc, 8, kDetourPresent);
     IDXGISwapChain1* sc1 = nullptr;
     if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) {
@@ -4093,6 +4105,17 @@ bool read_frame_dims(const NVSDK_NGX_Parameter* p, VkFrame& f, const CreateSizes
         }
     }
     f.reset = get_uint(p, "Reset") != 0;
+    {   // plugin2: the frame's jitter for [Reuse] Phase (OptiScaler hands Jitter.Offset.X / Y to FSR as they are)
+        static uint64_t serial = 0;
+        nr::FrameHint hint;
+        hint.serial = ++serial;
+        float jx = 0.0f, jy = 0.0f;
+        hint.jitter_known = get_float(p, "Jitter.Offset.X", &jx) && get_float(p, "Jitter.Offset.Y", &jy) && std::isfinite(jx) &&
+                            std::isfinite(jy);
+        hint.jitter_x = jx; hint.jitter_y = jy;
+        hint.render_width = f.render_w; hint.display_width = f.out_w;
+        nr::set_frame_hint(hint);
+    }
     if (!get_float(p, "DLSS.Pre.Exposure", &f.pre_exposure) || !(f.pre_exposure > 1e-6f) || !std::isfinite(f.pre_exposure)) f.pre_exposure = 1.0f;
     if (!get_float(p, "DLSS.Exposure.Scale", &f.exposure_scale) || !(f.exposure_scale > 0.0f) || !std::isfinite(f.exposure_scale)) f.exposure_scale = 1.0f;
     if (!get_float(p, "MV.Scale.X", &f.mv_x) || !std::isfinite(f.mv_x) || f.mv_x == 0.0f) f.mv_x = 1.0f;

@@ -20,13 +20,17 @@ def wanted_keys(game: str) -> dict:
         # [Spoofing] is left at the release's own `auto` values (Dxgi: true on AMD/Intel; the reported GPU: an NVIDIA
         # card, so the game offers DLSS). Dxgi is a per-game, per-system setting: if NR Control keeps waiting for the
         # game's upscaler, Dxgi=false is the thing to try (install.sh and the package README say so).
-        # [Upscalers] Dx12Upscaler is left at auto: OptiScaler's own choice, nothing to do with Neural Rendering.
+        # [Upscalers] Dx12Upscaler is left at auto unless FSR 4 Lite lossy is installed (below).
     }
 
 
 def optional_keys() -> dict:
     """Keys rewritten where the release's ini has them, and not missed where it does not."""
-    return {}
+    if os.environ.get("NR_LITE", "0") != "1":
+        return {}
+    # release/: FSR 4 Lite lossy (install.sh, default): DX12 games upscale through OptiScaler's FFX/FSR path, which loads
+    # OptiScaler\amd_fidelityfx_upscaler_dx12.dll (Lite); the driver's own FSR 4 library is not loaded (as in the tested games)
+    return {("Upscalers", "Dx12Upscaler"): "fsr31", ("FSR", "Fsr4DoNotLoadAmdxc64"): "true"}
 
 
 def main(game: str) -> int:

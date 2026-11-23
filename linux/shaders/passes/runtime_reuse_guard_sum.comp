@@ -1,0 +1,30 @@
+#version 460
+// guard/ (2026-11-23) [Reuse] Guard, part 2 of 2 (one workgroup): mean |block mean difference| over valid blocks, x255 (about display
+// levels) = the jump; the decision for this run's store (word 0 = the alpha store_guard uses):
+//   guarded = ema > 0 && jump > floor && jump > ratio * ema && the previous run was not guarded   -> alpha = GuardAlpha, else Blend.
+// A real change (lighting, new place) jumps on two runs in a row: the second is taken (one run late). Under a quarter of the blocks valid
+// (a cut, a reveal): no decision, the average restarts. Words: 0 alpha, 1 ema, 2 previous guarded, 3 last jump, 4 guarded runs, 5 runs, 6 valid share.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Stat { uint words[]; };
+layout(set = 0, binding = 1) readonly buffer Terms { uvec2 terms[]; };
+layout(push_constant) uniform Push { uint blocks; float ratio, floor_, galpha, blend; } pc;
+shared float s_sum[256]; shared float s_n[256];
+void main() {
+    const uint t = gl_LocalInvocationID.x; float sum = 0.0, n = 0.0;
+    for (uint i = t; i < pc.blocks; i += 256u) { const uvec2 q = terms[i]; if (q.y != 0u) { sum += abs(uintBitsToFloat(q.x)); n += 1.0; } }
+    s_sum[t] = sum; s_n[t] = n; barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) { if (t < s) { s_sum[t] += s_sum[t + s]; s_n[t] += s_n[t + s]; } barrier(); }
+    if (t == 0u) {
+        const float share = s_n[0] / max(float(pc.blocks), 1.0);
+        const float jump = s_n[0] > 0.0 ? 255.0 * s_sum[0] / s_n[0] : 0.0;
+        const float ema = uintBitsToFloat(words[1]); const bool prev = words[2] != 0u;
+        float alpha = pc.blend, ema2 = 0.0; bool g = false;
+        if (share >= 0.25) {
+            g = ema > 0.0 && jump > pc.floor_ && jump > pc.ratio * ema && !prev;
+            if (g) { alpha = pc.galpha; ema2 = ema; }
+            else ema2 = ema > 0.0 ? 0.8 * ema + 0.2 * min(jump, 2.0 * ema) : jump;
+        }
+        words[0] = floatBitsToUint(alpha); words[1] = floatBitsToUint(ema2); words[2] = g ? 1u : 0u; words[3] = floatBitsToUint(jump);
+        if (g) words[4] += 1u; words[5] += 1u; words[6] = floatBitsToUint(share);
+    }
+}

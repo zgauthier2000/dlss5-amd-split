@@ -29,6 +29,21 @@ void main() {
                 const vec3 q = st_gfq(CA, CB, prev, I, pc.low, mI, vI);
                 const float z = (I - mI) * (I - mI) / (vI + 0.0004);
                 conf = exp(-0.125 * z);
+                // armfix/ FeedbackMotionEdge (flags bit 5; cstop = threshold px, block = radius px): no feedback where this frame's motion
+                // differs from that `block` px away (4 directions) by cstop .. 2 cstop px: an edge moving against its neighbourhood, where
+                // the fed-back edit (under reuse a carried, misregistered one) would compound
+                if ((pc.flags & 32u) != 0u && (pc.flags & 2u) != 0u) {
+                    const vec2 sc = vec2(pc.mgrid) / vec2(pc.size);
+                    const vec2 m0 = texelFetch(Motion, ivec2(pc.mbase + min(uvec2((vec2(px) + 0.5) * sc), pc.mgrid - 1u)), 0).xy;
+                    float g = 0.0;
+                    for (int k = 0; k < 4; ++k) {
+                        const vec2 o = float(pc.block) * vec2(k == 0 ? 1.0 : k == 1 ? -1.0 : 0.0, k == 2 ? 1.0 : k == 3 ? -1.0 : 0.0);
+                        const vec2 pq = clamp(vec2(px) + 0.5 + o, vec2(0.5), vec2(pc.size) - 0.5);
+                        const vec2 mq = texelFetch(Motion, ivec2(pc.mbase + min(uvec2(pq * sc), pc.mgrid - 1u)), 0).xy;
+                        g = max(g, length((mq - m0) * pc.mscale));
+                    }
+                    conf *= 1.0 - smoothstep(pc.cstop, 2.0 * pc.cstop, g);
+                }
                 vec3 add = pc.w * conf * q;
                 if (pc.darkcol > 0.0) {   
                     const vec3 X = st_lab(p.rgb), Y = st_lab(clamp(p.rgb + add, 0.0, 1.0));

@@ -168,7 +168,7 @@ network = render("void write_network(", {"n": config["network"]})[0]
 preprocess = render("void write_preprocess(", {"p": config["preprocess"], "v": config["preprocess"]["values"]})[0]
 w2 = formats(body_of("void write_wilsjo2("))[0][0]   # no values: every key at auto
 logsec = render("void write_log(", {"enabled": config["log_enabled"], "clear": config["log_clear"]})[0]
-reusesec = render("void write_reuse(", {"every": config["controls"]["reuse_every"], "gate": config["controls"]["reuse_gate"]})[0]
+reusesec = render("void write_reuse(", {"k": config["controls"]})[0]
 inspect = render("void write_inspect(", {"i": struct("InspectConfig")})[0]   # every tool off
 hudfix = render("void write_hudfix(", {"h": struct("HudFixConfig")})[0]   # auto
 hudfix_addon = render("void write_hudfix(", {"h": dict(struct("HudFixConfig"), mode=0)})[0]   # off on the ReShade route

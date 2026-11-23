@@ -259,7 +259,10 @@ void main() {
             const vec3 back = p.rgb - texelFetch(Fine, ivec2(px), 0).rgb;
             imageStore(P, ivec2(px), vec4(back, p.a));
             const vec3 pk = st_h(back);
-            s_iv[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = vec4(st_lab(pk).x, st_h(o) - pk);
+            // visfix/ FeedbackHold (restored = 2 + w x 1000): the history holds this frame's feedback add / w (carried), not o - P
+            vec3 hv = st_h(o) - pk;
+            if (pc.restored >= 2u) hv = texelFetch(Fine, ivec2(px), 0).rgb / (float(pc.restored - 2u) * 0.001);
+            s_iv[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = vec4(st_lab(pk).x, hv);
         }
     }
     if (pc.restored == 0u) return;

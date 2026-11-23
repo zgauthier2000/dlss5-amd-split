@@ -1,3 +1,16 @@
+// CC_SMALL_FP8_EXPERIMENTAL (pipelines-experimental.json): NR_FIXP, the window's probability matrix is one fixed
+// 64x64 e4m3 table a layer ([query][key], 16384 bytes after the bias; written by the host for fixed-attention.txt's
+// pipelines) read as the PV product's B fragments - no QK^T, no softmax, the Q/K projections dead. NR_VOMERGE, with
+// it: the attention is linear, so the V and output projections are one matrix (in the V rows of qkv.bin); the f32
+// context is added to the residual instead of the output projection.
+#ifndef NR_VOMERGE
+#define NR_VOMERGE 0
+#endif
+#if NR_VOMERGE && (NR_HWAVES || NR_CONTEXT_LDS || !defined(NR_FIXP) || NR_HEADS != 1)
+#error "NR_VOMERGE: one-wave one-head C=32 bodies with NR_FIXP only"
+#endif
+// RDNA3 (exp/ port): with NR_OP_KSWAP the loaded P^T fragments get every k pair swapped in the upper lane half, the
+// order the softmax's NR_OPPUT builds and V's odd rows are staged in.
 // The per-item body of fswin_t.comp, moved here unchanged so that the
 // persistent kernels can instantiate it once per live-tile mask (NR_EDGE_BODIES).
 // Everything it declares is local to one instantiation. NR_LIVE (set by the
@@ -687,6 +700,15 @@
     for (int g = 0; g < NR_HEADS; ++g) {
 #endif
         NR_FRAG_B eqg[NR_MF][NR_HGF];
+#ifndef NR_MID_FUSE
+#define NR_MID_FUSE 0
+#endif
+#if NR_MID_FUSE
+        // SPILL PROBE (spill/): the middle product of each expand group right after that group,
+        // so a group's eqg dies before the next group's accumulators are born. Same k order.
+        NR_ACCF nr_mid_acc[NR_DF][NR_MF];
+        for(int n=0;n<NR_DF;++n) for(int m=0;m<NR_MF;++m) nr_mid_acc[n][m]=NR_ACCZERO;
+#endif
 #if NR_HWAVES
 #ifndef NR_EXPAND_GROUP
 #define NR_EXPAND_GROUP 2
@@ -829,6 +851,28 @@
                         for (int m = 0; m < NR_MF; ++m) NR_RND(a[p][m])
             }
 #endif
+#if NR_MID_FUSE
+#if NR_ACTIVATION_LUT || !NR_ACT_F32
+#error "NR_MID_FUSE probe: NR_ACT_F32 path only"
+#endif
+            for (int p = 0; p < NR_EXPAND_GROUP; ++p) {
+                NR_FRAG_B eqt[NR_MF];
+                for (int m = 0; m < NR_MF; ++m) NR_MG(m)
+                    for (int c = 0; c < 8; c += 2) {
+                        const fe4m3vec2 qp = nr_quant_pair32(vec2(
+                            NR_ACTP(a[p][m][c], c), NR_ACTP_B(a[p][m][c + 1], c + 1)));
+                        NR_OPPUT(eqt[m], c, qp)
+                    }
+                for (int n = 0; n < NR_DF; ++n) {
+                    NR_OPA wf;
+                    NR_LOAD_A(wf, NR_WARENA,
+                              NR_TILE(pc.mid_off, uint(g * NR_DF + n) * 16u, uint(h + p) * 16u,
+                                      uint(NR_HG)), 16u);
+                    for (int m = 0; m < NR_MF; ++m) NR_MMA(nr_mid_acc[n][m], wf, eqt[m]);
+                }
+            }
+            if (false)
+#endif
             for (int p = 0; p < NR_EXPAND_GROUP; ++p)
             for (int m = 0; m < NR_MF; ++m) NR_MG(m)
 #if NR_ACTIVATION_LUT
@@ -937,6 +981,7 @@
 #if NR_DF != 2 || NR_ACC_F16 != 0 || NR_F16_MMA
 #error "paired dense weights require the FP32 head-split path"
 #endif
+#if !NR_MID_FUSE
         NR_ACCF nr_mid_acc[NR_DF][NR_MF];
         for(int n=0;n<NR_DF;++n) for(int m=0;m<NR_MF;++m) nr_mid_acc[n][m]=NR_ACCZERO;
         for(int k=0;k<NR_HGF;++k) {
@@ -945,6 +990,7 @@
             for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(nr_mid_acc[0][m],wf0,eqg[m][k]);
             for(int m=0;m<NR_MF;++m) NR_MG(m) NR_MMA(nr_mid_acc[1][m],wf1,eqg[m][k]);
         }
+#endif
 #endif
 #if NR_SWI4
         // the e4m3 middle output fills all of lds_y, the int4 x copy included: every wave must be done
@@ -966,6 +1012,10 @@
             NR_ACCF a[NR_MF];
             for(int m=0;m<NR_MF;++m) a[m]=nr_mid_acc[n][m];
 #else
+#if NR_MID_FUSE
+            NR_ACCF a[NR_MF];
+            for (int m = 0; m < NR_MF; ++m) a[m] = nr_mid_acc[n][m];
+#else
             NR_ACCF a[NR_MF];
             for (int m = 0; m < NR_MF; ++m) a[m] = NR_ACCZERO;
             for (int k = 0; k < NR_HGF; ++k) {
@@ -977,6 +1027,7 @@
                 if (NR_ACC_F16 > 0 && (k + 1) % NR_ACC_F16 == 0)
                     for (int m = 0; m < NR_MF; ++m) NR_RND(a[m])
             }
+#endif
 #endif
             for (int m = 0; m < NR_MF; ++m) NR_MG(m)
 #if NR_QBATCH_ON
@@ -1442,6 +1493,9 @@
         const int hh = nrhw_h;
 #else
     NR_OPB cq[NR_MF][NR_CF];
+#if NR_VOMERGE
+    NR_ACCF nr_ctxf[NR_MF][NR_CF];
+#endif
     for (int hh = 0; hh < NR_HEADS; ++hh) {
 #endif
 #if NR_K_REGS
@@ -2063,7 +2117,9 @@
                 // K wants [token][dim]: store ColumnMajor, the accumulator
                 // being [dim][token]. V wants [dim][token], which is the
                 // accumulator's own orientation - a plain RowMajor store.
-#if !NR_K_REGS
+// tune (NR_FIXP): K is dead in the fixed-attention bodies (no logits read lds_k), so its staging is not compiled;
+// without the store ACO also drops the K projection, its norm and its quantiser (no other reader).
+#if !NR_K_REGS && !(defined(NR_FIXP) && NR_FIXP)
 #if NR_KV_LDS_SWAP
                 // The same store component by component, with the dims of the odd tokens (the
                 // rows the upper lane half reads as the logits' A operand) pair-swapped, so K
@@ -2435,6 +2491,21 @@
 #endif
         }
 #endif
+#if defined(NR_FIXP) && NR_FIXP   // the fixed probabilities replace P
+#if NR_HWAVES
+#error "NR_FIXP: one-wave C=32 bodies only"
+#endif
+        for (int m = 0; m < NR_MF; ++m) for (int j = 0; j < NR_JF; ++j) {
+            NR_LOAD_B(pb[m][j], wgt_e4m3, pc.b_off * 4u + 16384u + (tok0 + uint(m) * 16u) * 64u + uint(j) * 16u, 64u);
+#if NR_OP_KSWAP && !defined(NR_FIXP_NOSWAP_DIAG)   // diagnostic (wrong picture): the plain load alone
+            for (int k = 0; k < 16; k += 2) {
+                const NR_F16 nr_f0 = NR_F16(pb[m][j][k]), nr_f1 = NR_F16(pb[m][j][k + 1]);
+                pb[m][j][k]     = nr_hi ? nr_f1 : nr_f0;
+                pb[m][j][k + 1] = nr_hi ? nr_f0 : nr_f1;
+            }
+#endif
+        }
+#endif
 #if !(NR_HWAVES && NR_EXP_NOHI_HEAD)
         // ctx^T = V^T . P^T; this head's output occupies channel fragments
         // [hh*NR_DF, (hh+1)*NR_DF) of the concatenated C rows.
@@ -2457,6 +2528,9 @@
                 if (NR_ACC_F16 > 0 && (j + 1) % NR_ACC_F16 == 0)
                     for (int m = 0; m < NR_MF; ++m) NR_RND(a[m])
             }
+#if NR_VOMERGE
+            for (int m = 0; m < NR_MF; ++m) nr_ctxf[m][hh * NR_DF + e] = a[m];
+#endif
             for (int m = 0; m < NR_MF; ++m) NR_MGA(m) {
 #if NR_CONTEXT_LDS || NR_HWAVES
                 NR_STAGE_FRAG out_context;
@@ -2697,6 +2771,9 @@
             a[m][c]=nr_round_f16(wgt_f32[pc.ars_off+uint(n)*16u+NR_ROW(c)]*NR_Y(m,n,c));
 #endif
 #endif
+#if NR_VOMERGE
+        for (int m = 0; m < NR_MF; ++m) a[m] = a[m] + nr_ctxf[m][n];
+#else
         for (int k = 0; k < NR_CF; ++k) {
 #if NR_HWAVES
             NR_FRAG_B cqk[NR_MF];
@@ -2719,6 +2796,7 @@
             if (NR_ACC_F16 > 0 && (k + 1) % NR_ACC_F16 == 0)
                 for (int m = 0; m < NR_MF; ++m) NR_RND(a[m])
         }
+#endif
 #endif
         // Again element-wise: `ars` is per accumulator row and `y` has been in
         // registers since stage 2. The block's output leaves ColumnMajor,

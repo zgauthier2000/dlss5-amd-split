@@ -1,5 +1,7 @@
 #include "nr_native_plan.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <array>
 #include <sstream>
 #include <stdexcept>
@@ -15,6 +17,11 @@ struct Shape { uint32_t w, h; }; // host tensor scalars, not raster axes
 struct LayerShape { Shape before, after; };
 struct Walk { std::string text; uint32_t nx{}, ny{}; };
 uint32_t up(uint32_t n, uint32_t alignment) { return (n + alignment - 1) / alignment * alignment; }
+std::atomic<uint64_t> g_pad_like{0};   // the frame extent a scaled network pads like (set_plan_pad_like), 0: none
+bool pad_match_on() {
+    static const bool on = [] { const char* e = std::getenv("NR_PAD_MATCH"); return !(e && e[0] == '0'); }();
+    return on;
+}
 template <size_t N>
 Walk walk(const Record (&records)[N], uint32_t source_width, uint32_t source_height, bool emit) {
     Shape current{source_height, source_width}, previous = current;
@@ -68,7 +75,7 @@ Walk walk(const Record (&records)[N], uint32_t source_width, uint32_t source_hei
 }
 template <size_t N>
 NativePlan plan_for(const Record (&records)[N], const char* fingerprint, uint32_t width, uint32_t height,
-                    bool dll_align) {
+                    bool dll_align, bool match = true) {
     if (!width || !height || width > 16384 || height > 16384) throw std::invalid_argument("invalid source dimensions");
     const auto probe = walk(records, width, height, false);
     if (probe.nx >= 16 || probe.ny >= 16) throw std::logic_error("invalid native reduction count");
@@ -84,9 +91,28 @@ NativePlan plan_for(const Record (&records)[N], const char* fingerprint, uint32_
     result.reductions_x = probe.nx; result.reductions_y = probe.ny;
     result.width = std::max(320u, up(width, ax)); result.height = std::max(320u, up(height, ay));
     if (!(result.height % (ay * 4)) && !(result.width % (ax * 4))) result.width += ax;
+    // scale/ fix (2026-11-22): a network below the frame (NRResolutionScale < 1) pads its working extent so that the last
+    // down step's alignment (up(n, 4) tokens at 1/64) adds as many padded token rows / columns as at the frame's own
+    // extent. The network's global look (its ViT blocks see those padded tokens) follows that count: with a different
+    // count the picture took a lighter / bluish cast (-2 to -9 dB against full size; scale/NOTES.md). Small model only;
+    // the frame's own extent, and any extent whose count already matches, are unchanged. NR_PAD_MATCH=0: off.
+    const uint64_t like = g_pad_like.load(std::memory_order_relaxed);
+    const uint32_t lw = uint32_t(like >> 32), lh = uint32_t(like);
+    if (match && dll_align && like && pad_match_on() && width <= lw && height <= lh && (width != lw || height != lh) &&
+        probe.nx == 6 && probe.ny == 6 && result.width % 64 == 0 && result.height % 64 == 0) {
+        const NativePlan full = plan_for(records, fingerprint, lw, lh, dll_align, false);
+        const auto deep = [](uint32_t v) { return (4u - (v / 64u) % 4u) % 4u; };   // padded tokens at 1/64
+        if (full.reductions_x == 6 && full.reductions_y == 6 && full.width % 64 == 0 && full.height % 64 == 0) {
+            while (deep(result.width) != deep(full.width)) result.width += 64;
+            while (deep(result.height) != deep(full.height)) result.height += 64;
+        }
+    }
     result.text = walk(records, result.width, result.height, true).text;
     result.model = fingerprint;
     return result;
+}
+void set_plan_pad_like(uint32_t frame_width, uint32_t frame_height) {
+    g_pad_like.store((uint64_t(frame_width) << 32) | frame_height, std::memory_order_relaxed);
 }
 NativePlan make_native_plan(uint32_t width, uint32_t height, NetworkModel model) {
     return model == NetworkModel::Small ? plan_for(records_small, model_fingerprint_small, width, height, true)

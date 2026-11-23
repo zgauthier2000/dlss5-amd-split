@@ -30,6 +30,12 @@ void install();
 // Learns which queue a D3D12 swap chain presents on (DXVK's DXGI gives its device only): hooks ExecuteCommandLists of
 // the queue class of `device` (the game's). Once per process; not from DllMain.
 void watch_queues(ID3D12Device* device);
+// eldenring/ (11-23): the queue the game made a D3D12 swap chain with (the .asi's adopt_swapchain). The menu draws on it
+// when the presenting thread executed nothing on a queue of the swap chain's device (ERSS-FG + Streamline in Elden Ring:
+// the menu was never drawn). AddRef'd, kept; a later swap chain's replaces it.
+void hint_present_queue(ID3D12CommandQueue* queue);
+// release/: how many DXGI Presents reached NR Control's hook (0: none, e.g. a Vulkan game)
+uint64_t dxgi_presents();
 // Called on every Present of a D3D12 swap chain the menu sees, before it draws (whether or not it draws): the swap
 // chain, the queue it presents on and its encoding as the menu judges it (0 SDR, 1 an sRGB format, 2 scRGB, 3 HDR10).
 // The .asi's final-picture screenshot runs NR on the back buffer there.

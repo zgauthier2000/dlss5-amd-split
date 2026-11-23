@@ -1,0 +1,41 @@
+#version 460
+// v7 (2026-11-21): CutDrop detector, part 2 of 2: runtime_reuse_cut.comp's sums and decision from the terms part 1 wrote. Each of
+// the 256 invocations adds its points i = tid, tid + 256, ... in that order (16 loads issued, then added in order), the same tree,
+// the same words: the float results are bit for bit runtime_reuse_cut.comp's.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Stat { uint words[]; };
+layout(set = 0, binding = 1) readonly buffer Terms { uvec2 terms[]; };
+layout(push_constant) uniform Push {
+    uint width, height; uint motion_width, motion_height; float scale_x, scale_y; uint frame; float threshold; uint have_previous; float ratio;
+} pc;
+shared float s_sum[256];
+shared float s_n[256];
+void main() {
+    const uint count = pc.width * pc.height;
+    float sum = 0.0, n = 0.0;
+    if (pc.have_previous != 0u) {
+        uint i = gl_LocalInvocationID.x;
+        for (; i + 15u * 256u < count; i += 16u * 256u) {
+            uvec2 q[16];
+            for (uint k = 0u; k < 16u; ++k) q[k] = terms[i + k * 256u];
+            for (uint k = 0u; k < 16u; ++k) if (q[k].y != 0u) { sum += uintBitsToFloat(q[k].x); n += 1.0; }
+        }
+        for (; i < count; i += 256u) { const uvec2 q = terms[i]; if (q.y != 0u) { sum += uintBitsToFloat(q.x); n += 1.0; } }
+    }
+    s_sum[gl_LocalInvocationID.x] = sum; s_n[gl_LocalInvocationID.x] = n;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (gl_LocalInvocationID.x < s) { s_sum[gl_LocalInvocationID.x] += s_sum[gl_LocalInvocationID.x + s]; s_n[gl_LocalInvocationID.x] += s_n[gl_LocalInvocationID.x + s]; }
+        barrier();
+    }
+    if (gl_LocalInvocationID.x == 0u) {
+        const float mean = s_n[0] >= 0.25 * float(count) ? s_sum[0] / s_n[0] : 1.0;
+        words[2] = floatBitsToUint(pc.have_previous != 0u ? mean : 0.0);
+        if (pc.have_previous != 0u) {
+            const float ema = uintBitsToFloat(words[4]);
+            const bool cut = ema > 0.0 && mean > pc.threshold && mean > pc.ratio * ema;
+            if (cut) words[3] = pc.frame + 1u;
+            words[4] = floatBitsToUint(cut ? 0.0 : ema > 0.0 ? 0.8 * ema + 0.2 * min(mean, 2.0 * ema) : mean);
+        } else words[4] = floatBitsToUint(0.0);
+    }
+}

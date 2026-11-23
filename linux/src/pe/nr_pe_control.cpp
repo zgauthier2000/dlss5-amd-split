@@ -17,6 +17,12 @@
 #include <string>
 #include <thread>
 
+// release/: NR Control's DXGI Present count, from the .asi's menu (nr_pe_menu.cpp registers it; other binaries that link
+// this file have no menu and leave it unset)
+namespace { std::atomic<uint64_t (*)()> g_dxgi_presents{nullptr}; }
+namespace nr::pe::control { void set_dxgi_presents_source(uint64_t (*fn)()) { g_dxgi_presents = fn; } }
+static uint64_t dxgi_presents_now() { const auto fn = g_dxgi_presents.load(); return fn ? fn() : 0; }
+
 namespace nr::pe::control {
 namespace {
 
@@ -444,6 +450,11 @@ void report(const Status& st) {
     static bool told = false;
     if (s->menu_seq != seen_seq) told = true;   // it is there
     if (s->dll_menu) told = true;               // the .asi draws NR Control itself (a DXGI swap chain): no layer needed
+    if (!told && now - first > 10000 && dxgi_presents_now() > 0) {   // release/: a DXGI game: no layer is needed
+        told = true;
+        log("[nr] NR Control (End) has not been drawn yet: DXGI Presents reach its hook (%llu so far), but none could be drawn on; "
+            "the NR Control lines above say why", (unsigned long long)dxgi_presents_now());
+    }
     if (!told && now - first > 10000) {
         told = true;
         // the launch line is read on the Linux side: the folder as a Linux path (Wine's own mapping of any drive;

@@ -28,6 +28,14 @@
 
 namespace nr::control_ui {
 
+// (11-22) [Network] ExperimentalInt4 = 1: the experimental model runs its int4 route; shown as "... (INT4)" wherever the
+// menu names the running network. Set from the ini each frame (set_xint4); a label only, the ini keeps the plain name.
+inline bool g_xint4 = false;
+inline void set_xint4(const std::string& v) { g_xint4 = v == "1" || v == "on" || v == "true" || v == "yes"; }
+inline const char* net_label(int n) {
+    return n == nr::kSmallFp8Experimental && g_xint4 ? "CC_SMALL_FP8_EXPERIMENTAL (INT4)" : nr::network_codename(n);
+}
+
 // A text's size, the room left on the line, the cursor on the screen. ReShade's ImGui (the add-on's page) is a function
 // table built by MSVC, which returns an ImVec2 through a hidden pointer, where mingw's g++ expects it in a register
 // (MSVC's rule for a type with a constructor): called directly, those entries crash in ReShade. NR_IMGUI_MSVC_TABLE
@@ -319,7 +327,7 @@ inline void draw_layer_status(const nr::control::Shared* s) {
         ImGui::TableNextColumn();
         ImGui::TextUnformatted(r->state == 0 ? "-" : kWhere[std::min(r->placement, 2u)]);
         ImGui::TableNextColumn();
-        ImGui::TextUnformatted(r->net < nr::control::kNoNet ? nr::network_codename(int(r->net)) : "-");
+        ImGui::TextUnformatted(r->net < nr::control::kNoNet ? net_label(int(r->net)) : "-");
         ImGui::TableNextColumn();
         if (!r->width) ImGui::TextUnformatted("-");
         else if (r->nr_width && (r->nr_width != r->width || r->nr_height != r->height))
@@ -384,7 +392,7 @@ inline std::string osd_cost(float gpu_ms, float network_ms) {
 inline void draw_osd_lines(const nr::control::Shared* s, int mode) {
     if (osd_switching(s)) {   // the build's progress as a bar, its stage written on it
         ImGui::Text(s->net_running < nr::control::kNoNet ? "NR: switching to %s ... %.0f%%" : "NR: building %s ... %.0f%%",
-                    nr::network_codename(int(s->building_net)), double(s->build_progress) * 100.0);
+                    net_label(int(s->building_net)), double(s->build_progress) * 100.0);
         char phase[sizeof s->build_phase + 1] = {};
         std::memcpy(phase, s->build_phase, sizeof s->build_phase);   // (the page may not end it)
         ImGui::ProgressBar(std::clamp(s->build_progress, 0.f, 1.f), ImVec2(ImGui::GetFontSize() * 18.f, 0.f), phase);
@@ -401,22 +409,22 @@ inline void draw_osd_lines(const nr::control::Shared* s, int mode) {
         for (const nr::control::LayerStatus* r : rows) {
             const bool ran = r->state == 1 && now - r->updated < 1500 && r->gpu_ms > 0.f;
             if (mode == 3 && ran) {
-                ImGui::Text("NR layer %u: %s%s", r->number, nr::network_codename(int(r->net)),
+                ImGui::Text("NR layer %u: %s%s", r->number, net_label(int(r->net)),
                             osd_cost(r->gpu_ms, r->network_ms).c_str());
                 total += r->gpu_ms;
                 network += r->network_ms;
                 split = split && r->network_ms > 0.f;
             } else {
-                ImGui::Text("NR layer %u: %s", r->number, nr::network_codename(int(r->net)));
+                ImGui::Text("NR layer %u: %s", r->number, net_label(int(r->net)));
             }
         }
         if (mode == 3 && rows.size() > 1) ImGui::Text("NR in all: %s", osd_cost(total, split ? network : 0.f).c_str() + 2);   // (its two leading spaces)
     } else if (s->net_running >= nr::control::kNoNet) {   // nothing runs (the .asi: no layer on)
         ImGui::TextUnformatted("NR: not running");
     } else if (mode == 3 && s->gpu_ms > 0.f) {
-        ImGui::Text("NR: %s%s", nr::network_codename(int(s->net_running)), osd_cost(s->gpu_ms, s->network_ms).c_str());
+        ImGui::Text("NR: %s%s", net_label(int(s->net_running)), osd_cost(s->gpu_ms, s->network_ms).c_str());
     } else {
-        ImGui::Text("NR: %s", nr::network_codename(int(s->net_running)));
+        ImGui::Text("NR: %s", net_label(int(s->net_running)));
     }
 }
 
@@ -610,11 +618,19 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
     if (!ImGui::CollapsingHeader("Network model and options", ImGuiTreeNodeFlags_DefaultOpen)) return;
     const int file_model = std::max(0, nr::network_choice(ini.get("Network", "Model", "CC_SMALL_FP8")));
     const int shown = s && s->net_known && s->net_want < nr::control::kNoNet ? int(s->net_want) : file_model;
-    if (ImGui::BeginCombo("Network##model", nr::network_codename(shown))) {
+    // (11-22) [Network] ExperimentalInt4 = 1: the experimental model runs its int4 route (int4 ViT / attention matrices, the
+    // rest FP8); its name gets " (INT4)" here so the panel says which form runs.
+    const std::string x4 = ini.get("Network", "ExperimentalInt4", "0");
+    set_xint4(x4); const bool xint4 = g_xint4;
+    auto label = [&](int n) {
+        return n == nr::kSmallFp8Experimental && xint4 ? std::string(nr::network_codename(n)) + " (INT4)"
+                                                       : std::string(nr::network_codename(n));
+    };
+    if (ImGui::BeginCombo("Network##model", label(shown).c_str())) {
         for (int n : nr::kNetworkOrder) {
             const char* why = s && s->net_known ? s->net_why[n] : "";
             const bool ok = !why[0];
-            if (ImGui::Selectable(nr::network_codename(n), n == shown, ok ? 0 : ImGuiSelectableFlags_Disabled))
+            if (ImGui::Selectable(label(n).c_str(), n == shown, ok ? 0 : ImGuiSelectableFlags_Disabled))
                 ini.set("Network", "Model", nr::network_codename(n));
             if (!ok) { ImGui::SameLine(); ImGui::TextDisabled("- %s", why); }
         }
@@ -627,6 +643,10 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
          "the background; the running one serves until it is ready.");
     for (int n : nr::kNetworkOrder)
         if (s && s->net_known && s->net_why[n][0]) ImGui::TextDisabled("%s: %s", nr::network_codename(n), s->net_why[n]);
+    ini_flag(ini, "INT4 (experimental model)", "Network", "ExperimentalInt4", "0",
+             "[Network] ExperimentalInt4. On: CC_SMALL_FP8_EXPERIMENTAL runs its int4 form (the large ViT and attention matrices "
+             "in int4 with our calibration tables, the rest FP8): about 5-7% faster network, a very slightly different picture. "
+             "Needs dlssnr-amd/experimental/int4/. Off: the FP8 form. Takes effect after a restart.");
     ini_hotkey(ini, "Hotkey##net", "Network", "[Network] Hotkey: cycles through the networks that can run. Ctrl, Shift, "
                "Alt and one key, e.g. Ctrl+F11 or Alt+F9; empty: no hotkey.");
     ini_flag(ini, "Sound##net", "Network", "Sound", "1",
@@ -1115,11 +1135,11 @@ struct ChainEditor {
                 }
                 ImGui::TableNextColumn();
                 const int net = row.network.empty() ? -1 : nr::network_choice(row.network);
-                ImGui::SetNextItemWidth(230 * u);
-                if (ImGui::BeginCombo("##network", net < 0 ? "[Network] Model" : nr::network_codename(net))) {
+                ImGui::SetNextItemWidth((g_xint4 ? 300 : 230) * u);
+                if (ImGui::BeginCombo("##network", net < 0 ? "[Network] Model" : net_label(net))) {
                     if (ImGui::Selectable("[Network] Model", net < 0)) { materialize(); ini.set(sec, "Network", ""); }
                     for (int n : nr::kNetworkOrder)
-                        if (ImGui::Selectable(nr::network_codename(n), n == net)) { materialize(); ini.set(sec, "Network", nr::network_codename(n)); }
+                        if (ImGui::Selectable(net_label(n), n == net)) { materialize(); ini.set(sec, "Network", nr::network_codename(n)); }
                     ImGui::EndCombo();
                 }
                 ImGui::TableNextColumn();

@@ -178,10 +178,12 @@ struct Session::Impl {
     bool same_config(const Built& e, VkFormat f) const { return e.format == f && e.net == net_want && e.reuse == reuse_want; }
     // The network a runtime runs (nr::NetworkChoice).
     static int net_of(const Runtime& r) {
+        // the experimental model first: its int4 route (ExperimentalInt4) also reports int4_mixed() (fix 11-22: it was taken for
+        // CC_SILVER_AARDWOLD_INT4_MIXED, so the session marked the experimental model unavailable and fell back to CC_SMALL_FP8)
+        if (r.experimental()) return nr::kSmallFp8Experimental;
 #if NR_INT4
         if (r.int4_mixed()) return nr::kSilverAardwoldInt4;
 #endif
-        if (r.experimental()) return nr::kSmallFp8Experimental;
         return r.network() == NetworkModel::Small ? nr::kSmallFp8 : nr::kSilverAardwold;
     }
     RuntimeConfig make_config(uint32_t w, uint32_t h, VkFormat f) const;
@@ -208,6 +210,28 @@ struct Session::Impl {
                std::chrono::steady_clock::now() - last_resize < kDrsActive;
     }
     void prefetch();
+    // (upstream 050b8e5, 0.0.8.2) prefetch() goes on this long after the last resize, not only kDrsActive: a game that
+    // resizes in short bursts (an aim's zoom: a few frames, then seconds at one size) gave it one or two plans a burst,
+    // the whole range never. Plans are CPU work and host memory only (no device memory), one at a time, within the
+    // sizes the game has used.
+    static constexpr std::chrono::seconds kDrsPrefetch{30};
+    bool drs_recent() const {
+        return last_resize != std::chrono::steady_clock::time_point{} &&
+               std::chrono::steady_clock::now() - last_resize < kDrsPrefetch;
+    }
+    // Frame sizes that passed through while the one build slot was busy with something else (another size's plan, a
+    // prefetch): planned next, the newest first, before prefetch() guesses. One entry per working extent and format.
+    struct Demand { uint32_t w{}, h{}, ww{}, wh{}; VkFormat format{}; int net{}; };
+    std::vector<Demand> demanded;
+    static constexpr size_t kMaxDemanded = 16;
+    uint64_t demand_planned{};
+    void note_demand(uint32_t w, uint32_t h, VkFormat f);
+    bool plan_demanded();
+    // The biggest frame each feature has asked for: prefetch() plans nothing bigger (or bigger than the game's guides),
+    // a plan above the game's render size is never used and takes the slot from one that is.
+    std::map<uint64_t, std::pair<uint32_t, uint32_t>> feature_max;
+    // Why frames passed through since the last 10 s line (the status of each), for that line.
+    std::map<std::string, uint64_t> pass_why;
     // A whole network while the size moves gets this much room by area (1.25 linear): the plans of a sweep up to that
     // run in it instead of each asking for a bigger network.
     static constexpr double kDrsCapacity = 1.5625;
@@ -419,6 +443,7 @@ struct Session::Impl {
     uint32_t stage_slot{};
     uint32_t stage_slot_passes[kStageSlots]{};
     uint64_t stage_recorded{};
+    uint64_t fb_cut_seen{};   // burn/: CutFeedback
     // The averages by NR-chain layer (Session::set_call_layer; 0 outside a chain): every layer's runs apart, and whether
     // its last run was timed here (else the runtime's own timing is its cost)
     struct StageAverage {
@@ -1785,9 +1810,37 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
                 frames > 0 ? 100.0 * double(n.skipped) / frames : 0.0, (unsigned long long)n.gated,
                 n.motion_samples ? n.motion_sum / double(n.motion_samples) : 0.0, double(n.motion_peak),
                 double(controls.reuse_gate));
+            // plugin2: Split / Phase, and the runtime's own GPU timestamps around its whole recording per evaluate (network
+            // part, warp, copies) and around the network dispatches in it. NOT the evaluate line's "network" figure: that is
+            // a running average (10 % per frame) of the network-dispatch time per evaluate counting 0 on frames that skip it.
+            const bool split = controls.reuse_split && controls.reuse_every <= 8;
+            char extra[256] = "no split";
+            if (split)
+                std::snprintf(extra, sizeof extra, "%d parts (cuts %s), %llu cycles (%.2f frames per cycle start), part 1 one frame "
+                              "after its input %llu of %llu, frames without a part %llu, cycles dropped %llu, whole-network frames %llu",
+                              n.parts, n.cuts.c_str(), (unsigned long long)n.cycles,
+                              n.starts ? double(n.frames) / double(n.starts) : 0.0, (unsigned long long)n.lag1,
+                              (unsigned long long)(n.lag0 + n.lag1), (unsigned long long)n.waits, (unsigned long long)n.dropped,
+                              (unsigned long long)n.whole);
+            log("[nr] reuse %s, Phase %d (%s): %llu frames, %llu of them Lite lossy skip frames (jitter x < 0; jitter read on %llu), "
+                "%llu frames without one in the last 2 (Phase acts as 0 there); %llu network / cycle input frames, %llu of them "
+                "on Lite skip frames; %s; NR GPU per frame (runtime timestamps, %llu frames) mean %.2f, "
+                "min %.2f, max %.2f ms; network dispatches mean %.2f ms on %llu frames with network work",
+                split ? "split" : "whole network", controls.reuse_phase,
+                controls.reuse_phase == 1 ? "Lite skip frames" : controls.reuse_phase == 2 ? "Lite run frames" : "none",
+                (unsigned long long)n.frames, (unsigned long long)n.lite_skip_frames, (unsigned long long)n.jitter_frames,
+                (unsigned long long)n.fallback_frames, (unsigned long long)n.net_runs, (unsigned long long)n.net_runs_lite_skip, extra,
+                (unsigned long long)n.timed, n.timed ? n.gpu_sum / double(n.timed) : 0.0, double(n.gpu_min), double(n.gpu_max),
+                n.net_timed ? n.net_sum / double(n.net_timed) : 0.0, (unsigned long long)n.net_timed);
         }
     }
     ++(ok ? ran : passed);
+    if (!ok) ++pass_why[status.empty() ? std::string("no reason recorded") : status];
+    {
+        auto& m = feature_max[current_feature];
+        m.first = std::max(m.first, w); m.second = std::max(m.second, h);
+        if (feature_max.size() > 64) feature_max.erase(feature_max.begin());   // the oldest features (ids only grow)
+    }
     last_ok = ok;
     last_w = w; last_h = h; last_format = format;
     if (ok && runtime) {
@@ -1797,17 +1850,26 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
         if (last != runtime) { feature_prev_runtime[current_feature] = last; last = runtime; }
     }
     heap_poll();
-    if (!building && drs_active()) prefetch();
+    if (!building && !plan_demanded() && drs_recent()) prefetch();
     {
         const auto now = std::chrono::steady_clock::now();
         if (pass_logged == std::chrono::steady_clock::time_point{}) pass_logged = now;
         if (now - pass_logged >= kPassLog) {
             // every 10 s with NR asked for: a log that shows NR running as well as not (the OptiScaler route has no
             // frame line of its own)
-            if (passed || ran)
-                log("[nr] last %.0f s: %llu evaluations ran the network, %llu passed the frame through (%s)",
+            if (passed || ran) {
+                // (ran = the network was ready for the evaluation; the passes by their reasons, most frequent first)
+                std::vector<std::pair<uint64_t, const std::string*>> why;
+                for (const auto& [text, n] : pass_why) why.push_back({n, &text});
+                std::sort(why.begin(), why.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                std::string reasons;
+                for (size_t i = 0; i < why.size() && i < 4; ++i)
+                    reasons += (i ? "; " : "; passed: ") + std::to_string(why[i].first) + " x " + *why[i].second;
+                log("[nr] last %.0f s: %llu evaluations ran the network, %llu passed the frame through (%s)%s",
                     std::chrono::duration<double>(now - pass_logged).count(), (unsigned long long)ran,
-                    (unsigned long long)passed, ok ? "running now" : status.c_str());
+                    (unsigned long long)passed, ok ? "running now" : status.c_str(), reasons.c_str());
+            }
+            pass_why.clear();
             ran_total += ran; passed_total += passed; ran = passed = 0;
             pass_logged = now;
         }
@@ -1828,6 +1890,32 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     if (controls.reuse_every >= 2 && !reuse_want) {
         reuse_want = true;
         log("[nr] ReuseEvery %d asked for: networks are rebuilt able to reuse the network's edit (once)", controls.reuse_every);
+        log("[nr] [Reuse] Split %d, Phase %d, EdgeDrop %d (feather %.1f px), Disocclusion %d (threshold %.3f) (plugin3 build)",
+            controls.reuse_split ? 1 : 0, controls.reuse_phase, controls.reuse_edge_drop, double(controls.reuse_edge_feather),
+            controls.reuse_disocc ? 1 : 0, double(controls.reuse_disocc_threshold));
+        log("[nr] [Reuse] GateRun %d, CutDrop %.1f, CutChange %.3f (plugin4 build)", controls.reuse_gate_run ? 1 : 0,
+            double(controls.reuse_cut_drop), double(controls.reuse_cut_change));
+        log("[nr] [Reuse] Snap %d (radius %u, eps %g, mix %.2f), Box %d, NearMV %d (plugin5 build)", controls.reuse_snap,
+            controls.reuse_snap_radius, double(controls.reuse_snap_eps), double(controls.reuse_snap_mix), controls.reuse_box, controls.reuse_nearmv);
+        if (controls.reuse_relit)   // armfix/
+            log("[nr] [Reuse] Relit %d (K0 %.3f, K1 %.3f) (armfix build)", controls.reuse_relit, double(controls.reuse_relit_k0), double(controls.reuse_relit_k1));
+        if (controls.reuse_hist_gate || controls.reuse_blend > 0.0f)   // campfire/
+            log("[nr] [Reuse] HistoryGate %d, Blend %.3f (K0 %.3f, K1 %.3f) (campfire build; Split only)", controls.reuse_hist_gate, double(controls.reuse_blend),
+                double(controls.reuse_blend_k0), double(controls.reuse_blend_k1));
+        if (controls.reuse_disocc_motion)   // rim/
+            log("[nr] [Reuse] DisoccMotion %d (rim build)", controls.reuse_disocc_motion);
+        if (controls.reuse_fill_rim)   // rim/
+            log("[nr] [Reuse] DisoccFillRim %d (rim build)", controls.reuse_fill_rim);
+        if (controls.reuse_guard > 0.0f)   // guard/
+            log("[nr] [Reuse] Guard %.2f (GuardAlpha %.3f, GuardFloor %.2f) (guard build; with Blend only)", double(controls.reuse_guard),
+                double(controls.reuse_guard_alpha), double(controls.reuse_guard_floor));
+        if (controls.reuse_disocc_fill || controls.reuse_cut_feedback)
+            log("[nr] [Reuse] DisoccFill %d (radius %.1f px), CutFeedback %d (burn build)", controls.reuse_disocc_fill,
+                double(controls.reuse_disocc_fill_radius), controls.reuse_cut_feedback ? 1 : 0);
+        if (controls.reuse_moved)
+            log("[nr] [Reuse] Moved %d (dark only %d, relative %d, radius %.1f px, colour %.3f..%.3f, depth %.3f..%.3f) (burn build)",
+                controls.reuse_moved & 3, (controls.reuse_moved >> 2) & 1, (controls.reuse_moved >> 3) & 1, double(controls.reuse_moved_radius),
+                double(controls.reuse_moved_k0), double(controls.reuse_moved_k1), double(controls.reuse_moved_d0), double(controls.reuse_moved_d1));
     }
     // Adopt a finished background build first.
     {
@@ -1947,6 +2035,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                            this->format == format;
     if (building) {
         if (net_only) { touch_running(); return true; }
+        note_demand(w, h, format);   // planned once the slot is free, before any guess (plan_demanded)
         status = "building the network in the background; frames pass through until it is ready";
         return false;
     }
@@ -2281,6 +2370,41 @@ bool Session::Impl::start_plan(uint32_t w, uint32_t h, VkFormat f) {
     return true;
 }
 
+void Session::Impl::note_demand(uint32_t w, uint32_t h, VkFormat f) {
+    const Built* net = nullptr;
+    for (const auto& e : cache)
+        if (same_config(e, f) && !e.runtime->stale()) { net = &e; break; }
+    if (!net) return;   // no resident network yet: the network's own build is what the frames wait for
+    const NetworkModel model = net->runtime->network();
+    if (plan_for(w, h, f, model)) return;   // planned: what is missing is memory, not a plan
+    uint32_t ww = 0, wh = 0;
+    working_extent(model, 1.0f, w, h, &ww, &wh);
+    for (auto i = demanded.begin(); i != demanded.end(); ++i)
+        if (i->ww == ww && i->wh == wh && i->format == f && i->net == net_want) { demanded.erase(i); break; }
+    if (demanded.size() >= kMaxDemanded) demanded.erase(demanded.begin());
+    demanded.push_back(Demand{w, h, ww, wh, f, net_want});   // the newest last
+}
+
+// The slot is free: the newest frame size that passed through for want of its plan, planned now. False: none left.
+bool Session::Impl::plan_demanded() {
+    while (!demanded.empty()) {
+        const Demand d = demanded.back();
+        demanded.pop_back();
+        if (d.net != net_want) continue;
+        bool served = false;   // a resident network of this working extent runs it already (Runtime::share_for)
+        for (const auto& e : cache)
+            if (same_config(e, d.format) && !e.runtime->stale() && e.runtime->share_for(d.w, d.h)) { served = true; break; }
+        if (served) continue;
+        if (start_plan(d.w, d.h, d.format)) {
+            if (++demand_planned <= 8 || demand_planned % 50 == 0)
+                log("[nr] planning %ux%u (working extent %ux%u), a size frames passed through at while another was "
+                    "being built; %zu more waiting", d.w, d.h, d.ww, d.wh, demanded.size());
+            return true;
+        }
+    }
+    return false;
+}
+
 void Session::Impl::prefetch() {
     if (prefetched_around == std::make_pair(last_w, last_h)) return;
     const Built* net = nullptr;
@@ -2308,7 +2432,13 @@ void Session::Impl::prefetch() {
     build_net = net_want;
     build_started = std::chrono::steady_clock::now();
     const std::pair<uint32_t, uint32_t> around{last_w, last_h};
-    build_thread = std::thread([this, host, config, temporal, model, covered, around]() mutable {
+    // No bigger than the biggest frame this feature asked for, or the game's guides when they are bigger (allocated at
+    // its biggest render size): a plan above the game's render size is never run.
+    uint64_t limit_px = 0;
+    if (const auto m = feature_max.find(current_feature); m != feature_max.end())
+        limit_px = uint64_t(m->second.first) * m->second.second;
+    limit_px = std::max({limit_px, size_hint_px, uint64_t(last_w) * last_h});
+    build_thread = std::thread([this, host, config, temporal, model, covered, around, limit_px]() mutable {
         const auto t0 = std::chrono::steady_clock::now();
         std::unique_ptr<Runtime> made;
         std::string error;
@@ -2321,6 +2451,7 @@ void Session::Impl::prefetch() {
                     const int64_t hh = int64_t(around.second) + sign * int64_t(step);
                     const uint32_t ch = uint32_t(hh), cw = uint32_t(std::lround(double(hh) * aspect));
                     if (hh < 64 || cw < 64) continue;
+                    if (uint64_t(cw) * ch > limit_px) continue;
                     uint32_t ww = 0, wh = 0;
                     working_extent(model, scale, cw, ch, &ww, &wh);
                     if (std::find(covered.begin(), covered.end(), std::make_pair(ww, wh)) != covered.end()) continue;
@@ -3623,6 +3754,10 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stage_timing, base);
     }
     try {
+        if (c.reuse_cut_feedback && runtime) {   // burn/ CutFeedback: a cut since the last frame drops the Feedback history
+            const uint64_t cuts = runtime->reuse_cut_count();
+            if (cuts != fb_cut_seen) { fb_cut_seen = cuts; stage.drop_feedback(); }
+        }
         stage.record(cmd, sf, network);
         renodx_facts = stage.facts();
         renodx_facts_known = true;
