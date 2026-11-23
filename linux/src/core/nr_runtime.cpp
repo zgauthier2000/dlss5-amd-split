@@ -4171,7 +4171,12 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         impl_->reuse_have = true;
         impl_->reuse_since = 0;
         keep_edit_depth(sp.slot[sk_slot].frame, sp.dep[sk_slot], sp.slot[sk_slot].dep_ok);
-        if (tt.pingpong) tt.hcur ^= 1u;
+        // the split run's post wrote hwrite (the pair is the same on every part: the slot moves only here); with
+        // upstream 0.0.9's history rotation the feature's slot follows it (was: hcur ^= 1, the fixed pair)
+        if (tt.pingpong) {
+            tt.hcur = tt.hwrite;
+            if (fs && impl_->rotation()) fs->slot = int(tt.hwrite);
+        }
         for (int r = 0; r < sp.ring_n; ++r) {
             xcopy(sp.ring[r], kG, tt.flow[0], kG);
             const bool first = impl_->reuse_since == 0;
