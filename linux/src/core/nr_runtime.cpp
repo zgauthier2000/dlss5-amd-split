@@ -3185,6 +3185,14 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     auto& sp = impl_->split;
     const bool split_on = reuse_frame && engine && c.reuse_split && c.reuse_every >= 2 && c.reuse_every <= 8 && !impl_->split.off;
     bool sk_zero = false;   // a cycle dropped after some of its parts ran: the arena's tile counters are behind (zero them)
+    // Ours (merge/): Split left with a cycle in flight - Split or reuse switched off, Every 1 (NR Control's live switches): the cycle
+    // is dropped as any other, its parts' tile counters zeroed (sk_zero) before this frame's network. (Was: left as it was - every
+    // later wait timed out, ~245 ms a frame, until Split came back.)
+    if (!split_on && (sp.active || sp.pending >= 0)) {
+        if (sp.active && sp.j > 0) sk_zero = true;
+        ++sp.dropped;
+        sp.active = false; sp.pending = -1; sp.ring_n = 0; sp.n = 0;
+    }
     static const bool split_trace = std::getenv("NR_SPLIT_TRACE") != nullptr;
     static const bool no_cpu_gate = std::getenv("NR_REUSE_NO_CPU_GATE") != nullptr;   // tests: as split3's no_cpu_gate
     bool lite_skip = false, aligned = false; int phase = 0; float jx = 0, jy = 0; bool jit = false;
@@ -3219,10 +3227,19 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             reuse_skip = impl_->reuse_have && !temporal->reset && !run_now;
         }
         if (split_on) {
-            if (sp.n != N) { sp.n = N; sp.active = false; sp.pending = -1; sp.ring_n = 0; }
+            // [Reuse] Every changed (ours, merge/: NR Control's live switch): a cycle in flight is dropped as any other - its parts
+            // that ran left the arena's tile counters behind (sk_zero), and this frame runs the whole network. (Was: the
+            // schedule alone reset - every later wait timed out, ~200 ms a frame, for good: Elden Ring 11-23.)
+            bool n_changed = false;
+            if (sp.n != N) {
+                n_changed = sp.n != 0;
+                if (sp.active && sp.j > 0) sk_zero = true;
+                if (n_changed && (sp.active || sp.pending >= 0)) ++sp.dropped;
+                sp.n = N; sp.active = false; sp.pending = -1; sp.ring_n = 0;
+            }
             const std::vector<uint32_t> cuts = split_cuts(N);
             sp.last_parts = N;
-            bool drop = !impl_->reuse_have || temporal->reset || cuts.size() != size_t(N - 1);
+            bool drop = !impl_->reuse_have || temporal->reset || cuts.size() != size_t(N - 1) || n_changed;
             if (serial && sp.last_serial && serial != sp.last_serial + 1) drop = true;   // a frame this runtime did not see
             if (serial) sp.last_serial = serial;
             {
