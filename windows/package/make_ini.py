@@ -2,7 +2,7 @@
 """Default dlssnr-amd.ini files for the installer, written with the exact text and the default values the code has:
 the format strings are read out of src/pe/nr_pe_config.cpp and every value out of the structs' member defaults
 (nr_pe_config.hpp, core/nr_runtime.hpp, core/nr_renodx.hpp), so neither can drift from what the programs write.
-<out>/dlssnr-amd-optiscaler.ini ([Network], [Preprocess], [RenoDX], [wilsjo2] and [Log], what the OptiScaler route
+<out>/dlssnr-amd-optiscaler.ini ([Network], [Preprocess], [RenoDX], [wilsjo2], [Log] and [Reuse], what the OptiScaler route
 reads), <out>/dlssnr-amd-optiscaler-renodx.ini (the same with [RenoDX] Enabled = 1) and <out>/dlssnr-amd-addon.ini (the
 ReShade add-on's whole file). [Network] Model is the default network; install.ps1 writes the one chosen at install.
 usage: make_ini.py <nr_pe_config.cpp> <out dir>"""
@@ -175,6 +175,7 @@ preprocess = render("void write_preprocess(", {"p": config["preprocess"], "v": c
 w2 = formats(body_of("void write_wilsjo2("))[0][0]   # no values: every key at auto
 logsec = render("void write_log(", {"enabled": config["log_enabled"], "clear": config["log_clear"]})[0]
 nrcontrol = formats(body_of("void write_nrcontrol("))[0][0]   # no values: MenuKey = End
+reusesec = render("void write_reuse(", {"k": config["controls"]})[0]
 inspect = render("void write_inspect(", {"i": struct("InspectConfig")})[0]   # every tool off
 hudfix = render("void write_hudfix(", {"h": struct("HudFixConfig")})[0]   # off (the struct's default)
 hudfix_addon = render("void write_hudfix(", {"h": dict(struct("HudFixConfig"), mode=0)})[0]   # off on the ReShade route
@@ -200,11 +201,11 @@ def renodx_section(enabled, fast_method=0, present_guides=0):
 
 
 (out / "dlssnr-amd-optiscaler.ini").write_text(network + preprocess + renodx_section(False) + w2 + inspect + hudfix +
-                                                nrcontrol + d3d12 + gpu + logsec, encoding="utf-8")
+                                                nrcontrol + d3d12 + gpu + logsec + reusesec, encoding="utf-8")
 (out / "dlssnr-amd-optiscaler-renodx.ini").write_text(network + preprocess + renodx_section(True) + w2 + inspect + hudfix +
-                                                      nrcontrol + d3d12 + gpu + logsec, encoding="utf-8")
+                                                      nrcontrol + d3d12 + gpu + logsec + reusesec, encoding="utf-8")
 (out / "dlssnr-amd-standalone.ini").write_text(network + preprocess + renodx_section(True, 1, 2) + w2 + inspect + hudfix +
-                                               nrcontrol + d3d12 + gpu + logsec, encoding="utf-8")
-(out / "dlssnr-amd-addon.ini").write_text(dlssnr + own + "\n" + network + preprocess + renodx_section(False, kAddonFastMethod) + inspect + hudfix_addon + gpu + logsec,
+                                               nrcontrol + d3d12 + gpu + logsec + reusesec, encoding="utf-8")
+(out / "dlssnr-amd-addon.ini").write_text(dlssnr + own + "\n" + network + preprocess + renodx_section(False, kAddonFastMethod) + inspect + hudfix_addon + gpu + logsec + reusesec,
                                           encoding="utf-8")
 print("wrote", out / "dlssnr-amd-optiscaler.ini", out / "dlssnr-amd-optiscaler-renodx.ini", out / "dlssnr-amd-standalone.ini", out / "dlssnr-amd-addon.ini")

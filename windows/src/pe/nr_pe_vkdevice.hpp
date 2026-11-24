@@ -13,6 +13,7 @@
 // The queue matters and is not a detail: building the network uploads its
 // weights, which is a submit. Without a queue the Vulkan paths can record
 // nothing at all.
+#include <vector>   // (ours: clang/libc++ does not pull it in transitively)
 #include <string>
 #include "nr_pe_interop.hpp"
 
