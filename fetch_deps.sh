@@ -143,6 +143,15 @@ mkdir -p artifacts/ref/optiscaler-nightly-20261030
 get artifacts/ref/optiscaler-nightly-20261030/LICENSE \
     https://raw.githubusercontent.com/optiscaler/OptiScaler/e7e3872d410f704479d94d318d68d163b6b58947/LICENSE \
     3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
+# Ours: the nightly our package ships and our games run (nightly-20261118, OptiScaler 2df7ad9f), and its licence (the same
+# GPL-3.0 text as above, from its source tree at that commit).
+get artifacts/ref/downloads/OptiScaler_v10.0.0-pre1_20261118_2df7ad9f.7z \
+    https://github.com/optiscaler/OptiScaler-nightly/releases/download/nightly-20261118/OptiScaler_v10.0.0-pre1_20261118_2df7ad9f.7z \
+    2f202abf0da4ebac5b43b3d5571073261c2e1ece34d97d5d5b67242782f12817
+mkdir -p artifacts/ref/optiscaler-nightly-20261118
+get artifacts/ref/optiscaler-nightly-20261118/LICENSE \
+    https://raw.githubusercontent.com/optiscaler/OptiScaler/2df7ad9f/LICENSE \
+    3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 # Inter 4.1 (SIL Open Font License 1.1), NR Control's font on the Linux OptiScaler route (embedded in dlssnr-amd.asi).
 get artifacts/ref/downloads/Inter-4.1.zip https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip \
     9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e

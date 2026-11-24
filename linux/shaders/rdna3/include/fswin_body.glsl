@@ -6,8 +6,8 @@
 #ifndef NR_VOMERGE
 #define NR_VOMERGE 0
 #endif
-#if NR_VOMERGE && (NR_HWAVES || NR_CONTEXT_LDS || !defined(NR_FIXP) || NR_HEADS != 1)
-#error "NR_VOMERGE: one-wave one-head C=32 bodies with NR_FIXP only"
+#if NR_VOMERGE && (NR_HWAVES || NR_CONTEXT_LDS || NR_HEADS != 1)
+#error "NR_VOMERGE: one-wave one-head C=32 bodies only (the optimized networks also use it without NR_FIXP)"
 #endif
 // RDNA3 (exp/ port): with NR_OP_KSWAP the loaded P^T fragments get every k pair swapped in the upper lane half, the
 // order the softmax's NR_OPPUT builds and V's odd rows are staged in.

@@ -696,7 +696,9 @@ struct Stage::Impl {
             // fbfast/ (11-22): the one-dispatch guided filter, used only when its file is in the shader folder (an older folder: the
             // two st_box passes as before) and NR_FB_GF2 is not 0.
             const char* e = std::getenv("NR_FB_GF2");
-            if (!(e && e[0] == '0') && std::ifstream(cfg.shaders + "/renodx_st_gf2.spv", std::ios::binary)) {
+            FILE* gf2 = e && e[0] == '0' ? nullptr : nr::u8::fopen(cfg.shaders + "/renodx_st_gf2.spv", "rb");
+            if (gf2) {
+                std::fclose(gf2);
                 load(programs[kStGf2], "st_gf2", 20); st_gf2 = true;
             }
         }

@@ -44,6 +44,17 @@ for f in accumulation.txt swin-bias-storage.txt coherent-act.txt shader-constant
     cp -- "$NR_PRODUCT_SPV-experimental/$f" "$xs/"
 done
 cp -- "$NR_PRODUCT_SPV-experimental"/temporal/* "$xs/temporal/"
+# Ours: CC_SMALL_FP8_EXPERIMENTAL's FP16-activation set ([Network] FP16Activations: experimental/shaders-x2) and its int4 route
+# ([Network] ExperimentalInt4: experimental/int4/shaders + shaders-x2 + settings.txt). The route's tables (experimental/int4/vit:
+# per-matrix corrections and calibration means made from the small model, no weight values) only from NR_XINT4_TABLES=<vit dir>;
+# without them the experimental model runs FP8 (the log says why).
+for v in "--experimental --x2:experimental/shaders-x2" "--expint4:experimental/int4/shaders" "--expint4 --x2:experimental/int4/shaders-x2"; do
+    flags=${v%%:*}; to="$dst/${v#*:}"; tmp="$NR_PRODUCT_SPV-ours"; rm -rf -- "$tmp"
+    python3 linux/build/build_network.py "$NR_GPU_ARCH" $flags --out "$tmp" > /dev/null
+    mkdir -p -- "$to"; cp -r -- "$tmp"/. "$to/"; rm -rf -- "$tmp"
+done
+cp -- linux/data/int4/rdna3-experimental/settings.txt "$dst/experimental/int4/settings.txt"
+if [[ -n "${NR_XINT4_TABLES:-}" ]]; then cp -r -- "$NR_XINT4_TABLES" "$dst/experimental/int4/vit"; fi
 os="$dst/optimized/shaders"; mkdir -p -- "$os/temporal"
 python3 linux/build/build_network.py "$NR_GPU_ARCH" --optimized --out "$NR_PRODUCT_SPV-optimized" > /dev/null
 cp -- "$NR_PRODUCT_SPV-optimized"/g_*.spv "$os/"

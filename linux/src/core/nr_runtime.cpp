@@ -1691,7 +1691,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     if (experimental) {
         std::string xe; if (const char* e = std::getenv("DLSSNR_EXP_INT4")) xe = e;
         if (xe.empty()) {
-            FILE* f = std::fopen((data.parent_path() / "dlssnr-amd.ini").string().c_str(), "r");
+            FILE* f = nr::u8::fopen(nr::u8::text(data.parent_path() / "dlssnr-amd.ini"), "r");
             if (f) {
                 char line[512]; std::string sec;
                 while (std::fgets(line, sizeof line, f)) {
@@ -1757,7 +1757,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     if (experimental) {
         std::string fe; if (const char* e = std::getenv("DLSSNR_FP16_ACT")) fe = e;
         if (fe.empty()) {
-            FILE* f = std::fopen((data.parent_path() / "dlssnr-amd.ini").string().c_str(), "r");
+            FILE* f = nr::u8::fopen(nr::u8::text(data.parent_path() / "dlssnr-amd.ini"), "r");
             if (f) {
                 char line[512]; std::string sec;
                 while (std::fgets(line, sizeof line, f)) {
