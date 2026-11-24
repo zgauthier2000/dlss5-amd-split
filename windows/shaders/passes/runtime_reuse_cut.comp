@@ -1,0 +1,73 @@
+#version 460
+// plugin4 (2026-11-21): the cut detector of [Reuse] CutDrop. One workgroup walks a coarse grid (every 2nd texel of the motion
+// field: 1/8 of the frame each way): the luma of what the network is shown this frame against the previous frame's (kept in
+// `previous` on the same grid), looked up where this frame's motion says the point was. On a continuous view with valid vectors the
+// mean change is small; after a cut (a new scene, its vectors zeroed or not belonging to the old picture) it is large. Points whose
+// source lies outside the frame are left out. Word 2 = the mean change (float), word 3 = 1 + the reuse frame of the last cut (uint),
+// set when the mean passes `threshold` AND `ratio` x the running mean of the earlier frames (word 4: a scene that changes a lot
+// all the time, a fast pan with many revealed edges, raises its own bar; a cut is a spike against it); the warp drops every edit made from an input older than that frame.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Stat { uint words[]; };
+layout(set = 0, binding = 1) uniform sampler2D shown;
+layout(set = 0, binding = 2, rg32f) uniform readonly image2D motion;
+layout(set = 0, binding = 3, r32f) uniform readonly image2D previous;
+layout(set = 0, binding = 4, r32f) uniform writeonly image2D current;
+layout(push_constant) uniform Push {
+    uint width, height;       // the grid (previous / current)
+    uint motion_width, motion_height;
+    float scale_x, scale_y;   // engine units -> uv
+    uint frame;               // this reuse frame
+    float threshold;          // mean luma change that marks a cut
+    uint have_previous;       // 0: no previous grid yet (nothing is marked)
+    float ratio;              // and the mean must be this many times the running mean of the frames before (word 4)
+} pc;
+shared float s_sum[256];
+shared float s_n[256];
+
+float luma_at(vec2 uv) { return dot(texture(shown, uv).rgb, vec3(1.0 / 3.0)); }
+
+float previous_at(vec2 uv) {
+    const vec2 q = uv * vec2(pc.width, pc.height) - 0.5;
+    const vec2 f0 = floor(q), f = q - f0;
+    const ivec2 i = ivec2(f0), hi = ivec2(pc.width, pc.height) - 1;
+    const float a = imageLoad(previous, clamp(i, ivec2(0), hi)).r, b = imageLoad(previous, clamp(i + ivec2(1, 0), ivec2(0), hi)).r;
+    const float c = imageLoad(previous, clamp(i + ivec2(0, 1), ivec2(0), hi)).r, d = imageLoad(previous, clamp(i + ivec2(1, 1), ivec2(0), hi)).r;
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+void main() {
+    const uint count = pc.width * pc.height;
+    const vec2 size = vec2(pc.width, pc.height);
+    float sum = 0.0, n = 0.0;
+    for (uint i = gl_LocalInvocationID.x; i < count; i += 256u) {
+        const ivec2 p = ivec2(i % pc.width, i / pc.width);
+        const vec2 uv = (vec2(p) + 0.5) / size;
+        const float l = luma_at(uv);
+        if (pc.have_previous != 0u) {
+            const ivec2 mp = clamp(ivec2(uv * vec2(pc.motion_width, pc.motion_height)), ivec2(0), ivec2(pc.motion_width, pc.motion_height) - 1);
+            const vec2 src = uv + imageLoad(motion, mp).xy * vec2(pc.scale_x, pc.scale_y);
+            if (all(greaterThanEqual(src, vec2(0.0))) && all(lessThanEqual(src, vec2(1.0))) && !isnan(src.x) && !isnan(src.y)) {
+                sum += abs(l - previous_at(src)); n += 1.0;
+            }
+        }
+        imageStore(current, p, vec4(l));
+    }
+    s_sum[gl_LocalInvocationID.x] = sum; s_n[gl_LocalInvocationID.x] = n;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (gl_LocalInvocationID.x < s) { s_sum[gl_LocalInvocationID.x] += s_sum[gl_LocalInvocationID.x + s]; s_n[gl_LocalInvocationID.x] += s_n[gl_LocalInvocationID.x + s]; }
+        barrier();
+    }
+    if (gl_LocalInvocationID.x == 0u) {
+        // too few points with a source inside the frame (the vectors point everywhere off-screen): count as a cut too
+        const float mean = s_n[0] >= 0.25 * float(count) ? s_sum[0] / s_n[0] : 1.0;
+        words[2] = floatBitsToUint(pc.have_previous != 0u ? mean : 0.0);
+        if (pc.have_previous != 0u) {
+            const float ema = uintBitsToFloat(words[4]);
+            const bool cut = ema > 0.0 && mean > pc.threshold && mean > pc.ratio * ema;
+            if (cut) words[3] = pc.frame + 1u;
+            // the running mean (a spike counted at most twice it); after a cut it starts again from the new scene's next frame
+            words[4] = floatBitsToUint(cut ? 0.0 : ema > 0.0 ? 0.8 * ema + 0.2 * min(mean, 2.0 * ema) : mean);
+        } else words[4] = floatBitsToUint(0.0);
+    }
+}

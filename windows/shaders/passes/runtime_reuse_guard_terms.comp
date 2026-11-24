@@ -1,0 +1,51 @@
+#version 460
+// guard/ (2026-11-23) [Reuse] Guard, part 1 of 2: one 16x16 workgroup per block of the frame. Per pixel the picture with the fresh edit
+// (the network's answer) and with the previous stored edit carried in (as runtime_reuse_store_ema.comp reads it: motion from the cycle's
+// input frame back to the previous one, depth keep > 0.5), both as sqrt(L/(1+L)); the block's mean difference and a valid flag go to
+// terms[block]. Part 2 (guard_sum) averages |block mean| over valid blocks: how much the whole look moved between two network runs
+// (fine detail cancels inside a block; the "background flattens for a frame" flip of the SOTTR benchmark moves it ~3.7x the median).
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) buffer Stat { uint words[]; };
+layout(set = 0, binding = 1) buffer Terms { uvec2 terms[]; };
+layout(set = 0, binding = 2) uniform sampler2D shown;
+layout(set = 0, binding = 3, rgba32f) uniform readonly image2D answer;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D edit;          // not written here (same layout as store_guard)
+layout(set = 0, binding = 5, rgba16f) uniform readonly image2D old_edit;
+layout(set = 0, binding = 6, rg32f) uniform readonly image2D motion;
+layout(set = 0, binding = 7) uniform sampler2D depth_now;
+layout(set = 0, binding = 8, r32f) uniform readonly image2D depth_old;
+layout(set = 0, binding = 9) uniform sampler2D old_src;
+layout(push_constant) uniform Push { uint width, height, motion_width, motion_height, depth_width, depth_height, inverted; float disocc; uint blocks_x; } pc;
+vec2 mload(ivec2 p) { return imageLoad(motion, clamp(p, ivec2(0), ivec2(pc.motion_width, pc.motion_height) - 1)).xy; }
+vec3 oload(ivec2 p) { return imageLoad(old_edit, clamp(p, ivec2(0), ivec2(pc.width, pc.height) - 1)).rgb; }
+float dist_of(float d) { return pc.inverted != 0u ? 1.0 / max(d, 1.0e-8) : 1.0 / max(1.0 - d, 1.0e-8); }
+float tm(vec3 c) { const float y = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0); return sqrt(y / (1.0 + y)); }
+shared float s_d[256]; shared float s_n[256];
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy); const uint t = gl_LocalInvocationIndex;
+    float d = 0.0, n = 0.0;
+    if (p.x < int(pc.width) && p.y < int(pc.height)) {
+        const vec2 size = vec2(pc.width, pc.height), uv = (vec2(p) + 0.5) / size;
+        const vec2 mq = uv * vec2(pc.motion_width, pc.motion_height) - 0.5, mf0 = floor(mq), mf = mq - mf0; const ivec2 mi = ivec2(mf0);
+        const vec2 m = mix(mix(mload(mi), mload(mi + ivec2(1, 0)), mf.x), mix(mload(mi + ivec2(0, 1)), mload(mi + ivec2(1, 1)), mf.x), mf.y);
+        const vec2 src = uv + m;
+        if (all(lessThan(abs(m), vec2(8.0))) && all(greaterThanEqual(src, vec2(0.0))) && all(lessThanEqual(src, vec2(1.0)))) {
+            const vec2 ds = vec2(pc.depth_width, pc.depth_height);
+            const float zn = dist_of(texelFetch(depth_now, clamp(ivec2(uv * ds), ivec2(0), ivec2(ds) - 1), 0).r);
+            const float zo = dist_of(imageLoad(depth_old, clamp(ivec2(src * ds), ivec2(0), ivec2(ds) - 1)).r);
+            const float keep = clamp(2.0 - abs(log(zo / zn)) / pc.disocc, 0.0, 1.0);
+            if (keep > 0.5) {
+                const vec2 q = src * size - 0.5, f0 = floor(q), f = q - f0; const ivec2 i = ivec2(f0);
+                const vec3 old = mix(mix(oload(i), oload(i + ivec2(1, 0)), f.x), mix(oload(i + ivec2(0, 1)), oload(i + ivec2(1, 1)), f.x), f.y);
+                const vec3 sh = texelFetch(shown, p, 0).rgb;
+                d = tm(imageLoad(answer, p).rgb) - tm(sh + old); n = 1.0;
+            }
+        }
+    }
+    s_d[t] = d; s_n[t] = n; barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) { if (t < s) { s_d[t] += s_d[t + s]; s_n[t] += s_n[t + s]; } barrier(); }
+    if (t == 0u) {
+        const uint b = gl_WorkGroupID.y * pc.blocks_x + gl_WorkGroupID.x;
+        terms[b] = s_n[0] >= 128.0 ? uvec2(floatBitsToUint(s_d[0] / s_n[0]), 1u) : uvec2(0u, 0u);
+    }
+}

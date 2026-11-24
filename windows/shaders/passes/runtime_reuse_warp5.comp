@@ -1,0 +1,351 @@
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+// plugin5 (2026-11-21): runtime_reuse_warp4.comp + three options for the carried edit's look under Split (plugin5/NOTES.md), in
+// flags5; flags5 0 = warp4's arithmetic (but the host runs warp4 itself then).
+//  Box (bits 0-1): 1 = this frame's colour + the carried edit outside this frame's 3x3 colour box (by k0..k1, max over channels):
+//    the edit fades out; 2 = the edit frame's own input colour at the source (bilinear) outside this frame's 3x3 box (FSR 2's
+//    history box as a test, as upstream's Interleaved il0.comp flags 128): the content the edit was made on is not here.
+//  NearMV (bits 2-3): which accumulated motion the pixel takes: 1 = the 3x3 coarse motion texels' nearest by this frame's depth (FSR 2's
+//    vector dilation, upstream il0 flags 256); 2 = the 2x2 bilinear texels weighted by how well their depth matches this pixel's
+//    (exp(-(ln z_t/z_p)^2 / 2 s^2); joint bilateral), bilinear where none matches.
+//  Snap (bit 4): the carried edit goes into `carry` (not the answer): the guided-filter passes (runtime_reuse_snap_*.comp) re-project it
+//    onto this frame's structure and write the answer.
+// plugin4: runtime_reuse_warp3.comp + CutDrop (flags bit 3, edit_from1); own file name so v3 keeps its warp3.
+// plugin3 (2026-11-21): runtime_reuse_warp.comp + EdgeDrop's feather + Disocclusion. Flags 0: the original's arithmetic.
+//  EdgeDrop (flags bit 0): the accumulator's sentinel (runtime_reuse_motion3.comp) already lands outside the frame (no edit); the
+//    edit also fades out over `feather` pixels towards the edit frame's border, so the edge of the carried edit is not a seam.
+//  Fill (bit 2, EdgeDrop = 2): a source outside the edit's frame reads the edit at the nearest point inside it (clamped), so the
+//    strip a pan reveals keeps the network's look (with no edit it shows the plain picture: brighter where the network darkens).
+//  Disocclusion (bit 1): this frame's depth at the pixel against the edit frame's depth at the pixel's source (nearest), both as
+//    view distance (1/d for an inverted depth, 1/(1-d) otherwise): past a relative difference of `disocc` the edit fades out, to
+//    nothing at twice it. A pixel whose content the edit frame did not see there (revealed behind a moving character, or a
+//    character edge whose blurred quarter-resolution motion points onto the background) gets this frame's plain picture.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) buffer Stat { float mean_pixels[]; };     // word 1: the accumulated motion's mean length
+layout(set = 0, binding = 1) uniform sampler2D shown;
+#if defined(NR_ANSWER16)   // v7: the answer straight into the caller's RGBA16F frame (no RGBA32F answer + converting blit)
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D answer;
+#else
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D answer;
+#endif
+#if defined(NR_ANSWER16) && NR_ANSWER16 == 2
+// round to the nearest half, ties to even (the blit's conversion, if it rounds that way); the store then converts an exact value
+float nr_rtne16(float x) {
+    const uint u = floatBitsToUint(x), sg = u & 0x80000000u, a = u & 0x7fffffffu;
+    if (a >= 0x7f800000u) return x;
+    if (a >= 0x477ff000u) return uintBitsToFloat(sg | 0x7f800000u);
+    if (a >= 0x38800000u) return uintBitsToFloat(sg | ((a + 0xfffu + ((a >> 13u) & 1u)) & ~0x1fffu));
+    return roundEven(x * 16777216.0) * (1.0 / 16777216.0);
+}
+#define NR_A16(v) vec4(nr_rtne16((v).x), nr_rtne16((v).y), nr_rtne16((v).z), nr_rtne16((v).w))
+#else
+#define NR_A16(v) (v)
+#endif
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D edit;
+layout(set = 0, binding = 4, rg32f) uniform readonly image2D motion;   // accumulated, uv units
+layout(set = 0, binding = 5) uniform sampler2D depth_now;              // this frame's depth (R32F, texelFetch)
+layout(set = 0, binding = 6, r32f) uniform readonly image2D depth_edit; // the edit frame's depth
+layout(set = 0, binding = 7) uniform sampler2D edit_src;               // plugin5: the edit frame's input colour (Box 2)
+layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D carry;  // plugin5: the carried edit (Snap)
+// burn/ (2026-11-21) Moved: 4x4 cell means of sqrt(L/(1+L)) of the edit frame's input and of this frame's (runtime_reuse_moved_prep.comp)
+layout(set = 0, binding = 9, r32f) uniform readonly image2D moved_cap;
+layout(set = 0, binding = 10, r32f) uniform readonly image2D moved_now;
+layout(push_constant) uniform Push {
+    uint width, height;          // the model's extent: `shown`, `answer`, `edit`
+    uint motion_width, motion_height;
+    uint round_u8;
+    float limit;                 // pixels the picture may have moved for the whole edit to be trusted; 0: no fade
+    uint flags;                  // bit 0 EdgeDrop, bit 1 Disocclusion, bit 2 Fill, bit 3 CutDrop (plugin4)
+    float feather;               // EdgeDrop: pixels of fade towards the edit frame's border (0: none)
+    float disocc;                // Disocclusion: relative view-distance difference where the fade starts
+    uint inverted;               // the depth is inverted (1 near, 0 far)
+    uint depth_width, depth_height;
+    uint edit_from1;             // plugin4 (flags bit 3, CutDrop): 1 + the reuse frame the stored edit's input belongs to
+    uint flags5;                 // plugin5: bits 0-1 Box mode, 2-3 NearMV mode, 4 Snap
+    float box_k0, box_k1;        // Box: the fade from k0 to k1 outside the box (values of the shown frame)
+    float near_sigma;            // NearMV 2: the depth match's width (ln of the view-distance ratio)
+    // burn/ Moved (0 = off, this file's v7 arithmetic): bit 0 colour test, bit 1 depth test, bit 2 darkening only, bit 3 colour test on
+    // the structure (each offset's difference to the centre's, so a uniform brightness change does not count)
+    uint moved;
+    float mk0, mk1;              // colour: the fade from mk0 to mk1 of the largest cell-mean difference (sqrt(L/(1+L)) units)
+    float mrad;                  // pixels: the test's ring radius (a second ring at half of it)
+    float md0, md1;              // depth: the fade from md0 to md1 of (nearer-neighbour fraction then) - (now)
+    uint cw, ch;                 // the cell images' size
+    // burn/ Fill (moved bit 4): where Disocclusion fades the edit, the faded part is replaced by the mean edit of the edit frame's
+    // points around the source (rings at fill_r/4, /2, x1, x2; 8 directions) whose depth THEN matches this pixel's depth NOW (the
+    // background beside the object that stood there), instead of none (the plain picture: darker where the network brightens)
+    float fill_r;
+    float rl0, rl1;              // armfix/ Relit (moved bit 12): the fade from rl0 to rl1 of the cell-mean change (sqrt(L/(1+L)) units)
+} pc;
+
+float cap_cell(vec2 x) {   // bilinear on the cell centres, x in pixels
+    const vec2 q = x * 0.25 - 0.5, f0 = floor(q), f = q - f0; const ivec2 i = ivec2(f0), hi = ivec2(pc.cw, pc.ch) - 1;
+    return mix(mix(imageLoad(moved_cap, clamp(i, ivec2(0), hi)).r, imageLoad(moved_cap, clamp(i + ivec2(1, 0), ivec2(0), hi)).r, f.x),
+               mix(imageLoad(moved_cap, clamp(i + ivec2(0, 1), ivec2(0), hi)).r, imageLoad(moved_cap, clamp(i + ivec2(1, 1), ivec2(0), hi)).r, f.x), f.y);
+}
+float now_cell(vec2 x) {
+    const vec2 q = x * 0.25 - 0.5, f0 = floor(q), f = q - f0; const ivec2 i = ivec2(f0), hi = ivec2(pc.cw, pc.ch) - 1;
+    return mix(mix(imageLoad(moved_now, clamp(i, ivec2(0), hi)).r, imageLoad(moved_now, clamp(i + ivec2(1, 0), ivec2(0), hi)).r, f.x),
+               mix(imageLoad(moved_now, clamp(i + ivec2(0, 1), ivec2(0), hi)).r, imageLoad(moved_now, clamp(i + ivec2(1, 1), ivec2(0), hi)).r, f.x), f.y);
+}
+vec2 ring_dir(int k) { const float a = float(k) * 0.78539816; return vec2(cos(a), sin(a)); }   // (no const array: glslang copies it per access)
+
+vec3 edit_clamped(ivec2 p) {
+    return imageLoad(edit, clamp(p, ivec2(0), ivec2(pc.width, pc.height) - 1)).rgb;
+}
+
+vec2 motion_clamped(ivec2 p) {
+    return imageLoad(motion, clamp(p, ivec2(0), ivec2(pc.motion_width, pc.motion_height) - 1)).xy;
+}
+
+vec2 acc_bil(vec2 u) {   // armfix/: the accumulated motion at uv, bilinear on its texel centres
+    const vec2 q = u * vec2(pc.motion_width, pc.motion_height) - 0.5; const vec2 f0 = floor(q), f = q - f0; const ivec2 i = ivec2(f0);
+    return mix(mix(motion_clamped(i), motion_clamped(i + ivec2(1, 0)), f.x), mix(motion_clamped(i + ivec2(0, 1)), motion_clamped(i + ivec2(1, 1)), f.x), f.y);
+}
+
+float distance_of(float d) {
+    return pc.inverted != 0u ? 1.0 / max(d, 1.0e-8) : 1.0 / max(1.0 - d, 1.0e-8);
+}
+
+float dist_texel(ivec2 t) {   // this frame's view distance at a motion texel's centre
+    const vec2 ds = vec2(pc.depth_width, pc.depth_height);
+    const ivec2 d = clamp(ivec2((vec2(t) + 0.5) * ds / vec2(pc.motion_width, pc.motion_height)), ivec2(0), ivec2(ds) - 1);
+    return distance_of(texelFetch(depth_now, d, 0).r);
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.width) || p.y >= int(pc.height)) return;
+    const vec2 size = vec2(pc.width, pc.height);
+    const vec2 uv = (vec2(p) + 0.5) / size;
+
+    // the accumulated motion, bilinear on its (coarser) texel centres
+    const vec2 mq = uv * vec2(pc.motion_width, pc.motion_height) - 0.5;
+    const vec2 mf0 = floor(mq), mf = mq - mf0;
+    const ivec2 mi = ivec2(mf0);
+    vec2 m = mix(mix(motion_clamped(mi), motion_clamped(mi + ivec2(1, 0)), mf.x),
+                 mix(motion_clamped(mi + ivec2(0, 1)), motion_clamped(mi + ivec2(1, 1)), mf.x), mf.y);
+    const uint near_mode = (pc.flags5 >> 2) & 3u;
+    if (near_mode == 1u) {
+        const ivec2 msz = ivec2(pc.motion_width, pc.motion_height);
+        const ivec2 t0 = clamp(ivec2(uv * vec2(msz)), ivec2(0), msz - 1);
+        ivec2 best = t0; float bz = dist_texel(t0);
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x) {
+                const ivec2 c = clamp(t0 + ivec2(x, y), ivec2(0), msz - 1);
+                const float z = dist_texel(c);
+                if (z < bz) { bz = z; best = c; }
+            }
+        m = imageLoad(motion, best).xy;
+    } else if (near_mode == 2u) {
+        const vec2 ds = vec2(pc.depth_width, pc.depth_height);
+        const float zp = distance_of(texelFetch(depth_now, clamp(ivec2(uv * ds), ivec2(0), ivec2(ds) - 1), 0).r);
+        const float k = 1.0 / (2.0 * pc.near_sigma * pc.near_sigma);
+        vec2 acc = vec2(0.0); float wsum = 0.0;
+        for (int y = 0; y <= 1; ++y)
+            for (int x = 0; x <= 1; ++x) {
+                const ivec2 c = mi + ivec2(x, y);
+                const ivec2 cc = clamp(c, ivec2(0), ivec2(pc.motion_width, pc.motion_height) - 1);
+                const float wb = (x == 1 ? mf.x : 1.0 - mf.x) * (y == 1 ? mf.y : 1.0 - mf.y);
+                const float l = log(dist_texel(cc) / zp);
+                const float w = wb * exp(-l * l * k);
+                acc += w * imageLoad(motion, cc).xy; wsum += w;
+            }
+        if (wsum > 1.0e-4) m = acc / wsum;
+    }
+
+    vec2 source = uv + m;
+    bool filled = false;   // Fill: the source was outside and is now its nearest inside point (no depth test there: other content)
+    if ((pc.flags & 4u) != 0u && all(lessThan(abs(m), vec2(8.0)))) {
+        const vec2 c = clamp(source, vec2(0.0), vec2(1.0));
+        filled = any(notEqual(c, source));
+        source = c;
+    }
+    vec3 e = vec3(0.0);
+    if (all(greaterThanEqual(source, vec2(0.0))) && all(lessThanEqual(source, vec2(1.0)))) {
+        const vec2 q = source * size - 0.5;
+        const vec2 f0 = floor(q), f = q - f0;
+        const ivec2 i = ivec2(f0);
+        e = mix(mix(edit_clamped(i), edit_clamped(i + ivec2(1, 0)), f.x),
+                mix(edit_clamped(i + ivec2(0, 1)), edit_clamped(i + ivec2(1, 1)), f.x), f.y);
+        if ((pc.flags & 1u) != 0u && pc.feather > 0.0) {
+            const vec2 sp = source * size;
+            const float border = min(min(sp.x, size.x - sp.x), min(sp.y, size.y - sp.y));
+            e *= clamp(border / pc.feather, 0.0, 1.0);
+        }
+        if ((pc.flags & 2u) != 0u && !filled) {
+            const vec2 ds = vec2(pc.depth_width, pc.depth_height);
+            const ivec2 dn = clamp(ivec2(uv * ds), ivec2(0), ivec2(ds) - 1);
+            const ivec2 de = clamp(ivec2(source * ds), ivec2(0), ivec2(ds) - 1);
+            const float zn = distance_of(texelFetch(depth_now, dn, 0).r);
+            const float ze = distance_of(imageLoad(depth_edit, de).r);
+            const float r = abs(log(ze / zn));
+            // rim/ (2026-11-23) DisoccMotion (moved bit 21): the threshold grows with how far this pixel's content moved since the edit
+            // (x (1 + moved px / 16)): a surface that moves fast also changes depth (SOTTR: the ponytail's swing, ln 0.26-0.35 in 3-6
+            // frames, its whole edit dropped), while background revealed behind a moving object hardly moves itself (strict test kept).
+            const float dth = (pc.moved & 2097152u) != 0u ? pc.disocc * (1.0 + length(m * size) / 16.0) : pc.disocc;
+            const float keep = clamp(2.0 - r / dth, 0.0, 1.0);
+            vec3 fill = vec3(0.0);
+            if ((pc.moved & 16u) != 0u && keep < 1.0) {
+                const vec2 sp = source * size, sc = ds / size;
+                vec3 acc = vec3(0.0); float n = 0.0;
+                const float zlo = zn * exp(-pc.disocc), zhi = zn * exp(pc.disocc);   // |ln(zq / zn)| < disocc, without a log per sample
+                // visfix/ (DisoccFill 4, moved bit 7): each matching sample weighted by how well the edit frame's input colour there matches
+                // this frame's colour at the pixel (luma in sqrt(L/(1+L)) units, gaussian of width md0): the edit of the same kind of surface,
+                // not of a lighter / darker neighbour (the network's rim around the object that stood there)
+                const bool cw = (pc.moved & 128u) != 0u;
+                float lnow = 0.0;
+                if (cw) { const vec3 cn = max(texelFetch(shown, p, 0).rgb, vec3(0.0)); const float y = dot(cn, vec3(0.2126, 0.7152, 0.0722)); lnow = sqrt(y / (1.0 + y)); }
+                const float ik = 1.0 / max(2.0 * pc.md0 * pc.md0, 1.0e-8);
+                vec3 fbacc = vec3(0.0); float fbn = 0.0;   // rim/ DisoccFillRim: samples off the occluder's layer (used only if none on this pixel's)
+                vec3 racc = vec3(0.0); float rn = 0.0;   // visfix/ (DisoccFill 5, moved bit 8): the outermost ring with a match only
+                [[dont_unroll]] for (int ring = 0; ring < 4; ++ring) {
+                    // rings at fill_r x 1/4, 1/2, 1, 2; DisoccFill 3 (moved bit 6): x 1, 2, 3, 4 (away from the object's own rim)
+                    const float rr = (pc.moved & 64u) != 0u ? pc.fill_r * float(ring + 1)
+                                                             : pc.fill_r * (ring == 0 ? 0.25 : ring == 1 ? 0.5 : ring == 2 ? 1.0 : 2.0);
+#if !defined(NR_FILL_DIRS)
+#define NR_FILL_DIRS 4   // burn/ default (16 samples: a third of 8 directions' cost, same picture within noise; NOTES.md)
+#endif
+                    [[dont_unroll]] for (int k = 0; k < NR_FILL_DIRS; ++k) {
+                        // 4 directions: each ring turned by 22.5 degrees from the one inside it
+                        const vec2 q = sp + rr * (NR_FILL_DIRS == 8 ? ring_dir(k) : ring_dir(2 * k + 0) * mat2(cos(0.3927 * float(ring)), sin(0.3927 * float(ring)), -sin(0.3927 * float(ring)), cos(0.3927 * float(ring))));
+                        if (any(lessThan(q, vec2(0.0))) || any(greaterThanEqual(q, size))) continue;
+                        const float zq = distance_of(imageLoad(depth_edit, clamp(ivec2(q * sc), ivec2(0), ivec2(ds) - 1)).r);
+                        // rim/ (2026-11-23) DisoccFillRim (moved bit 19): samples on any layer but the occluder's (the edit frame's depth at the
+                        // source, ze), for a hole none of whose samples is on this pixel's layer: the ground that was hidden behind the object
+                        // (SOTTR: the ponytail's swing) got no edit there, a darker patch the shape of where the object was beside a lit strip
+                        // and only those past the occluder's layer on the side this pixel is on now (revealed ground: other ground; a moved strand of
+                        // hair: other hair, not the ground behind it)
+                        if ((pc.moved & 524288u) != 0u && !(zq > zlo && zq < zhi) && log(zq / ze) * sign(log(zn / ze)) > pc.disocc) {
+                            // with DisoccFill 4 weighted by colour match as its own samples (another layer is lit otherwise: SOTTR campfire, the wall
+                            // behind her face)
+                            float w = 1.0;
+                            if (cw) { const vec3 cq = max(texelFetch(edit_src, clamp(ivec2(q), ivec2(0), ivec2(pc.width, pc.height) - 1), 0).rgb, vec3(0.0));
+                                      const float y = dot(cq, vec3(0.2126, 0.7152, 0.0722)); const float d = sqrt(y / (1.0 + y)) - lnow; w = exp(-d * d * ik) + 1.0e-3; }
+                            fbacc += w * edit_clamped(ivec2(q)); fbn += w;
+                        }
+                        if (zq > zlo && zq < zhi) {
+                            float w = 1.0;
+                            if (cw) { const vec3 cq = max(texelFetch(edit_src, clamp(ivec2(q), ivec2(0), ivec2(pc.width, pc.height) - 1), 0).rgb, vec3(0.0));
+                                      const float y = dot(cq, vec3(0.2126, 0.7152, 0.0722)); const float d = sqrt(y / (1.0 + y)) - lnow; w = exp(-d * d * ik) + 1.0e-3; }
+                            const vec3 eq = edit_clamped(ivec2(q));
+                            acc += w * eq; n += w;
+                            if ((pc.moved & 256u) != 0u) { racc += eq; rn += 1.0; }
+                        }
+                    }
+                    if ((pc.moved & 32u) != 0u && n > 0.0) break;   // DisoccFill 2: the innermost ring with a match only
+                    if ((pc.moved & 256u) != 0u && rn > 0.0) { acc = racc; n = rn; }   // DisoccFill 5: keep the latest (outer) ring that matched
+                    racc = vec3(0.0); rn = 0.0;
+                }
+                if (n > 0.0) fill = acc / n;
+                else if (fbn > 0.0) fill = fbacc / fbn;   // rim/
+                if ((pc.moved & 512u) != 0u) fill *= pc.mk0;   // visfix/ DisoccFillMix < 1: part of the fill only (between the hole's plain picture and the full fill)
+            }
+            e = e * keep + fill * (1.0 - keep);
+        }
+    }
+    // Past the limit the edit fades out, linearly to nothing at twice the limit: a global measure of how far
+    // the warp can be believed, which is what the host's gate predicts and this frame's own motion confirms.
+    if (pc.limit > 0.0) e *= clamp(2.0 - mean_pixels[1] / pc.limit, 0.0, 1.0);
+    // plugin4 CutDrop: a cut (runtime_reuse_cut.comp, word 3) after the stored edit's input frame: the edit belongs to another scene
+    if ((pc.flags & 8u) != 0u && floatBitsToUint(mean_pixels[3]) > pc.edit_from1) e = vec3(0.0);
+    // armfix/ (2026-11-22) AgeFade (moved bit 10): the carried edit x the host's factor for its age (in mk1: free without Moved's tests)
+    if ((pc.moved & 1024u) != 0u) e *= pc.mk1;
+    // armfix/ MotionEdge (moved bit 11; mrad = radius px, md1 = threshold px): the accumulated motion here against that mrad px away in 4
+    // directions: content that moved against its neighbourhood since the edit's frame (a limb's edge beside the body) - the edit made
+    // for that neighbourhood then does not fit it now. Fades the edit out from md1 to 2 md1 px of difference.
+    if ((pc.moved & 2048u) != 0u && all(lessThan(abs(m), vec2(8.0)))) {
+        float g = 0.0;
+        for (int k = 0; k < 4; ++k) {
+            const vec2 v = acc_bil(uv + pc.mrad * ring_dir(2 * k) / size);
+            if (all(lessThan(abs(v), vec2(8.0)))) g = max(g, length((v - m) * size));
+        }
+        e *= 1.0 - smoothstep(pc.md1, 2.0 * pc.md1, g);
+    }
+    // armfix/ Relit (moved bit 12): this frame's input around the pixel (4x4 cell means, moved_now) against the edit frame's input around
+    // the pixel's source (moved_cap): the surface is lit differently now (light moving over a limb), so the edit the network made for the
+    // old shading does not fit. Bit 13: either direction (else only where it is lighter now); bit 14: only the edit's darkening fades.
+    if ((pc.moved & 4096u) != 0u && all(greaterThanEqual(source, vec2(0.0))) && all(lessThanEqual(source, vec2(1.0)))) {
+        float fn = 0.0, fc = 0.0;
+        if ((pc.moved & 262144u) == 0u) { fn = now_cell(vec2(p) + 0.5); fc = cap_cell(source * size); }
+        if ((pc.moved & 131072u) != 0u) {   // bit 17: per pixel (bit 18: per pixel only, no cells)
+            const vec2 q = source * size - 0.5; const vec2 f0 = floor(q), f = q - f0; const ivec2 i = ivec2(f0), hi2 = ivec2(pc.width, pc.height) - 1;
+            const vec3 cc = mix(mix(texelFetch(edit_src, clamp(i, ivec2(0), hi2), 0).rgb, texelFetch(edit_src, clamp(i + ivec2(1, 0), ivec2(0), hi2), 0).rgb, f.x),
+                                mix(texelFetch(edit_src, clamp(i + ivec2(0, 1), ivec2(0), hi2), 0).rgb, texelFetch(edit_src, clamp(i + ivec2(1, 1), ivec2(0), hi2), 0).rgb, f.x), f.y);
+            const float yn = max(dot(texelFetch(shown, p, 0).rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0), yc = max(dot(cc, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+            const float pn = sqrt(yn / (1.0 + yn)), pcap = sqrt(yc / (1.0 + yc));
+            if ((pc.moved & 262144u) != 0u || abs(pn - pcap) > abs(fn - fc)) { fn = pn; fc = pcap; }
+        }
+        float d = fn - fc;
+        if ((pc.moved & 32768u) != 0u) d = -d;   // bit 15: where it is darker now
+        float keep = 1.0 - smoothstep(pc.rl0, pc.rl1, (pc.moved & 8192u) != 0u ? abs(d) : d);
+        if ((pc.moved & 65536u) != 0u) {   // bit 16, gain: the edit follows the light, x (L_now / L_then)^rl0, at most rl1 (f = sqrt(L / (1 + L)))
+            const float a = min(fn * fn, 0.999), b = min(fc * fc, 0.999);
+            keep = min(pow(max(a / (1.0 - a), 1.0e-6) / max(b / (1.0 - b), 1.0e-6), pc.rl0), pc.rl1);
+        }
+        if ((pc.moved & 16384u) != 0u) e = max(e, vec3(0.0)) + min(e, vec3(0.0)) * keep;
+        else e *= keep;
+    }
+    // burn/ Moved: what was around this pixel's source in the edit frame is not what is around it now (an object left or arrived:
+    // the network's dark rim / contact shadow on the background around where the object WAS rides along with the background)
+#if defined(NR_MOVED)   // research only (burn/NOTES.md: it made the burn worse); the shipped file is built without it
+    if ((pc.moved & 3u) != 0u && all(greaterThanEqual(source, vec2(0.0))) && all(lessThanEqual(source, vec2(1.0)))) {
+        const vec2 sp = source * size, pp = vec2(p) + 0.5;
+        float fade = 1.0;
+        if ((pc.moved & 1u) != 0u) {
+            const float c0 = cap_cell(sp), n0 = now_cell(pp);
+            const bool rel = (pc.moved & 8u) != 0u;
+            float dm = rel ? 0.0 : abs(c0 - n0);
+            for (int k = 0; k < 16; ++k) {
+                const float r = k < 8 ? pc.mrad : 0.5 * pc.mrad;
+                const vec2 o = r * (k < 8 ? ring_dir(k) : vec2(ring_dir(k - 8).x * 0.9239 - ring_dir(k - 8).y * 0.3827, ring_dir(k - 8).x * 0.3827 + ring_dir(k - 8).y * 0.9239));
+                const float dc = cap_cell(sp + o) - (rel ? c0 : 0.0), dn = now_cell(pp + o) - (rel ? n0 : 0.0);
+                dm = max(dm, abs(dc - dn));
+            }
+            fade = min(fade, 1.0 - smoothstep(pc.mk0, pc.mk1, dm));
+        }
+        if ((pc.moved & 2u) != 0u && (pc.flags & 2u) != 0u) {
+            const vec2 ds = vec2(pc.depth_width, pc.depth_height), sc = ds / size;
+            const ivec2 hi = ivec2(ds) - 1;
+            const float zc = distance_of(imageLoad(depth_edit, clamp(ivec2(sp * sc), ivec2(0), hi)).r);
+            const float zn = distance_of(texelFetch(depth_now, clamp(ivec2(pp * sc), ivec2(0), hi), 0).r);
+            float nt = 0.0, nn = 0.0;   // the largest fraction by which a ring point is nearer than the centre: then, now
+            for (int k = 0; k < 16; ++k) {
+                const float r = k < 8 ? pc.mrad : 0.5 * pc.mrad;
+                const vec2 o = r * (k < 8 ? ring_dir(k) : vec2(ring_dir(k - 8).x * 0.9239 - ring_dir(k - 8).y * 0.3827, ring_dir(k - 8).x * 0.3827 + ring_dir(k - 8).y * 0.9239));
+                const float a = distance_of(imageLoad(depth_edit, clamp(ivec2((sp + o) * sc), ivec2(0), hi)).r);
+                const float b = distance_of(texelFetch(depth_now, clamp(ivec2((pp + o) * sc), ivec2(0), hi), 0).r);
+                nt = max(nt, 1.0 - a / zc); nn = max(nn, 1.0 - b / zn);
+            }
+            fade = min(fade, 1.0 - smoothstep(pc.md0, pc.md1, nt - nn));
+        }
+        if ((pc.moved & 4u) != 0u) e = max(e, vec3(0.0)) + min(e, vec3(0.0)) * fade;
+        else e *= fade;
+    }
+#endif
+    const vec4 s = texelFetch(shown, p, 0);
+    const uint box_mode = pc.flags5 & 3u;
+    if (box_mode != 0u) {
+        vec3 lo = vec3(1.0e9), hi = vec3(-1.0e9);
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x) {
+                const vec3 c = texelFetch(shown, clamp(p + ivec2(x, y), ivec2(0), ivec2(pc.width, pc.height) - 1), 0).rgb;
+                lo = min(lo, c); hi = max(hi, c);
+            }
+        vec3 v;
+        if (box_mode == 1u) v = s.rgb + e;
+        else {
+            const vec2 q = clamp(source, vec2(0.0), vec2(1.0)) * size - 0.5;
+            const vec2 f0 = floor(q), f = q - f0;
+            const ivec2 i = ivec2(f0), hi2 = ivec2(pc.width, pc.height) - 1;
+            v = mix(mix(texelFetch(edit_src, clamp(i, ivec2(0), hi2), 0).rgb, texelFetch(edit_src, clamp(i + ivec2(1, 0), ivec2(0), hi2), 0).rgb, f.x),
+                    mix(texelFetch(edit_src, clamp(i + ivec2(0, 1), ivec2(0), hi2), 0).rgb, texelFetch(edit_src, clamp(i + ivec2(1, 1), ivec2(0), hi2), 0).rgb, f.x), f.y);
+        }
+        const vec3 out3 = max(v - hi, lo - v);
+        e *= 1.0 - smoothstep(pc.box_k0, pc.box_k1, max(out3.r, max(out3.g, out3.b)));
+    }
+    if ((pc.flags5 & 16u) != 0u) { imageStore(carry, p, vec4(e, 0.0)); return; }
+    vec3 o = s.rgb + e;
+    if (pc.round_u8 != 0u) o = round(clamp(o, 0.0, 1.0) * 255.0) / 255.0;
+    imageStore(answer, p, NR_A16(vec4(o, s.a)));
+}

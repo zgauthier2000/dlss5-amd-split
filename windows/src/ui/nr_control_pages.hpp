@@ -38,7 +38,14 @@ inline const char* const kNetworkNames[] = {NR_N("CC_SMALL_FP8"), NR_N("CC_SMALL
     NR_N("CC_SILVER_AARDWOLD"), NR_N("CC_SILVER_AARDWOLD_OPTIMIZED"), NR_N("CC_SILVER_AARDWOLD_OPTIMIZED (layers: quality)"),
     NR_N("CC_SILVER_AARDWOLD_OPTIMIZED (layers: balanced)"), NR_N("CC_SILVER_AARDWOLD_OPTIMIZED (layers: performance)"),
     NR_N("CC_SILVER_AARDWOLD_OPTIMIZED (layers: ultra performance)")};
-inline const char* net_name(int n) { return tr(nr::network_label(n)); }
+// ours (11-22): [Network] ExperimentalInt4 on (the default): the experimental model runs its int4 route; shown as
+// "... (INT4)" wherever the menu names the running network. Set from the ini each frame (set_xint4); a label only.
+inline bool g_xint4 = true;
+inline void set_xint4(const std::string& v) { g_xint4 = v == "1" || v == "on" || v == "true" || v == "yes"; }
+inline const char* net_name(int n) {
+    return n == nr::kSmallFp8Experimental && g_xint4 ? "CC_SMALL_FP8_EXPERIMENTAL (INT4)" : tr(nr::network_label(n));
+}
+inline const char* net_label(int n) { return net_name(n); }
 // A network as the lists offer it (a choice, not what runs): CC_SILVER_AARDWOLD_OPTIMIZED without its level - that is
 // the Optimized layers combo's, not the list's.
 inline const char* net_choice_name(int n) { return tr(nr::network_codename(n)); }
@@ -1338,6 +1345,30 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
              "GPU: it is then used as set, whatever the driver or the GPU's IDs say (a wrong one runs another GPU's machine "
              "code and the game may stop - set it back to Auto). "
              "Takes effect when the game restarts.");
+    }
+    set_xint4("0");   // (ours: the experimental int4 / FP16 sets are Linux / Proton only)
+    {   // ours: [Reuse] Every and Split, live (the DLL reads the file again each second; from every frame to Every >= 2 the
+        // network is rebuilt once, able to reuse its edit)
+        ImGui::Separator();
+        ImGui::TextUnformatted(tr("Reuse (frame rate)"));
+        static const char* const everys[] = {NR_N("Every frame (no reuse)"), NR_N("Every 2 frames"), NR_N("Every 3 frames"),
+                                              NR_N("Every 4 frames"), NR_N("Every 5 frames"), NR_N("Every 6 frames"),
+                                              NR_N("Every 7 frames"), NR_N("Every 8 frames")};
+        int every = std::atoi(ini.get("Reuse", "Every", "4").c_str());
+        every = every <= 1 ? 1 : std::min(every, 8);
+        if (ImGui::BeginCombo(tr("Network runs"), tr(everys[every - 1]))) {
+            for (int e = 1; e <= 8; ++e)
+                if (ImGui::Selectable(tr(everys[e - 1]), e == every) && e != every) ini.set("Reuse", "Every", std::to_string(e));
+            ImGui::EndCombo();
+        }
+        help("[Reuse] Every. How often the network runs; the frames between carry its last edit forward along the motion "
+             "vectors. Fewer runs: faster, the edit a little older on moving things. Every frame: the full cost each frame. "
+             "Applied at once (the first switch from every frame to reuse builds the network again, a few seconds).");
+        if (every <= 1) ImGui::BeginDisabled();
+        ini_flag(ini, "Split the run over the frames", "Reuse", "Split", "1",
+                 "[Reuse] Split. On (default): one network run is spread over the frames until the next, so every frame costs "
+                 "about the same (even frame pacing). Off: the whole network on one frame, the others almost free (uneven).");
+        if (every <= 1) ImGui::EndDisabled();   // (Split: nothing to split with the network every frame)
     }
     {
         const std::string k = ini.get("Network", "Hotkey", "Ctrl+F11");

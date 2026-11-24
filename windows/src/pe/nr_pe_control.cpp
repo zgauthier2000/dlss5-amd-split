@@ -21,6 +21,12 @@
 #include <vector>
 #include <algorithm>
 
+// release/: NR Control's DXGI Present count, from the .asi's menu (nr_pe_menu.cpp registers it; other binaries that link
+// this file have no menu and leave it unset)
+namespace { std::atomic<uint64_t (*)()> g_dxgi_presents{nullptr}; }
+namespace nr::pe::control { void set_dxgi_presents_source(uint64_t (*fn)()) { g_dxgi_presents = fn; } }
+static uint64_t dxgi_presents_now() { const auto fn = g_dxgi_presents.load(); return fn ? fn() : 0; }
+
 namespace nr::pe::control {
 namespace {
 nr::control::Shared* shared();

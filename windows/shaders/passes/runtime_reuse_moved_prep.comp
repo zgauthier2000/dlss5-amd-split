@@ -1,0 +1,21 @@
+#version 460
+// burn/ (2026-11-21): [Reuse] Moved (colour test) helper: 4x4 cell means of a perceptual luma, f = sqrt(L / (1 + L)), of a colour
+// image at the model's extent (cells past the edge average the texels inside). Run once per stored edit on the edit's input frame
+// (moved_cap) and once per reuse frame on this frame's input (moved_now); runtime_reuse_warp5.comp compares the two around each pixel.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D cells;
+layout(push_constant) uniform Push { uint width, height, cw, ch; } pc;
+void main() {
+    const ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(pc.cw) || c.y >= int(pc.ch)) return;
+    float s = 0.0, n = 0.0;
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x) {
+            const ivec2 p = c * 4 + ivec2(x, y);
+            if (p.x >= int(pc.width) || p.y >= int(pc.height)) continue;
+            const float l = max(dot(texelFetch(src, p, 0).rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+            s += sqrt(l / (1.0 + l)); n += 1.0;
+        }
+    imageStore(cells, c, vec4(s / max(n, 1.0)));
+}

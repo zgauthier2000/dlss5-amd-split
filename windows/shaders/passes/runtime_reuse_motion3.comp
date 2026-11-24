@@ -1,0 +1,50 @@
+#version 460
+// plugin3 (2026-11-21): runtime_reuse_motion.comp + EdgeDrop. The same composition, total(p) = m(p) + previous(p + m(p)), and with
+// `edge` set a pixel whose chain since the edit's frame looked outside a previous frame at ANY step is marked invalid: the
+// accumulator holds a sentinel there (kInvalid uv, far outside the frame), which every later composition that reads it (bilinear,
+// any weight) passes on, and which the warp reads as "no edit". The original tests only the last composed source; the clamped
+// lookups of the earlier steps can bring an off-screen source back inside and carry a wrong edit onto newly revealed screen edges.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rg32f) uniform readonly image2D motion;
+layout(set = 0, binding = 1, rg32f) uniform readonly image2D previous;
+layout(set = 0, binding = 2, rg32f) uniform writeonly image2D next;
+layout(push_constant) uniform Push {
+    uint width, height;      // the field
+    float scale_x, scale_y;  // engine units -> uv
+    uint first;              // 1: the previous frame is the one the edit belongs to, nothing to compose
+    uint edge;               // 1: mark chains that left the frame (EdgeDrop)
+} pc;
+const float kInvalid = 1.0e4;
+
+vec2 fetch_clamped(ivec2 p) {
+    return imageLoad(previous, clamp(p, ivec2(0), ivec2(pc.width, pc.height) - 1)).xy;
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.width) || p.y >= int(pc.height)) return;
+    const vec2 m = imageLoad(motion, p).xy * vec2(pc.scale_x, pc.scale_y);
+    const vec2 size = vec2(pc.width, pc.height);
+    vec2 total = m;
+    bool lost = false;
+    if (pc.edge != 0u) {
+        const vec2 source = (vec2(p) + 0.5) / size + m;     // this step's source in the previous frame, uv
+        lost = any(lessThan(source, vec2(0.0))) || any(greaterThan(source, vec2(1.0))) || any(isnan(m));
+    }
+    if (pc.first == 0u) {
+        const vec2 q = (vec2(p) + 0.5 + m * size) - 0.5;      // texel space of the previous field
+        const vec2 f0 = floor(q), f = q - f0;
+        const ivec2 i = ivec2(f0);
+        const vec2 a = fetch_clamped(i), b = fetch_clamped(i + ivec2(1, 0)), c = fetch_clamped(i + ivec2(0, 1)), d = fetch_clamped(i + ivec2(1, 1));
+        total += mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+        if (pc.edge != 0u) {
+            // a footprint texel that is invalid and carries weight: the chain is lost (a little dilation, about one texel)
+            const vec4 w = vec4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
+            const bvec4 bad = bvec4(any(greaterThan(abs(a), vec2(8.0))), any(greaterThan(abs(b), vec2(8.0))),
+                                    any(greaterThan(abs(c), vec2(8.0))), any(greaterThan(abs(d), vec2(8.0))));
+            if ((bad.x && w.x > 0.0) || (bad.y && w.y > 0.0) || (bad.z && w.z > 0.0) || (bad.w && w.w > 0.0)) lost = true;
+        }
+    }
+    if (lost) total = vec2(kInvalid);
+    imageStore(next, p, vec4(total, 0.0, 0.0));
+}

@@ -1,16 +1,19 @@
-// Makes dlssnr-amd/dlssnr-int4.bin at install time (package/install.ps1, INT4 mixed installed).
-// The int4 weights are not shipped: they are rebuilt from the model's own weights (dlssnr.bin) and the package's
+// Makes dlssnr-amd/CC_SILVER_AARDWOLD_OPTIMIZED_INT4.bin at install time (package/install.ps1).
+// The int4 weights are not shipped: they are rebuilt from CC_SILVER_AARDWOLD_OPTIMIZED's weights (CC_SILVER_AARDWOLD_OPTIMIZED.bin) and the package's
 // recovery tables (int4/vit, int4/swin: *.fix.bin, *.mu.bin) by the graph builder's own decoder, run here exactly as
 // the runtime's int4 build runs it (same plan, same settings), stopping before any GPU work.
-//   dlssnr-int4-weights <dlssnr.bin> <int4 data: vit/, swin/, settings.txt, shaders/> <output file>
+//   dlssnr-int4-weights <CC_SILVER_AARDWOLD_OPTIMIZED.bin> <int4 data: vit/, swin/, settings.txt, shaders/> <output file>
 #define NR_NO_MAIN
 #include "../core/nr_graph.cpp"
 #include "nr_native_plan.hpp"
 #include <sstream>
 
-int main(int argc, char** argv) try {
-    if (argc != 4) { std::fprintf(stderr, "usage: %s <dlssnr.bin> <int4 data dir> <output file>\n", argv[0]); return 2; }
-    const std::filesystem::path pack = std::filesystem::absolute(argv[1]), i4 = std::filesystem::absolute(argv[2]);
+// The arguments in UTF-8 (wmain below: the install passes the package folder and %TEMP%, which hold the user's
+// letters - a Chinese user name - that the ANSI code page may not have)
+static int run(int argc, char** argv) try {
+    if (argc != 4) { std::fprintf(stderr, "usage: %s <CC_SILVER_AARDWOLD_OPTIMIZED.bin> <int4 data dir> <output file>\n", argv[0]); return 2; }
+    const std::filesystem::path pack = std::filesystem::absolute(nr::u8::path(argv[1])),
+                                i4 = std::filesystem::absolute(nr::u8::path(argv[2]));
     std::map<std::string, std::string> cfg;
     cfg["NR_I4_DIR"] = (i4 / "vit").string();
     if (std::filesystem::is_directory(i4 / "swin")) cfg["NR_SWI4_DIR"] = (i4 / "swin").string();
@@ -44,3 +47,15 @@ int main(int argc, char** argv) try {
     std::fprintf(stderr, "dlssnr-int4-weights: %s\n", e.what());
     return 1;
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** wargv) {   // (linked with -municode)
+    std::vector<std::string> u8;
+    for (int i = 0; i < argc; ++i) u8.push_back(nr::u8::narrow(wargv[i]));
+    std::vector<char*> argv;
+    for (auto& a : u8) argv.push_back(a.data());
+    return run(argc, argv.data());
+}
+#else
+int main(int argc, char** argv) { return run(argc, argv); }
+#endif

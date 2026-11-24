@@ -1,0 +1,100 @@
+#version 460
+// plugin4: runtime_reuse_warp3.comp + CutDrop (flags bit 3, edit_from1); own file name so v3 keeps its warp3.
+// plugin3 (2026-11-21): runtime_reuse_warp.comp + EdgeDrop's feather + Disocclusion. Flags 0: the original's arithmetic.
+//  EdgeDrop (flags bit 0): the accumulator's sentinel (runtime_reuse_motion3.comp) already lands outside the frame (no edit); the
+//    edit also fades out over `feather` pixels towards the edit frame's border, so the edge of the carried edit is not a seam.
+//  Fill (bit 2, EdgeDrop = 2): a source outside the edit's frame reads the edit at the nearest point inside it (clamped), so the
+//    strip a pan reveals keeps the network's look (with no edit it shows the plain picture: brighter where the network darkens).
+//  Disocclusion (bit 1): this frame's depth at the pixel against the edit frame's depth at the pixel's source (nearest), both as
+//    view distance (1/d for an inverted depth, 1/(1-d) otherwise): past a relative difference of `disocc` the edit fades out, to
+//    nothing at twice it. A pixel whose content the edit frame did not see there (revealed behind a moving character, or a
+//    character edge whose blurred quarter-resolution motion points onto the background) gets this frame's plain picture.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) buffer Stat { float mean_pixels[]; };     // word 1: the accumulated motion's mean length
+layout(set = 0, binding = 1) uniform sampler2D shown;
+#if defined(NR_ANSWER16)   // v7: the answer straight into the caller's RGBA16F frame (the store rounds as the blit did)
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D answer;
+#else
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D answer;
+#endif
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D edit;
+layout(set = 0, binding = 4, rg32f) uniform readonly image2D motion;   // accumulated, uv units
+layout(set = 0, binding = 5) uniform sampler2D depth_now;              // this frame's depth (R32F, texelFetch)
+layout(set = 0, binding = 6, r32f) uniform readonly image2D depth_edit; // the edit frame's depth
+layout(push_constant) uniform Push {
+    uint width, height;          // the model's extent: `shown`, `answer`, `edit`
+    uint motion_width, motion_height;
+    uint round_u8;
+    float limit;                 // pixels the picture may have moved for the whole edit to be trusted; 0: no fade
+    uint flags;                  // bit 0 EdgeDrop, bit 1 Disocclusion, bit 2 Fill, bit 3 CutDrop (plugin4)
+    float feather;               // EdgeDrop: pixels of fade towards the edit frame's border (0: none)
+    float disocc;                // Disocclusion: relative view-distance difference where the fade starts
+    uint inverted;               // the depth is inverted (1 near, 0 far)
+    uint depth_width, depth_height;
+    uint edit_from1;             // plugin4 (flags bit 3, CutDrop): 1 + the reuse frame the stored edit's input belongs to
+} pc;
+
+vec3 edit_clamped(ivec2 p) {
+    return imageLoad(edit, clamp(p, ivec2(0), ivec2(pc.width, pc.height) - 1)).rgb;
+}
+
+vec2 motion_clamped(ivec2 p) {
+    return imageLoad(motion, clamp(p, ivec2(0), ivec2(pc.motion_width, pc.motion_height) - 1)).xy;
+}
+
+float distance_of(float d) {
+    return pc.inverted != 0u ? 1.0 / max(d, 1.0e-8) : 1.0 / max(1.0 - d, 1.0e-8);
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.width) || p.y >= int(pc.height)) return;
+    const vec2 size = vec2(pc.width, pc.height);
+    const vec2 uv = (vec2(p) + 0.5) / size;
+
+    // the accumulated motion, bilinear on its (coarser) texel centres
+    const vec2 mq = uv * vec2(pc.motion_width, pc.motion_height) - 0.5;
+    const vec2 mf0 = floor(mq), mf = mq - mf0;
+    const ivec2 mi = ivec2(mf0);
+    const vec2 m = mix(mix(motion_clamped(mi), motion_clamped(mi + ivec2(1, 0)), mf.x),
+                       mix(motion_clamped(mi + ivec2(0, 1)), motion_clamped(mi + ivec2(1, 1)), mf.x), mf.y);
+
+    vec2 source = uv + m;
+    bool filled = false;   // Fill: the source was outside and is now its nearest inside point (no depth test there: other content)
+    if ((pc.flags & 4u) != 0u && all(lessThan(abs(m), vec2(8.0)))) {
+        const vec2 c = clamp(source, vec2(0.0), vec2(1.0));
+        filled = any(notEqual(c, source));
+        source = c;
+    }
+    vec3 e = vec3(0.0);
+    if (all(greaterThanEqual(source, vec2(0.0))) && all(lessThanEqual(source, vec2(1.0)))) {
+        const vec2 q = source * size - 0.5;
+        const vec2 f0 = floor(q), f = q - f0;
+        const ivec2 i = ivec2(f0);
+        e = mix(mix(edit_clamped(i), edit_clamped(i + ivec2(1, 0)), f.x),
+                mix(edit_clamped(i + ivec2(0, 1)), edit_clamped(i + ivec2(1, 1)), f.x), f.y);
+        if ((pc.flags & 1u) != 0u && pc.feather > 0.0) {
+            const vec2 sp = source * size;
+            const float border = min(min(sp.x, size.x - sp.x), min(sp.y, size.y - sp.y));
+            e *= clamp(border / pc.feather, 0.0, 1.0);
+        }
+        if ((pc.flags & 2u) != 0u && !filled) {
+            const vec2 ds = vec2(pc.depth_width, pc.depth_height);
+            const ivec2 dn = clamp(ivec2(uv * ds), ivec2(0), ivec2(ds) - 1);
+            const ivec2 de = clamp(ivec2(source * ds), ivec2(0), ivec2(ds) - 1);
+            const float zn = distance_of(texelFetch(depth_now, dn, 0).r);
+            const float ze = distance_of(imageLoad(depth_edit, de).r);
+            const float r = abs(log(ze / zn));
+            e *= clamp(2.0 - r / pc.disocc, 0.0, 1.0);
+        }
+    }
+    // Past the limit the edit fades out, linearly to nothing at twice the limit: a global measure of how far
+    // the warp can be believed, which is what the host's gate predicts and this frame's own motion confirms.
+    if (pc.limit > 0.0) e *= clamp(2.0 - mean_pixels[1] / pc.limit, 0.0, 1.0);
+    // plugin4 CutDrop: a cut (runtime_reuse_cut.comp, word 3) after the stored edit's input frame: the edit belongs to another scene
+    if ((pc.flags & 8u) != 0u && floatBitsToUint(mean_pixels[3]) > pc.edit_from1) e = vec3(0.0);
+    const vec4 s = texelFetch(shown, p, 0);
+    vec3 o = s.rgb + e;
+    if (pc.round_u8 != 0u) o = round(clamp(o, 0.0, 1.0) * 255.0) / 255.0;
+    imageStore(answer, p, vec4(o, s.a));
+}

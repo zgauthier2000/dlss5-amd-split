@@ -136,6 +136,7 @@ inline constexpr Key kKeys[] = {
     {"NRFastHybridFine", kFloat, 2, 0.f, 2.f, 1.f, "Passes", "Fine detail", "NRFastHybridFine. How much of the network's fine detail change Hybrid adds: 1 as made (default), 0 none, 2 twice.", nullptr},
     {"NRFastInterleavedPasses", kUint, 0, 2.f, 8.f, 3.f, "Passes", "Passes (fast)", "NRFastInterleavedPasses. Interleaved: how many legacy passes (2 to 8) take turns, one each frame. Each pass more needs more video memory.", nullptr},
     {"NRFastInterleavedPreset", kUint, 0, 1.f, 2.f, float(nr::fast::kDefaultInterleavedPreset), "Passes", "Interleaved preset", "NRFastInterleavedPreset. Interleaved's processing method.", "~Preset 1\0Preset 1\0Preset 2\0"},
+    {"NRFastInterleavedFill", kBool, 0, 0.f, 0.f, 1.f, "Passes", "Hole fill", "NRFastInterleavedFill. Where a moved increment cannot be used (something uncovered, an edge), Interleaved fills it from its usable neighbours. Off: about 0.15 ms a frame faster, the picture almost the same.", nullptr},
 };
 inline constexpr int kCount = int(sizeof kKeys / sizeof kKeys[0]);
 }  // namespace nr::renodx_keys

@@ -40,11 +40,11 @@ struct Settings {
     bool auto_mask = false;             // NRAutoMask
     // The stack: passes 2..4 with their own controls once "Same as pass 1" is off (NRPass2FollowPass1 ...).
     uint32_t passes = 1;                // NRPasses 1..4 (1..30 with NRUnlockPasses)
-    uint32_t passes_mode = 0;           // NRPassesMode: 0 legacy, 1 fast
-    uint32_t fast_method = fast::kDefaultMethod;   // NRFastMethod: 0 Interleaved, 1 Extrapolation, 2 Feedback, 3 Hybrid, 4 Edit strength (the route's default)
+    uint32_t passes_mode = 0;           // NRPassesMode: 0 legacy, 1 fast (ours: legacy with NRPasses 1 = 1 pass; user 11-23 "i like 1 pass much better")
+    uint32_t fast_method = fast::kDefaultMethod;   // NRFastMethod: 0 Interleaved, 1 Extrapolation, 2 Feedback, 3 Hybrid, 4 Edit strength (the route's default: Interleaved on OptiScaler; user 11-23 "interleaved looks by far best")
     // Each method's own settings, [0] Extrapolation, [1] Feedback, [2] Hybrid (NRFast<Method>Passes / HaloLimit / Fine)
     float fast_passes[3] = {3.0f, 3.0f, 3.0f};       // 1..8, referred to legacy pass counts
-    bool fast_halo_limit[3] = {false, false, false};
+    bool fast_halo_limit[3] = {true, true, true};
     float fast_fine[3] = {0.0f, 1.0f, 1.0f};         // 0..2: the strengthening's fine-detail part, x (1: as made)
     float fast_edit_strength = 2.0f;    // NRFastEditStrength 0..4: Edit strength's stops x (the look's Edit strength)
     // Interleaved: legacy passes 2..8, one of them a frame in turn, each with its own history (needs motion vectors:
@@ -52,6 +52,10 @@ struct Settings {
     uint32_t fast_interleaved_passes = 3;   // NRFastInterleavedPasses 2..8
     // NRFastInterleavedPreset: Interleaved's variant - 1 = the method of 0.0.8.4 , 2 = a later method (the default: nr_fast_passes.hpp)
     uint32_t fast_interleaved_preset = fast::kDefaultInterleavedPreset;
+    // NRFastInterleavedFill (ours, merge/): Interleaved's hole fill (moved increments not used replaced by their usable
+    // neighbours': the pyramid il_pp + step 4). 1 = on (upstream; default), 0 = off: -0.12..-0.17 ms a frame at
+    // 1694x953 under Every 4 + Split (merge/NOTES.md). NR_IL_FILL in the environment wins.
+    bool fast_interleaved_fill = true;
     bool unlock_passes = false;         // NRUnlockPasses: ours, as OptiScaler's UnlockPasses (passes 5.. take pass 4's)
     float pass_intensity[3] = {1.0f, 1.0f, 1.0f};
     bool pass_follow[3] = {true, true, true};
@@ -63,7 +67,7 @@ struct Settings {
     // Where NR runs on the OptiScaler route (NRHookPoint): 0 after the upscaler, 1 before it (not with Ray
     // Reconstruction), 2 at the game's Present (the default).
     // The ReShade routes are RenoDX's Present hook point.
-    uint32_t hook_point = 2;
+    uint32_t hook_point = 1;
     uint32_t present_guides = 0;        // NRPresentGuides: 0 optional, 1 required, 2 never (neutral guides)
     // The .asi's Present layers under frame generation (RenoDX's NRPresentFrames / NRPresentFgSource): 0 NR on every
     // present, the motion scaled by 1 / the presents a game frame; 1 on the first present after each game frame only.
@@ -88,14 +92,17 @@ struct Settings {
     uint32_t display_pedestal = 0;      // NRDisplayPedestal: 0 off (default), 1 always, 2 smooth, 3 auto
     uint32_t sdr_black_restore = 0;     // NRSdrBlackRestore: 0 off (default), 1 every block, 2 smooth, 3 auto
     bool neural_floor_guard = true;     // NRNeuralFloorGuard
-    uint32_t feed_mode = 0;             // NRFeedMode: 0 auto, 1 the content meter, 2 the game's exposure
+    uint32_t feed_mode = 2;             // NRFeedMode: 0 auto, 1 the content meter, 2 the game's exposure
     uint32_t norm_governor = 2;         // NRNormGovernor
     bool norm_cut_aware = true;         // NRNormCutAware
     float norm_attack_stops = 4.0f;     // NRNormAttackStops
     float norm_release_stops = 0.5f;    // NRNormReleaseStops
     float norm_slew_stops = 0.02f;      // NRNormSlewStops
     uint32_t detail_stability = 1;      // NRDetailStability: 0 auto, 1 off (default), 2 always
-    float resolution_scale = 1.0f;      // NRResolutionScale: the network at 0.33..1 of the frame
+    // armfix/ (2026-11-22): NRFastFeedbackMotionEdge t (px; 0 off = v9): Feedback / Hybrid feed nothing back where this frame's motion
+    // differs from that NRFastFeedbackMotionEdgeRadius px away by t .. 2t px (st_fb_in.comp flags bit 5)
+    float fb_motion_edge = 0.0f; uint32_t fb_motion_edge_radius = 4;
+    float resolution_scale = 0.75f;      // NRResolutionScale: the network at 0.33..1 of the frame
     bool follow_input_res = false;      // NRFollowInputRes: the network at the game's render resolution
     uint32_t look_upsample = 0;         // NRLookUpsample: 0 auto, 1 edge-aware, 2 classic, 3 area input
     // Adjust NR's look (look_stage.hpp Settings; every default the identity, NRLookMode off).
@@ -214,6 +221,14 @@ public:
 
     // The settings for the next frame (read once per frame).
     void set(const Settings&);
+    // burn/: the Feedback method's history is dropped before the next frame (a cut the runtime's CutDrop detector saw)
+    void drop_feedback();
+    // visfix/ (2026-11-22) FeedbackHold: the network callback tells the stage what the runtime did with this frame (reused = the answer
+    // came from the stored edit, fresh = a new edit took over this frame) and whether [Reuse] FeedbackHold is on. With it on, a reused frame
+    // whose edit is not fresh stores its feedback add (divided by the feedback weight) as the Feedback history instead of its total edit:
+    // the add is carried along, not fed the carried edit again every frame (the loop that compounds a stale edit's warp error).
+    // Never called = v9 (the note is cleared before every network call).
+    void note_network(bool reused, bool fresh, bool hold);
     // 0 SDR (legacy codec), 1 linear HDR, 2 PQ: what this frame format and flag resolve to.
     uint8_t hdr_mode() const;
 

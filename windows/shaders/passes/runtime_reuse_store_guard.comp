@@ -1,0 +1,56 @@
+#version 460
+// guard/ (2026-11-23) [Reuse] Guard: runtime_reuse_store_ema.comp with alpha read from the guard's stat buffer (word 0, written by
+// runtime_reuse_guard_sum.comp this frame): a run whose whole-picture look jumps is mixed in with GuardAlpha instead of Blend. Original header:
+// campfire/ (2026-11-23) [Reuse] Blend: runtime_reuse_store.comp + the previous stored edit carried in. The fresh edit (answer - what the
+// network was shown, at the split cycle's input frame c) is mixed with the previous stored edit (made on the previous network input frame)
+// read at the pixel's source by the motion accumulated from c back to that frame (HistoryGate's field, normalized uv at 1/4 size):
+//   stored = fresh + (1 - alpha) * keep * (old(source) - fresh)
+// keep: 1 where the depth at the source in the old edit's frame matches c's depth (relative view-distance difference < disocc, gone at 2x),
+// 0 outside the frame / on the accumulator's sentinel; with ck1 > 0 also faded where the input's luma there then and here now differ. alpha = 1: the plain store. The carried edit then steps by alpha x the change between
+// two network runs at each refresh (an exponential average over network runs) instead of the whole change.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) buffer Stat { uint words[]; };
+layout(set = 0, binding = 1) buffer Terms { uvec2 terms[]; };   // unused here (same layout as guard_terms)
+layout(set = 0, binding = 2) uniform sampler2D shown;                          // what the network saw (the cycle's input)
+layout(set = 0, binding = 3, rgba32f) uniform readonly image2D answer;         // the network's answer
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D edit;          // the stored edit (written)
+layout(set = 0, binding = 5, rgba16f) uniform readonly image2D old_edit;       // copy of the previous stored edit
+layout(set = 0, binding = 6, rg32f) uniform readonly image2D motion;           // c -> previous network input frame, uv, 1/4 size
+layout(set = 0, binding = 7) uniform sampler2D depth_now;                      // c's depth
+layout(set = 0, binding = 8, r32f) uniform readonly image2D depth_old;         // the previous edit frame's depth
+layout(set = 0, binding = 9) uniform sampler2D old_src;                        // the previous edit frame's input colour (Relit's copy)
+layout(push_constant) uniform Push {
+    uint width, height, motion_width, motion_height, depth_width, depth_height, inverted;
+    float alpha, disocc;
+    float ck0, ck1;   // colour test: the old edit is kept less where sqrt(L/(1+L)) at p now and at the source then differ by ck0 .. ck1 (ck1 <= 0: off)
+} pc;
+vec2 mload(ivec2 p) { return imageLoad(motion, clamp(p, ivec2(0), ivec2(pc.motion_width, pc.motion_height) - 1)).xy; }
+vec3 oload(ivec2 p) { return imageLoad(old_edit, clamp(p, ivec2(0), ivec2(pc.width, pc.height) - 1)).rgb; }
+float dist_of(float d) { return pc.inverted != 0u ? 1.0 / max(d, 1.0e-8) : 1.0 / max(1.0 - d, 1.0e-8); }
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.width) || p.y >= int(pc.height)) return;
+    const vec3 fresh = imageLoad(answer, p).rgb - texelFetch(shown, p, 0).rgb;
+    const vec2 size = vec2(pc.width, pc.height), uv = (vec2(p) + 0.5) / size;
+    const vec2 mq = uv * vec2(pc.motion_width, pc.motion_height) - 0.5, mf0 = floor(mq), mf = mq - mf0; const ivec2 mi = ivec2(mf0);
+    const vec2 m = mix(mix(mload(mi), mload(mi + ivec2(1, 0)), mf.x), mix(mload(mi + ivec2(0, 1)), mload(mi + ivec2(1, 1)), mf.x), mf.y);
+    const vec2 src = uv + m;
+    vec3 e = fresh;
+    if (all(lessThan(abs(m), vec2(8.0))) && all(greaterThanEqual(src, vec2(0.0))) && all(lessThanEqual(src, vec2(1.0)))) {
+        const vec2 ds = vec2(pc.depth_width, pc.depth_height);
+        const float zn = dist_of(texelFetch(depth_now, clamp(ivec2(uv * ds), ivec2(0), ivec2(ds) - 1), 0).r);
+        const float zo = dist_of(imageLoad(depth_old, clamp(ivec2(src * ds), ivec2(0), ivec2(ds) - 1)).r);
+        float keep = clamp(2.0 - abs(log(zo / zn)) / pc.disocc, 0.0, 1.0);
+        const vec2 q = src * size - 0.5, f0 = floor(q), f = q - f0; const ivec2 i = ivec2(f0);
+        if (pc.ck1 > 0.0) {   // the surface at the source then is not the one here now (a limb's edge over the body, light moved): the fresh edit
+            const ivec2 hi = ivec2(pc.width, pc.height) - 1;
+            const vec3 co = mix(mix(texelFetch(old_src, clamp(i, ivec2(0), hi), 0).rgb, texelFetch(old_src, clamp(i + ivec2(1, 0), ivec2(0), hi), 0).rgb, f.x),
+                                mix(texelFetch(old_src, clamp(i + ivec2(0, 1), ivec2(0), hi), 0).rgb, texelFetch(old_src, clamp(i + ivec2(1, 1), ivec2(0), hi), 0).rgb, f.x), f.y);
+            const float yn = max(dot(texelFetch(shown, p, 0).rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0), yo = max(dot(co, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+            keep *= 1.0 - smoothstep(pc.ck0, pc.ck1, abs(sqrt(yn / (1.0 + yn)) - sqrt(yo / (1.0 + yo))));
+        }
+        const vec3 old = mix(mix(oload(i), oload(i + ivec2(1, 0)), f.x), mix(oload(i + ivec2(0, 1)), oload(i + ivec2(1, 1)), f.x), f.y);
+        e = fresh + (1.0 - uintBitsToFloat(words[0])) * keep * (old - fresh);
+    }
+    imageStore(edit, p, vec4(e, 0.0));
+}

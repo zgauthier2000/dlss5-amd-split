@@ -1,0 +1,42 @@
+#version 460
+// v7 (2026-11-21): CutDrop detector, part 1 of 2: one invocation per grid point (runtime_reuse_cut.comp's loop body, unchanged
+// arithmetic): this frame's luma into `current`, and the point's term |luma - previous at the motion's source| with a valid flag
+// into `terms` (2 words a point). runtime_reuse_cut_sum.comp then adds them in runtime_reuse_cut.comp's order.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer Stat { uint words[]; };
+layout(set = 0, binding = 1) buffer Terms { uint terms[]; };
+layout(set = 0, binding = 2) uniform sampler2D shown;
+layout(set = 0, binding = 3, rg32f) uniform readonly image2D motion;
+layout(set = 0, binding = 4, r32f) uniform readonly image2D previous;
+layout(set = 0, binding = 5, r32f) uniform writeonly image2D current;
+layout(push_constant) uniform Push {
+    uint width, height; uint motion_width, motion_height; float scale_x, scale_y; uint frame; float threshold; uint have_previous; float ratio;
+} pc;
+float luma_at(vec2 uv) { return dot(texture(shown, uv).rgb, vec3(1.0 / 3.0)); }
+float previous_at(vec2 uv) {
+    const vec2 q = uv * vec2(pc.width, pc.height) - 0.5;
+    const vec2 f0 = floor(q), f = q - f0;
+    const ivec2 i = ivec2(f0), hi = ivec2(pc.width, pc.height) - 1;
+    const float a = imageLoad(previous, clamp(i, ivec2(0), hi)).r, b = imageLoad(previous, clamp(i + ivec2(1, 0), ivec2(0), hi)).r;
+    const float c = imageLoad(previous, clamp(i + ivec2(0, 1), ivec2(0), hi)).r, d = imageLoad(previous, clamp(i + ivec2(1, 1), ivec2(0), hi)).r;
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+void main() {
+    const uint count = pc.width * pc.height;
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= count) return;
+    const vec2 size = vec2(pc.width, pc.height);
+    const ivec2 p = ivec2(i % pc.width, i / pc.width);
+    const vec2 uv = (vec2(p) + 0.5) / size;
+    const float l = luma_at(uv);
+    uint t = 0u, v = 0u;
+    if (pc.have_previous != 0u) {
+        const ivec2 mp = clamp(ivec2(uv * vec2(pc.motion_width, pc.motion_height)), ivec2(0), ivec2(pc.motion_width, pc.motion_height) - 1);
+        const vec2 src = uv + imageLoad(motion, mp).xy * vec2(pc.scale_x, pc.scale_y);
+        if (all(greaterThanEqual(src, vec2(0.0))) && all(lessThanEqual(src, vec2(1.0))) && !isnan(src.x) && !isnan(src.y)) {
+            t = floatBitsToUint(abs(l - previous_at(src))); v = 1u;
+        }
+    }
+    terms[2u * i] = t; terms[2u * i + 1u] = v;
+    imageStore(current, p, vec4(l));
+}

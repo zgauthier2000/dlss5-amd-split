@@ -13,6 +13,9 @@
 #include <filesystem>
 #include <string>
 #include <mutex>
+#include <map>
+#include <algorithm>
+#include <cstdio>
 #include "nr_ini_network.hpp"
 #if NR_INT4
 #include "nr_ini_int4.hpp"
@@ -390,7 +393,7 @@ struct Temporal {
     // has one); then both posts are built - post_pp the RGBA32F history's, post16_pp the RGBA16F one's, the same sets -
     // and a switch is new history images and the sets pointing at them (Impl::switch_history), no build.
     bool h16{};
-    bool h16_ok{}, h16_want{true};
+    bool h16_ok{}, h16_want{false};   // ours: 32 unless asked (the picture as before)
     nrvk::Kernel post16_pp[2], post16_grade_pp[2];
     bool pingpong{};
     uint32_t hcur{};
@@ -636,6 +639,116 @@ struct Runtime::Impl {
     // (the native plan's padded one) and Model Resolution.
     std::vector<std::string> share_arguments;
     uint32_t work_w{}, work_h{};
+    // ---- temporal reuse (RuntimeConfig::reuse, Controls::reuse_every) -----------------------------------
+    //
+    // After a network frame: `reuse_edit` = answer - what the network was shown (RGBA16F, model extent).
+    // On a frame that skips the network: the motion since then is accumulated in `reuse_acc` (RG32F at the
+    // motion field's extent, uv units, two images because composition reads the previous one at other
+    // pixels), and the answer is rebuilt from this frame's own `tex_in` and the warped edit. One state
+    // per runtime: it belongs to the first feature that used it, others run the network as usual.
+    bool reuse{};
+    nrvk::Context::Image reuse_edit{}, reuse_acc[2]{};
+    nrvk::Kernel reuse_store, reuse_motion[2], reuse_warp[2], reuse_stat, reuse_stat_acc[2];
+    nrvk::Buffer reuse_stat_buffer{};   // host visible: the previous frames' mean motion, pixels of the model extent
+    uint64_t reuse_gate_trips{}, reuse_skipped{}, reuse_ran{};
+    double reuse_motion_sum{}; uint64_t reuse_motion_samples{}; float reuse_motion_peak{};
+    // save3/ (11-22): at GateRun 0 word 0 (this frame's motion mean) is read by the log's motion figures only, so the stat runs on
+    // every kStatEvery-th reuse frame there and the log averages those samples (GateRun 1: every frame, as before)
+    static constexpr uint32_t kStatEvery = 8;
+    uint32_t reuse_stat_n{}; bool reuse_stat_fresh{};
+    // save3/ (11-22): the accumulated mean's exact shortcut. stat_max = a wide pass, the largest motion length of the
+    // accumulator into word 5 (atomic max of the float bits); stat_accg / stat_acc3g = runtime_reuse_stat(3) that first reads word 5
+    // (and clears it): below 0.99 x the fade limit the fade factor is exactly 1 (save3/NOTES.md) and the sum is left out (word 1 = 0).
+    // Missing files: the plain passes as before.
+    nrvk::Kernel reuse_stat_max[2], reuse_stat_accg[2], reuse_stat_acc3g[2];
+    bool reuse_accg{};
+    bool reuse_have{};              // an edit is stored
+    uint32_t reuse_since{};         // frames that skipped the network since it ran
+    uint32_t reuse_acc_cur{};       // which accumulator holds the latest accumulation
+    uint64_t reuse_feature{};       // the feature that owns the stored edit
+    bool reuse_owned{};
+    // ---- plugin3: EdgeDrop / Disocclusion (Controls::reuse_edge_drop / reuse_disocc, plugin3/NOTES.md) ----------------------
+    // Their own kernels (runtime_reuse_*3.spv); off: the kernels above, the same commands as before. `reuse_dep` = the stored
+    // edit's frame's depth (copied from temporal.depth when the edit is stored); usable only while reuse_dep_ok.
+    bool reuse3{};                  // the kernels exist (their files were found)
+    bool reuse3_logged{};
+    nrvk::Kernel reuse_motion3[2], reuse_warp3[2], reuse_stat_acc3[2];
+    nrvk::Context::Image reuse_dep{};
+    bool reuse_dep_ok{};
+    int64_t reuse_edit_from = -1;   // trace: the reuse frame whose input the stored edit belongs to
+    int64_t vf_seen_from = -2;      // visfix/: reuse_edit_from as the last frame reported it (RecordResult::edit_fresh)
+    // ---- plugin4: CutDrop (Controls::reuse_cut_drop). Words 2 / 3 of reuse_stat_buffer: the last frame's change, 1 + the last cut's frame.
+    bool reuse4{};
+    nrvk::Kernel reuse_warp4[2], reuse_cut[2];
+    // v7: the detector as a wide pass (cut_terms) + the ordered sum (cut_sum); NR_V7_CUT=0 runs the one-workgroup kernel as before
+    nrvk::Kernel reuse_cut_terms[2], reuse_cut_sum;
+    nrvk::Buffer reuse_cut_tbuf{};
+    bool reuse_cut_wide{};
+    nrvk::Context::Image reuse_cut_luma[2]{};
+    bool reuse_cut_have{};
+    uint32_t reuse_cut_k{}, reuse_cut_seen{};
+    uint64_t reuse_cuts{};
+    // ---- plugin5: Snap / Box / NearMV (Controls::reuse_snap / reuse_box / reuse_nearmv). reuse_src: the stored edit's input colour.
+    bool reuse5{};
+    nrvk::Kernel reuse_warp5[2], reuse_snap_prep, reuse_snap_coef, reuse_snap_mean, reuse_snap_apply;
+    nrvk::Kernel reuse_store_ema;   // campfire/ [Reuse] Blend
+    nrvk::Kernel reuse_guard_terms, reuse_guard_sum, reuse_store_guard;   // guard/ [Reuse] Guard
+    nrvk::Buffer reuse_guard_stat{}, reuse_guard_tbuf{}; uint32_t reuse_guard_bx{}, reuse_guard_by{}; bool reuse_guard_ok{};
+    // v7: the warp5 / Snap apply answer straight into the caller's RGBA16F frame (NR_V7_WB: 0 off, 1 plain store, 2 nearest-even
+    // rounding first; default 2); one descriptor set pair per frame image, kept (a game's frame images are few and long-lived)
+    nrvk::Kernel reuse_warp5d[2], reuse_snap_applyd, reuse_warp4d[2];
+    bool reuse_wbd{};
+    struct WbSet { VkImage image{}; VkImageView view{}; VkDescriptorPool pool{}; VkDescriptorSet w5[2]{}, ap{}, w4[2]{};
+                   VkDescriptorPool poolh{}; VkDescriptorSet w5h[2]{}; /* armfix/: warp5 on the MotionRes accumulators */ };
+    std::vector<WbSet> wb_sets;
+    nrvk::Context::Image reuse_carry{}, reuse_src{}, reuse_snap_img[6]{};
+    // burn/: [Reuse] Moved's cell images (the edit frame's input, this frame's) and their pass; moved_ok: the prep shader exists
+    nrvk::Context::Image reuse_moved_cap{}, reuse_moved_now{};
+    nrvk::Kernel reuse_moved_prep_cap, reuse_moved_prep_now;
+    bool reuse_moved_ok = false, reuse_moved_logged = false;
+    uint32_t reuse_snap_cw{}, reuse_snap_ch{};
+    // ---- plugin2: Split (Controls::reuse_split) and Phase (Controls::reuse_phase), plugin2/NOTES.md ---------------
+    // A cycle: the input of one frame (its capture: the network's input image, the motion field, depth, the params
+    // and the noise seed) is run through the network in `n` parts on `n` consecutive frames, one part per frame; the
+    // last part stores the edit, the motion of the frames since the capture (kept in `ring`) is replayed into the
+    // accumulator, and that frame's own picture is rebuilt from it. The frames of the cycle show the previous edit.
+    static constexpr int kSplitRing = 9;
+    struct SplitSlot { int64_t frame = -1; uint32_t seed = 0; float params[12] = {}; bool aligned = false, lite_skip = false;
+                       bool dep_ok = false; /* plugin3: dep[] holds this capture's depth (Disocclusion) */ bool hg = false; /* campfire/ HistoryGate field in flow[] */ };
+    struct SplitState {
+        bool made = false, laid = false;
+        nrvk::Context::Image col[2]{}, flow[2]{}, dep[2]{}, live_col{}, live_flow{}, ring[kSplitRing]{};
+        SplitSlot slot[2];
+        int64_t frame = -1;                 // reuse frames of the owning feature
+        bool active = false; int cs = -1, j = 0, n = 0;
+        int pending = -1;                   // a capture whose cycle has not started
+        int64_t next_slot = 0;              // first frame a cycle may start on
+        int ring_n = 0;                     // motion fields kept, frames capture+1 ..
+        uint64_t last_serial = 0;
+        int64_t ideal = -1;                 // Split 0 with Phase: the next scheduled network frame
+        std::map<int, std::vector<uint32_t>> cuts; std::map<int, std::string> cut_source;
+        uint64_t cycles{}, dropped{}, starts{}, starts_aligned{}, waits{}, lag0{}, lag1{}, whole{};
+        uint64_t net_runs{}, net_runs_lite_skip{}, jitter_frames{}, zeroed{};
+        // plugin2 11-21 fix: the last frame Phase could align to; window counts of frames, Lite skip frames, frames where Phase
+        // fell back to 0 because no aligned frame came in the last 2 frames (a stretch without Lite skip frames)
+        int64_t last_aligned = -100;
+        uint64_t win_frames{}, lite_skip_frames{}, fallback_frames{};
+        int last_parts = 0;
+        bool off = false;                   // another runtime used this network memory: Split stays off here
+    } split;
+    // ---- armfix/: [Reuse] MotionRes (Controls::reuse_motion_res): the carried edit's own motion field, accumulators and split ring at
+    // 1/2 or 1/1 of the network's size, made on first use (outside the image heap, as Split's images). `steps`: accumulations since the
+    // stored edit's frame that went into them; the warp reads them only when that equals the 1/4 accumulator's count.
+    struct HiAcc {
+        bool made = false, laid = false, failed = false, logged = false; int div = 0; uint32_t w = 0, h = 0;
+        nrvk::Context::Image flow{}, acc[2]{}, ring[kSplitRing]{};
+        bool ring_ok[kSplitRing] = {}; bool flow_ok = false;
+        nrvk::Kernel motion[2], warp5[2], warp5d[2];
+        VkDescriptorPool pool{}; VkDescriptorSet ring_set[kSplitRing][2]{};
+        uint32_t steps = 0;
+    } hi;
+    std::filesystem::path adapters_dir;
+    uint64_t win_timed{}; double win_gpu{}; float win_min{}, win_max{}; uint64_t win_net_n{}; double win_net{};
     // The post block restores the frame's alpha (and the 8-bit rounding) in its
     // own store, so the alpha pass is skipped: native compose, one pass, no
     // Model Resolution - there the answer is the post block's output as it is.
@@ -677,11 +790,14 @@ struct Runtime::Impl {
             return;   // VK_NOT_READY: still running, ask again next frame
         if (stamps[1] <= stamps[0]) return;
         gpu_ms = float(double(stamps[1] - stamps[0]) * timestamp_ns / 1e6);
+        ++win_timed; win_gpu += gpu_ms;
+        win_min = win_timed == 1 ? gpu_ms : std::min(win_min, gpu_ms); win_max = win_timed == 1 ? gpu_ms : std::max(win_max, gpu_ms);
         if (slot_passes[oldest]) {
             uint64_t net = 0;
             for (uint32_t p = 0; p < slot_passes[oldest]; ++p)
                 if (stamps[3 + 2 * p] > stamps[2 + 2 * p]) net += stamps[3 + 2 * p] - stamps[2 + 2 * p];
             net_ms = float(double(net) * timestamp_ns / 1e6);
+            ++win_net_n; win_net += net_ms;
             net_ms_avg = net_ms_avg > 0.0f ? net_ms_avg + (net_ms - net_ms_avg) * 0.1f : net_ms;
         }
         if (std::getenv("NR_LAYER_TIMING_DIAG"))
@@ -722,10 +838,10 @@ struct Runtime::Impl {
         int slot{-1};          // the history image holding its last frame (Temporal::hist), -1 none yet
     };
     std::map<uint64_t, FeatureState> features;
-    // A feature's own history image is made when it first has to leave the bound history (another feature binds
-    // over it) - never while it is the only one, which is every single-layer caller: there it would only hold the
-    // zeros its first frame starts from (4K: a whole RGBA16F image). A feature without one has never been
-    // swapped out, so binding it means starting from zeros (record_all clears the bound history).
+    // (upstream 050b8e5, 0.0.8.2) A feature's own history image is made when it first has to leave the bound history
+    // (another feature binds over it) - never while it is the only one, which is every single-layer caller: there it
+    // would only hold the zeros its first frame starts from (one model-extent RGBA32F image). A feature without one
+    // has never been swapped out, so binding it means starting from zeros (record_all clears the bound history).
     FeatureState make_feature() { return FeatureState{}; }
     void ensure_history(FeatureState& f) {
         if (f.history.handle) return;
@@ -1337,6 +1453,16 @@ struct Runtime::Impl {
             for (auto& p : f.second.estimator_luma) if (p.handle) session.ctx.destroy(p);
         }
         for (auto& r : retiring) if (r.first.handle) session.ctx.destroy(r.first);
+        for (auto* im : {&split.col[0], &split.col[1], &split.flow[0], &split.flow[1], &split.dep[0], &split.dep[1],
+                         &split.live_col, &split.live_flow, &reuse_dep})
+            if (im->handle) session.ctx.destroy(*im);
+        for (auto& im : split.ring) if (im.handle) session.ctx.destroy(im);
+        for (auto* im : {&hi.flow, &hi.acc[0], &hi.acc[1]}) if (im->handle) session.ctx.destroy(*im);
+        for (auto& im : hi.ring) if (im.handle) session.ctx.destroy(im);
+        for (auto& k : hi.motion) if (k.device) k.destroy();
+        for (auto& k : hi.warp5) if (k.device) k.destroy();
+        for (auto& k : hi.warp5d) if (k.device) k.destroy();
+        if (hi.pool) vkDestroyDescriptorPool(session.ctx.device, hi.pool, nullptr);
         if (mask_pre.device) mask_pre.destroy();
         if (post_grade.device) post_grade.destroy();
         if (mask_resolve.device) mask_resolve.destroy();
@@ -1557,12 +1683,12 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         if (!impl_->motion_without_depth)
             nr::logf("[nr] motion vectors read where the depth picks (dlssnr-amd.ini [Network] Motion Without Depth = 0)");
     }
-    // [Network] History Precision: 16 (the default) the history images RGBA16F, 32 RGBA32F (live afterwards:
+    // [Network] History Precision: 16 the history images RGBA16F, 32 RGBA32F (ours: the default; upstream 16) (live afterwards:
     // Runtime::set_history_f16). NR_HIST16 in the environment wins.
     {
         std::string v = nr::ini_network_key(writable_ini_file(data.parent_path()), "history precision");
         for (auto& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
-        impl_->temporal.h16_want = !(v == "32" || v == "fp32" || v == "full" || v == "rgba32f");
+        impl_->temporal.h16_want = v == "16" || v == "fp16" || v == "half" || v == "rgba16f";
         if (const char* e = std::getenv("NR_HIST16")) impl_->temporal.h16_want = std::atoi(e) != 0;
     }
     const auto native = make_native_plan(mw, mh, network);
@@ -1639,6 +1765,12 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // enabled on a device supporting VK_KHR_pipeline_binary; anything missing: Quality, and the log says why. RDNA3
     // runs them as the bundle's gfx11 int4 records (the iu4 WMMA rewrite of NR_I4_MMA2 pairs made with the records).
     bool int4 = false;
+#ifdef NR_TEST_LEGACY_INT4
+    // Only the legacy golden harness defines this; installed programs migrate to the fitted network.
+    const bool legacy_int4 = true;
+#else
+    const bool legacy_int4 = false;
+#endif
     std::string int4_env;
 #ifdef _WIN32
     { char b[16] = {}; const unsigned long n = GetEnvironmentVariableA("DLSSNR_INT4", b, sizeof b); if (n && n < sizeof b) int4_env = b; }
@@ -1656,6 +1788,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
     // What the build reads for int4 (nr_build_cfg.hpp): installed, only this map - empty without int4 layers, so
     // nothing in the environment reaches it; a development tree keeps reading the environment.
     std::map<std::string, std::string> int4_cfg;
+    // ours: the experimental model's int4 route (ExperimentalInt4) is Linux / Proton only (its SPIR-V + tables); here off
+    const bool xint4 = false, i4tables = false; (void)i4tables;
     const std::filesystem::path i4root = data / (level == nr::kLayersPerformance ? "int4-performance"
                                                  : level == nr::kLayersUltra ? "int4-ultra" : "int4");
     // The int4 levels' SPIR-V: the Linux network's in i4root/shaders on RDNA4; on RDNA3 the bundle's own gfx11 builds
@@ -1684,7 +1818,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             int4 = true;
             int4_cfg["NR_I4_DIR"] = (i4root / "vit").string();
             if (std::filesystem::is_directory(i4root / "swin", ec)) int4_cfg["NR_SWI4_DIR"] = (i4root / "swin").string();
-            int4_cfg["NR_I4_WEIGHTS"] = i4weights.string();
+            if (!i4tables) int4_cfg["NR_I4_WEIGHTS"] = i4weights.string();
             // the rewritten pipeline binaries (nrvk.hpp create_iu4), keyed by driver like pipeline.cache
             const std::filesystem::path cache_data = writable_cache_base(data);
             const std::filesystem::path cache_i4 = (cache_data == data) ? i4root : (cache_data / i4root.filename());
@@ -1692,12 +1826,54 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             if (!ec) int4_cfg["NR_I4_CACHE"] = (cache_i4 / "pipeline-binaries").string();
             const auto t = slurp((i4root / "settings.txt").string());
             nr::int4_settings(std::string(t.begin(), t.end()), int4_cfg);
-            nr::logf("[nr] CC_SILVER_AARDWOLD_OPTIMIZED (layers: %s) (%s)", nr::layers_word(level), int4_from);
+            if (xint4) nr::logf("[nr] int4_mixed network (%s)", int4_from);
+            else nr::logf("[nr] CC_SILVER_AARDWOLD_OPTIMIZED (layers: %s) (%s)", nr::layers_word(level), int4_from);
         }
     }
     impl_->int4 = int4;
     impl_->layers = int4 ? level : nr::kLayersQuality;
 #endif
+    // v9 (11-22): [Network] FP16Activations = 1 in dlssnr-amd.ini (DLSSNR_FP16_ACT, env, wins): the experimental model runs
+    // its FP16-activation shader set - FP8 activation rounding kept in the pre block, the C=32 encoder and the 64/128 down
+    // stages, off everywhere else (spill/ notes section 12, "X2"): experimental/shaders-x2, and with ExperimentalInt4
+    // experimental/int4/shaders-x2. The small and original models have no such set: the key is ignored there. A missing
+    // folder: off, and the log says why. Off (the default) = the shaders as before, nothing else changes.
+    bool fp16act = false;
+    std::filesystem::path x2_shaders, x2_net;
+    if (experimental) {
+        std::string fe; if (const char* e = std::getenv("DLSSNR_FP16_ACT")) fe = e;
+        if (fe.empty()) {
+            FILE* f = nr::u8::fopen(nr::u8::text(data.parent_path() / "dlssnr-amd.ini"), "r");
+            if (f) {
+                char line[512]; std::string sec;
+                while (std::fgets(line, sizeof line, f)) {
+                    std::string t = line; const auto c = t.find_first_of(";#"); if (c != std::string::npos) t.resize(c);
+                    std::string u; for (char ch : t) if (!std::isspace(static_cast<unsigned char>(ch))) u += char(std::tolower(static_cast<unsigned char>(ch)));
+                    if (u.empty()) continue;
+                    if (u.front() == '[') { sec = u; continue; }
+                    if (sec == "[network]" && u.rfind("fp16activations=", 0) == 0) fe = u.substr(16);
+                }
+                std::fclose(f);
+            }
+        }
+        if (fe.empty() || fe == "1" || fe == "on" || fe == "true" || fe == "yes") {   // release/: on unless set off
+            bool i4 = false;
+#if NR_INT4
+            i4 = int4;
+#endif
+            std::error_code ec;
+            x2_shaders = xroot / "shaders-x2";
+            x2_net = i4 ? xroot / "int4" / "shaders-x2" : x2_shaders;
+            if (!std::filesystem::is_regular_file(x2_shaders / "fixed-attention.txt", ec) ||
+                !std::filesystem::is_directory(x2_shaders / "temporal", ec) ||
+                !std::filesystem::is_regular_file(x2_net / "fixed-attention.txt", ec))
+                nr::logf("[nr] FP16Activations requested but %s is incomplete: off", x2_net.string().c_str());
+            else {
+                fp16act = true;
+                nr::logf("[nr] FP16 activations (shaders %s)", x2_net.string().c_str());
+            }
+        }
+    }
     // Where the pass's own cost is measured. Two queries per ring slot. A queue
     // family is allowed to report no timestamp bits - then there is no pool, and
     // every accessor answers zero rather than a number made up from a clock.
@@ -1733,7 +1909,10 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         "--host-boundary", arena_reuse() ? "--reuse" : "--no-reuse", "--source-width", std::to_string(mw),
         "--source-height", std::to_string(mh), "--accumulation", config.accumulation,
         "--pipeline-cache", cache_file.string(),
-        "--lazy-images"};
+        };
+    // ours: upstream 0.0.8.2's lazy input copy / answer image not with reuse (its kernels bind tex_in / surf0 at build)
+    if (!config.reuse) arguments.push_back("--lazy-images");
+
     if (experimental || optimized) {   // CC_SMALL_FP8_EXPERIMENTAL, CC_SILVER_AARDWOLD_OPTIMIZED: their own shaders (ACO SPIR-V: kept with ACO Mode on) and pipeline caches
         const std::filesystem::path& var_root = experimental ? xroot : oroot;
         const std::filesystem::path var_cache = ((cache_data == data) ? var_root : (cache_data / var_root.filename())) / "pipeline.cache";
@@ -1756,6 +1935,11 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         }
     }
 #endif
+    if (fp16act)   // v9: the FP16-activation set, with its own pipeline cache next to it
+        for (size_t i = 0; i + 1 < arguments.size(); ++i) {
+            if (arguments[i] == "--spv-dir") arguments[i + 1] = x2_net.string();
+            if (arguments[i] == "--pipeline-cache") arguments[i + 1] = (x2_net.parent_path() / "pipeline-x2.cache").string();
+        }
     // The weights as one file (windows/build/pack_model.py); the names inside are
     // the relative paths the graph asks for under --unpacked.
 #if NR_INT4
@@ -1805,6 +1989,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         VkFormatProperties2 f2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &f3};
         vkGetPhysicalDeviceFormatProperties2(host.physical, unorm, &f2);
         impl_->direct_out = NR_DIRECT_OUT && NR_POST_ALPHA && impl_->direct_in && store_matches_blit &&
+                            !config.reuse &&
                             mask_config.width == 0 &&
                             (f3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT) &&
                             (f3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT);
@@ -1941,6 +2126,7 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             : std::filesystem::path(temporal_config.shaders));
         if (experimental) shaders = std::filesystem::canonical(xroot / "shaders" / "temporal");
         if (optimized) shaders = std::filesystem::canonical(oroot / "shaders" / "temporal");
+        if (fp16act) shaders = std::filesystem::canonical(x2_shaders / "temporal");
 #if NR_INT4
         // with the int4 layers, the temporal pre/post variants built with their network's defines: int4/shaders/temporal
         if (int4) shaders = std::filesystem::canonical(i4spv / "temporal");
@@ -2018,7 +2204,8 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         // the blit converts whatever the game hands over. With Motion Without Depth (the default, as NVIDIA's DLLs,
         // which never bind a depth) nothing copies into it or samples it (game_depth is false, the pre block's depth
         // branch is off): a 1x1 image fills the descriptor (4K: 33 MB).
-        t.depth = impl_->motion_without_depth ? s.ctx.image(1, 1, VK_FORMAT_R32_SFLOAT, true)
+        // Ours: reuse's Disocclusion reads the game's depth here even with Motion Without Depth: full size with reuse.
+        t.depth = impl_->motion_without_depth && !config.reuse ? s.ctx.image(1, 1, VK_FORMAT_R32_SFLOAT, true)
                                               : s.ctx.image(mw, mh, VK_FORMAT_R32_SFLOAT, true);
         vkDestroySampler(s.ctx.device, t.depth.sampler, nullptr);
         t.depth.sampler = linear_sampler();
@@ -2156,6 +2343,162 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
         NRVK_CHECK(vkAllocateMemory(host.device,&allocation,nullptr,&im.memory));
         NRVK_CHECK(vkBindImageMemory(host.device,im.handle,im.memory,0));
         s.ctx.transition(im,VK_IMAGE_LAYOUT_GENERAL);
+    }
+    if (config.reuse) {
+        if (!impl_->temporal.enabled || mask_config.width)
+            throw std::invalid_argument("temporal reuse needs the temporal path and no control mask");
+        auto& t = impl_->temporal;
+        impl_->reuse = true;
+        impl_->adapters_dir = adapters;
+        impl_->reuse_edit = s.ctx.image(mw, mh, VK_FORMAT_R16G16B16A16_SFLOAT, false);
+        s.ctx.transition(impl_->reuse_edit, VK_IMAGE_LAYOUT_GENERAL);
+        for (auto& a : impl_->reuse_acc) {
+            a = s.ctx.image(t.lw[0], t.lh[0], VK_FORMAT_R32G32_SFLOAT, false);
+            s.ctx.transition(a, VK_IMAGE_LAYOUT_GENERAL);
+        }
+        impl_->reuse_stat_buffer = s.ctx.buffer(32, true);   // plugin4: words 2-4 for CutDrop (16 before; 0-1 as before)
+        std::memset(impl_->reuse_stat_buffer.mapped, 0, 32);
+        impl_->reuse_stat.create(s.ctx, (adapters / "runtime_reuse_stat.spv").string(), {impl_->reuse_stat_buffer.handle}, 28,
+                                 {&t.flow[0]});
+        for (unsigned k = 0; k < 2; ++k)
+            impl_->reuse_stat_acc[k].create(s.ctx, (adapters / "runtime_reuse_stat.spv").string(),
+                                            {impl_->reuse_stat_buffer.handle}, 28, {&impl_->reuse_acc[k]});
+        if (std::filesystem::exists(adapters / "runtime_reuse_stat_max.spv") && std::filesystem::exists(adapters / "runtime_reuse_stat_accg.spv") &&
+            std::filesystem::exists(adapters / "runtime_reuse_stat3g.spv") && !(std::getenv("NR_SAVE3_ACC") && std::getenv("NR_SAVE3_ACC")[0] == '0')) {
+            for (unsigned k = 0; k < 2; ++k) {
+                impl_->reuse_stat_max[k].create(s.ctx, (adapters / "runtime_reuse_stat_max.spv").string(),
+                                                {impl_->reuse_stat_buffer.handle}, 36, {&impl_->reuse_acc[k]});
+                impl_->reuse_stat_accg[k].create(s.ctx, (adapters / "runtime_reuse_stat_accg.spv").string(),
+                                                 {impl_->reuse_stat_buffer.handle}, 36, {&impl_->reuse_acc[k]});
+            }
+            impl_->reuse_accg = true;
+        }
+        impl_->reuse_store.create(s.ctx, (adapters / "runtime_reuse_store.spv").string(), {}, 8,
+                                  {&s.tex_in, &s.surf0, &impl_->reuse_edit});
+        for (unsigned k = 0; k < 2; ++k) {
+            // writes acc[k], composes onto acc[k ^ 1]
+            impl_->reuse_motion[k].create(s.ctx, (adapters / "runtime_reuse_motion.spv").string(), {}, 20,
+                                          {&t.flow[0], &impl_->reuse_acc[k ^ 1], &impl_->reuse_acc[k]});
+            impl_->reuse_warp[k].create(s.ctx, (adapters / "runtime_reuse_warp.spv").string(),
+                                        {impl_->reuse_stat_buffer.handle}, 24,
+                                        {&s.tex_in, &s.surf0, &impl_->reuse_edit, &impl_->reuse_acc[k]});
+        }
+        // plugin3: EdgeDrop / Disocclusion. Missing files (a v2 shader folder): the fixes stay off, with a log line.
+        if (std::filesystem::exists(adapters / "runtime_reuse_warp3.spv") && std::filesystem::exists(adapters / "runtime_reuse_motion3.spv") &&
+            std::filesystem::exists(adapters / "runtime_reuse_stat3.spv")) {
+            impl_->reuse_dep = s.ctx.image(t.depth.w, t.depth.h, VK_FORMAT_R32_SFLOAT, false);
+            s.ctx.transition(impl_->reuse_dep, VK_IMAGE_LAYOUT_GENERAL);
+            for (unsigned k = 0; k < 2; ++k) {
+                impl_->reuse_stat_acc3[k].create(s.ctx, (adapters / "runtime_reuse_stat3.spv").string(),
+                                                 {impl_->reuse_stat_buffer.handle}, 28, {&impl_->reuse_acc[k]});
+                if (impl_->reuse_accg)
+                    impl_->reuse_stat_acc3g[k].create(s.ctx, (adapters / "runtime_reuse_stat3g.spv").string(),
+                                                      {impl_->reuse_stat_buffer.handle}, 36, {&impl_->reuse_acc[k]});
+                impl_->reuse_motion3[k].create(s.ctx, (adapters / "runtime_reuse_motion3.spv").string(), {}, 24,
+                                               {&t.flow[0], &impl_->reuse_acc[k ^ 1], &impl_->reuse_acc[k]});
+                impl_->reuse_warp3[k].create(s.ctx, (adapters / "runtime_reuse_warp3.spv").string(),
+                                             {impl_->reuse_stat_buffer.handle}, 48,
+                                             {&s.tex_in, &s.surf0, &impl_->reuse_edit, &impl_->reuse_acc[k], &t.depth, &impl_->reuse_dep});
+            }
+            impl_->reuse3 = true;
+        }
+        // plugin4: CutDrop. Missing files: CutDrop stays off, with a log line.
+        if (impl_->reuse3 && std::filesystem::exists(adapters / "runtime_reuse_warp4.spv") &&
+            std::filesystem::exists(adapters / "runtime_reuse_cut.spv")) {
+            const uint32_t gw = (t.lw[0] + 1) / 2, gh = (t.lh[0] + 1) / 2;
+            for (auto& l : impl_->reuse_cut_luma) { l = s.ctx.image(gw, gh, VK_FORMAT_R32_SFLOAT, false); s.ctx.transition(l, VK_IMAGE_LAYOUT_GENERAL); }
+            for (unsigned k = 0; k < 2; ++k) {
+                impl_->reuse_warp4[k].create(s.ctx, (adapters / "runtime_reuse_warp4.spv").string(),
+                                             {impl_->reuse_stat_buffer.handle}, 52,
+                                             {&s.tex_in, &s.surf0, &impl_->reuse_edit, &impl_->reuse_acc[k], &t.depth, &impl_->reuse_dep});
+                // reads luma[k ^ 1] (the previous frame's grid), writes luma[k]
+                impl_->reuse_cut[k].create(s.ctx, (adapters / "runtime_reuse_cut.spv").string(), {impl_->reuse_stat_buffer.handle}, 40,
+                                           {&s.tex_in, &t.flow[0], &impl_->reuse_cut_luma[k ^ 1], &impl_->reuse_cut_luma[k]});
+            }
+            static const bool v7cut = !(std::getenv("NR_V7_CUT") && !std::atoi(std::getenv("NR_V7_CUT")));
+            if (v7cut && std::filesystem::exists(adapters / "runtime_reuse_cut_terms.spv") &&
+                std::filesystem::exists(adapters / "runtime_reuse_cut_sum.spv")) {
+                impl_->reuse_cut_tbuf = s.ctx.buffer(VkDeviceSize(gw) * gh * 8);
+                for (unsigned k = 0; k < 2; ++k)
+                    impl_->reuse_cut_terms[k].create(s.ctx, (adapters / "runtime_reuse_cut_terms.spv").string(),
+                                                     {impl_->reuse_stat_buffer.handle, impl_->reuse_cut_tbuf.handle}, 40,
+                                                     {&s.tex_in, &t.flow[0], &impl_->reuse_cut_luma[k ^ 1], &impl_->reuse_cut_luma[k]});
+                impl_->reuse_cut_sum.create(s.ctx, (adapters / "runtime_reuse_cut_sum.spv").string(),
+                                            {impl_->reuse_stat_buffer.handle, impl_->reuse_cut_tbuf.handle}, 40);
+                impl_->reuse_cut_wide = true;
+            }
+            impl_->reuse4 = true;
+        }
+        // plugin5: Snap / Box / NearMV. Missing files: they stay off, with a log line.
+        if (impl_->reuse4 && std::filesystem::exists(adapters / "runtime_reuse_warp5.spv") &&
+            std::filesystem::exists(adapters / "runtime_reuse_snap_prep.spv") && std::filesystem::exists(adapters / "runtime_reuse_snap_box.spv") &&
+            std::filesystem::exists(adapters / "runtime_reuse_snap_apply.spv")) {
+            auto& r5 = *impl_;
+            r5.reuse_carry = s.ctx.image(mw, mh, VK_FORMAT_R16G16B16A16_SFLOAT, false);
+            s.ctx.transition(r5.reuse_carry, VK_IMAGE_LAYOUT_GENERAL);
+            r5.reuse_src = s.ctx.image(s.tex_in.w, s.tex_in.h, s.tex_in.format, true, false, false);
+            s.ctx.transition(r5.reuse_src, VK_IMAGE_LAYOUT_GENERAL);
+            if (std::filesystem::exists(adapters / "runtime_reuse_store_ema.spv") && r5.reuse_dep.handle)   // campfire/ [Reuse] Blend (after reuse_src: it binds it)
+                r5.reuse_store_ema.create(s.ctx, (adapters / "runtime_reuse_store_ema.spv").string(), {}, 44,
+                                          {&s.tex_in, &s.surf0, &r5.reuse_edit, &r5.reuse_carry, &t.flow[0], &t.depth, &r5.reuse_dep, &r5.reuse_src});
+            if (r5.reuse_store_ema.device && std::filesystem::exists(adapters / "runtime_reuse_store_guard.spv") &&   // guard/ [Reuse] Guard
+                std::filesystem::exists(adapters / "runtime_reuse_guard_terms.spv") && std::filesystem::exists(adapters / "runtime_reuse_guard_sum.spv")) {
+                r5.reuse_guard_bx = (mw + 15) / 16; r5.reuse_guard_by = (mh + 15) / 16;
+                r5.reuse_guard_stat = s.ctx.buffer(64, true);   // zeroed: no average yet, previous run not guarded
+                r5.reuse_guard_tbuf = s.ctx.buffer(VkDeviceSize(r5.reuse_guard_bx) * r5.reuse_guard_by * 8);
+                const std::vector<VkBuffer> gb{r5.reuse_guard_stat.handle, r5.reuse_guard_tbuf.handle};
+                const std::vector<nrvk::Context::Image*> gi{&s.tex_in, &s.surf0, &r5.reuse_edit, &r5.reuse_carry, &t.flow[0], &t.depth, &r5.reuse_dep, &r5.reuse_src};
+                r5.reuse_guard_terms.create(s.ctx, (adapters / "runtime_reuse_guard_terms.spv").string(), gb, 36, gi);
+                r5.reuse_guard_sum.create(s.ctx, (adapters / "runtime_reuse_guard_sum.spv").string(), gb, 20);
+                r5.reuse_store_guard.create(s.ctx, (adapters / "runtime_reuse_store_guard.spv").string(), gb, 44, gi);
+                r5.reuse_guard_ok = true;
+            }
+            r5.reuse_snap_cw = (mw + 3) / 4; r5.reuse_snap_ch = (mh + 3) / 4;
+            for (auto& im : r5.reuse_snap_img) {
+                im = s.ctx.image(r5.reuse_snap_cw, r5.reuse_snap_ch, VK_FORMAT_R32G32B32A32_SFLOAT, false);
+                s.ctx.transition(im, VK_IMAGE_LAYOUT_GENERAL);
+            }
+            // burn/: Moved's cell images (always made: warp5 binds them; 1/16 of the frame each)
+            r5.reuse_moved_cap = s.ctx.image(r5.reuse_snap_cw, r5.reuse_snap_ch, VK_FORMAT_R32_SFLOAT, false);
+            s.ctx.transition(r5.reuse_moved_cap, VK_IMAGE_LAYOUT_GENERAL);
+            r5.reuse_moved_now = s.ctx.image(r5.reuse_snap_cw, r5.reuse_snap_ch, VK_FORMAT_R32_SFLOAT, false);
+            s.ctx.transition(r5.reuse_moved_now, VK_IMAGE_LAYOUT_GENERAL);
+            if (std::filesystem::exists(adapters / "runtime_reuse_moved_prep.spv")) {
+                r5.reuse_moved_prep_cap.create(s.ctx, (adapters / "runtime_reuse_moved_prep.spv").string(), {}, 16, {&r5.reuse_src, &r5.reuse_moved_cap});
+                r5.reuse_moved_prep_now.create(s.ctx, (adapters / "runtime_reuse_moved_prep.spv").string(), {}, 16, {&s.tex_in, &r5.reuse_moved_now});
+                r5.reuse_moved_ok = true;
+            }
+            for (unsigned k = 0; k < 2; ++k)
+                r5.reuse_warp5[k].create(s.ctx, (adapters / (std::string("runtime_reuse_warp5") + ".spv")).string(), {r5.reuse_stat_buffer.handle}, 112,
+                                         {&s.tex_in, &s.surf0, &r5.reuse_edit, &r5.reuse_acc[k], &t.depth, &r5.reuse_dep, &r5.reuse_src,
+                                          &r5.reuse_carry, &r5.reuse_moved_cap, &r5.reuse_moved_now});
+            r5.reuse_snap_prep.create(s.ctx, (adapters / "runtime_reuse_snap_prep.spv").string(), {}, 16,
+                                      {&s.tex_in, &r5.reuse_carry, &r5.reuse_snap_img[0], &r5.reuse_snap_img[1]});
+            r5.reuse_snap_coef.create(s.ctx, (adapters / "runtime_reuse_snap_box.spv").string(), {}, 20,
+                                      {&r5.reuse_snap_img[0], &r5.reuse_snap_img[1], &r5.reuse_snap_img[2], &r5.reuse_snap_img[3]});
+            r5.reuse_snap_mean.create(s.ctx, (adapters / "runtime_reuse_snap_box.spv").string(), {}, 20,
+                                      {&r5.reuse_snap_img[2], &r5.reuse_snap_img[3], &r5.reuse_snap_img[4], &r5.reuse_snap_img[5]});
+            r5.reuse_snap_apply.create(s.ctx, (adapters / "runtime_reuse_snap_apply.spv").string(), {}, 24,
+                                       {&s.tex_in, &r5.reuse_carry, &r5.reuse_snap_img[4], &r5.reuse_snap_img[5], &s.surf0});
+            r5.reuse5 = true;
+            static const int v7wb = std::getenv("NR_V7_WB") ? std::atoi(std::getenv("NR_V7_WB")) : 1;
+            const std::string sfx = v7wb == 1 ? "_a16.spv" : "_a16n.spv";
+            if (v7wb && std::filesystem::exists(adapters / (std::string("runtime_reuse_warp5") + sfx)) &&
+                std::filesystem::exists(adapters / ("runtime_reuse_snap_apply" + sfx)) &&
+                std::filesystem::exists(adapters / "runtime_reuse_warp4_a16.spv")) {
+                for (unsigned k = 0; k < 2; ++k)
+                    r5.reuse_warp5d[k].create(s.ctx, (adapters / (std::string("runtime_reuse_warp5") + sfx)).string(), {r5.reuse_stat_buffer.handle}, 112,
+                                              {&s.tex_in, &s.surf0, &r5.reuse_edit, &r5.reuse_acc[k], &t.depth, &r5.reuse_dep, &r5.reuse_src,
+                                               &r5.reuse_carry, &r5.reuse_moved_cap, &r5.reuse_moved_now});
+                r5.reuse_snap_applyd.create(s.ctx, (adapters / ("runtime_reuse_snap_apply" + sfx)).string(), {}, 24,
+                                            {&s.tex_in, &r5.reuse_carry, &r5.reuse_snap_img[4], &r5.reuse_snap_img[5], &s.surf0});
+                for (unsigned k = 0; k < 2; ++k)
+                    r5.reuse_warp4d[k].create(s.ctx, (adapters / "runtime_reuse_warp4_a16.spv").string(), {r5.reuse_stat_buffer.handle}, 52,
+                                              {&s.tex_in, &s.surf0, &r5.reuse_edit, &r5.reuse_acc[k], &t.depth, &r5.reuse_dep});
+                r5.reuse_wbd = true;
+                nr::logf("[nr] v7: warp / Snap answer stored into the frame (%s)", v7wb == 1 ? "plain store" : "nearest-even first");
+            }
+        }
     }
     impl_->post_alpha = NR_POST_ALPHA && s.kern.count("fswinimagepost32");
     timer.mark("adapters");
@@ -2563,6 +2906,15 @@ void Runtime::set_history_strength(float v) {
 void Runtime::release_feature(uint64_t feature) {
     if (!feature) return;
     impl_->plain_seeds.erase(feature);
+    // Temporal reuse belongs to the feature that first used it; a host that rebuilds its feature (OptiScaler
+    // does when a setting changes) would otherwise find the stored edit owned by a feature that is gone, and
+    // the network would run on every frame from then on.
+    if (impl_->reuse_owned && impl_->reuse_feature == feature) {
+        impl_->reuse_owned = false;
+        impl_->reuse_feature = 0;
+        impl_->reuse_have = false;
+        impl_->reuse_since = 0;
+    }
     auto it = impl_->features.find(feature);
     if (it == impl_->features.end()) return;
     if (it->second.history.handle)
@@ -2669,6 +3021,115 @@ TemporalResult Runtime::record_temporal(VkCommandBuffer cmd, const ColourFrame& 
 
 bool Runtime::takes_target(const Controls& c) const {
     return c.enabled && c.apply_model && impl_->temporal.enabled;
+}
+
+// ---- plugin2: the host's frame hint, the arena's last user, the split cut picker -------------------------------------
+namespace {
+std::mutex g_hint_mutex;
+FrameHint g_hint;
+std::mutex g_arena_mutex;
+std::map<VkBuffer, const void*> g_arena_user;   // the runtime that recorded network work on an arena last
+// Per-step GPU ms of the small network (CC_SMALL_FP8, 71 steps) at 2258x1270 on the RX 7800 XT, measured
+// (split3/cutpick3: the chained graph's timestamps, a tile-counter chain's time shared out by an unchained run).
+constexpr double kSmallStepMs[71] = {3.4706933333333336,0.7928266666666667,0.8541263196344426,1.6060931195677708,1.1213346271193467,1.0038081997298567,0.08042499923136977,0.037127877224709484,0.10857341834901683,0.03662534495951305,0.0794067101676823,0.036321180693736264,0.14040486998922191,0.03743333333333333,0.02477333333333333,0.1311907249731901,0.13649154952593318,0.09911105883420994,0.08346086547338188,0.036529946148322896,0.12923749281977637,0.1341818130064622,0.09800988255205663,0.08247601981875592,0.03616585705850639,0.12810092188021457,0.13292833876723228,0.09698886247529073,0.08295319632654281,0.036375001175198596,0.1288737157215933,0.13377247813062226,0.09745894197937632,0.08264676822940026,0.036282152036593344,0.12844715893414652,0.1338992943568192,0.09737795977637409,0.08242916852055472,0.036177992345786336,0.12779512551035194,0.1342663830004858,0.0968246639561545,0.0825130860332328,0.036272448921109465,0.12827613181925104,0.13309490584033698,0.09703676071940291,0.08417307218242047,0.036997365208980636,0.13122991714385981,0.13591558277482477,0.09893072935658095,0.08741618574137665,0.03931714759195666,0.022619999999999994,0.009266666666666668,0.07739196674845474,0.03581702785889546,0.12005693333869645,0.03538742870627354,0.07715472542536501,0.03527842593620531,0.12773842266468227,0.03530407364680959,1.0130781569419305,1.064912180073207,1.3630539919928133,0.8754000000000001,0.8012533333333335,3.411613333333334};
+// The same for CC_SMALL_FP8_EXPERIMENTAL (exp/ RDNA3 port, 2026-11-21: ReLU MLPs, fixed attention + merged V/output projections in
+// the decoder's C=32 layers), measured the same way (exp/scripts/t6.sh + steptab.py: split3 runner, gsottr60, chained + unchained).
+constexpr double kExpStepMs[71] = {3.4732666666666665,0.7529933333333335,0.8072500283564594,1.4781743222806152,1.0727542459072175,1.009385910620439,0.08051381904797913,0.03711555068244546,0.10857486483420925,0.03711555068244545,0.07946449960300957,0.03662058868010132,0.14043061930507764,0.03736666666666666,0.02482,0.13105113101551757,0.13335016696130425,0.09684536868984482,0.08315880691807033,0.036480158436240265,0.1290888297768186,0.1341083032168261,0.09767723498537807,0.08210416144569128,0.036142590705181166,0.13045216332651324,0.13264427946303378,0.09648347172624719,0.08243402927375156,0.036165939697597814,0.12788154710886734,0.1350782651932296,0.09642021872655367,0.08239250426126682,0.0361555403286289,0.1278258764573533,0.1330431349287516,0.09679627735733282,0.08332686223903099,0.03640119719929471,0.12850864743311274,0.13325689571461427,0.09740639741394733,0.0834659764223475,0.03671712284298649,0.12971447889970952,0.13417439859900904,0.09799468990261402,0.0838935437185415,0.03686851522176258,0.13036052203537443,0.13475671734183753,0.0982540350158173,0.08579801892723043,0.03842864773943625,0.022666666666666665,0.009260000000000001,0.07741100148030312,0.036271413799960225,0.12015625492145553,0.035490970681160375,0.07692482379973928,0.03543339700846203,0.12780715631559175,0.035561338503347244,1.0064581665893377,1.033773675747332,1.2752184678199772,0.6519466666666668,0.58242,2.5644933333333335};
+constexpr double kRefPixels = 2258.0 * 1270.0;
+// Per-frame overheads of a split frame at 2258x1270 (ms), beyond its part's steps: the first part's frame (warp of the stored
+// edit, the capture copies), a middle part's (warp, the motion field kept), the last part's (store, replay, inputs put back,
+// warp). Measured on the RX 7800 XT (plugin2 harness, thirds 5,67, frames 6-59 medians, 10:37 AM); NR_SPLIT_OVH=<f>,<m>,<l>.
+constexpr double kSplitOvhFirst = 0.77, kSplitOvhMid = 0.62, kSplitOvhLast = 1.13;
+// cutpick3.py's rule: the N-part partition at step boundaries minimizing max/min of the part times (+ overheads).
+std::vector<uint32_t> pick_cuts(const std::vector<double>& est, int N, double of, double om, double ol) {
+    const int n = int(est.size());
+    if (N < 2 || N > n) return {};
+    std::vector<double> cum(size_t(n) + 1, 0.0);
+    for (int i = 0; i < n; ++i) cum[size_t(i) + 1] = cum[size_t(i)] + est[size_t(i)];
+    const int K = n + 1;
+    auto D = [&](int a, int b) { return cum[size_t(b)] - cum[size_t(a)] + (a == 0 ? of : b == n ? ol : om); };
+    const double mean = (cum[size_t(n)] + of + (N - 2) * om + ol) / N;
+    std::vector<double> sums;
+    for (int a = 0; a < K; ++a)
+        for (int b = a + 1; b < K; ++b) { const double d = D(a, b); if (d > 0 && d <= mean + 1e-9) sums.push_back(d); }
+    std::sort(sums.begin(), sums.end());
+    sums.erase(std::unique(sums.begin(), sums.end()), sums.end());
+    const double INF = 1e18;
+    double best = INF; std::vector<uint32_t> cuts;
+    std::vector<double> dp(static_cast<size_t>(K)), nd(static_cast<size_t>(K));
+    std::vector<std::vector<int>> arg(static_cast<size_t>(N), std::vector<int>(static_cast<size_t>(K), 0));
+    for (size_t q = sums.size(); q-- > 0;) {
+        const double m = sums[q];
+        if (best < INF && best <= mean / m) break;
+        std::fill(dp.begin(), dp.end(), INF); dp[0] = 0;
+        for (int j = 0; j < N; ++j) {
+            std::fill(nd.begin(), nd.end(), INF);
+            for (int b = 0; b < K; ++b) {
+                int am = 0;
+                for (int a = 0; a < b; ++a) {
+                    if (dp[size_t(a)] >= INF) continue;
+                    const double d = D(a, b);
+                    if (d < m - 1e-12) continue;
+                    const double v = std::max(dp[size_t(a)], d);
+                    if (v < nd[size_t(b)]) { nd[size_t(b)] = v; am = a; }
+                }
+                arg[size_t(j)][size_t(b)] = am;
+            }
+            dp.swap(nd);
+        }
+        if (dp[size_t(n)] >= INF) continue;
+        const double r = dp[size_t(n)] / m;
+        if (r < best - 1e-12) {
+            best = r; cuts.clear();
+            int b = n;
+            for (int j = N - 1; j > 0; --j) { b = arg[size_t(j)][size_t(b)]; cuts.push_back(uint32_t(b)); }
+            std::sort(cuts.begin(), cuts.end());
+        }
+    }
+    return cuts;
+}
+FrameHint frame_hint() { std::lock_guard<std::mutex> l(g_hint_mutex); return g_hint; }
+}  // namespace
+void set_frame_hint(const FrameHint& h) { std::lock_guard<std::mutex> l(g_hint_mutex); g_hint = h; }
+
+std::vector<uint32_t> Runtime::split_cuts(int parts, std::string* source) {
+    auto& sp = impl_->split;
+    auto it = sp.cuts.find(parts);
+    if (it != sp.cuts.end()) { if (source) *source = sp.cut_source[parts]; return it->second; }
+    const auto& st = impl_->session.steps;
+    const double px = double(impl_->mw) * double(impl_->mh), scale = px / kRefPixels;
+    std::vector<double> est(st.size());
+    std::string src;
+    if (impl_->network == NetworkModel::Small && st.size() == 71) {
+        const double* tab = impl_->experimental ? kExpStepMs : kSmallStepMs;
+        for (size_t i = 0; i < st.size(); ++i) est[i] = tab[i] * scale;
+        src = impl_->experimental ? "table: small experimental network, measured at 2258x1270, scaled by pixels"
+                                  : "table: small network, measured at 2258x1270, scaled by pixels";
+    } else {
+        double sum = 0;
+        for (size_t i = 0; i < st.size(); ++i) { est[i] = double(st[i].gx) * st[i].gy * st[i].gz; sum += est[i]; }
+        for (auto& e : est) e = sum > 0 ? e / sum * 22.387 * scale : 0.0;
+        src = "modelled: workgroups per step (no measured table for this network)";
+    }
+    double of = kSplitOvhFirst, om = kSplitOvhMid, ol = kSplitOvhLast;
+    if (const char* e = std::getenv("NR_SPLIT_OVH")) std::sscanf(e, "%lf,%lf,%lf", &of, &om, &ol);
+    std::vector<uint32_t> cuts = pick_cuts(est, parts, of * scale, om * scale, ol * scale);
+    // NR_SPLIT_CUTS=c1,c2,..: fixed cuts (tests), used when there are parts - 1 of them, ascending, inside the network
+    if (const char* e = std::getenv("NR_SPLIT_CUTS")) {
+        std::vector<uint32_t> v; std::string t(e); size_t a = 0;
+        while (a < t.size()) { size_t b = t.find(',', a); if (b == std::string::npos) b = t.size();
+                               v.push_back(uint32_t(std::atoi(t.substr(a, b - a).c_str()))); a = b + 1; }
+        bool ok = int(v.size()) == parts - 1;
+        for (size_t k = 0; ok && k < v.size(); ++k) ok = v[k] >= 1 && v[k] < st.size() && (k == 0 || v[k] > v[k - 1]);
+        if (ok) { cuts = v; src += "; cuts fixed by NR_SPLIT_CUTS"; }
+    }
+    std::string list;
+    for (uint32_t c : cuts) list += (list.empty() ? "" : ",") + std::to_string(c);
+    nr::logf("[nr] Split over %d frames: cuts %s (%s; frame overheads first / middle / last %.2f / %.2f / %.2f ms at 2258x1270)",
+             parts, list.empty() ? "none" : list.c_str(), src.c_str(), of, om, ol);
+    sp.cuts[parts] = cuts; sp.cut_source[parts] = src;
+    if (source) *source = src;
+    return cuts;
 }
 
 EngineResult Runtime::record_engine(VkCommandBuffer cmd, const EngineFrame& frame,
@@ -2841,12 +3302,206 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 tgt->after == VK_IMAGE_LAYOUT_PREINITIALIZED))
         throw std::invalid_argument("invalid NR target frame");
     const VkImage wb = tgt ? tgt->image : frame.image;
+    // Temporal reuse: does this frame take part, and does it skip the network? Decided once, here, from the
+    // controls and the stored state; everything below only reads `reuse_frame` and `reuse_skip`.
+    // The motion is the engine's, or the fallback estimator's when the game provides none (record_temporal).
+    bool reuse_frame = impl_->reuse && temporal && c.reuse_every >= 2 && c.apply_model && passes == 1 &&
+                       !mask;
+    if (reuse_frame) {
+        if (!impl_->reuse_owned) { impl_->reuse_owned = true; impl_->reuse_feature = temporal->feature; }
+        else if (impl_->reuse_feature != temporal->feature) reuse_frame = false;
+    }
+    bool reuse_skip = false;
+    // plugin2: Split and Phase. Off (Split 0, Phase 0, or no jitter): nothing below changes what is recorded.
+    enum class SplitKind { Off, Whole, Wait, Part, Last };
+    SplitKind sk = SplitKind::Off;
+    size_t sk_lo = 0, sk_hi = 0;
+    bool sk_capture = false, sk_slot_in = false, sk_ring_add = false;
+    int sk_slot = -1, sk_cap = -1, sk_lag = 0;
+    auto& sp = impl_->split;
+    const bool split_on = reuse_frame && engine && c.reuse_split && c.reuse_every >= 2 && c.reuse_every <= 8 && !impl_->split.off;
+    bool sk_zero = false;   // a cycle dropped after some of its parts ran: the arena's tile counters are behind (zero them)
+    // Ours (merge/): Split left with a cycle in flight - Split or reuse switched off, Every 1 (NR Control's live switches): the cycle
+    // is dropped as any other, its parts' tile counters zeroed (sk_zero) before this frame's network. (Was: left as it was - every
+    // later wait timed out, ~245 ms a frame, until Split came back.)
+    if (!split_on && (sp.active || sp.pending >= 0)) {
+        if (sp.active && sp.j > 0) sk_zero = true;
+        ++sp.dropped;
+        sp.active = false; sp.pending = -1; sp.ring_n = 0; sp.n = 0;
+    }
+    static const bool split_trace = std::getenv("NR_SPLIT_TRACE") != nullptr;
+    static const bool no_cpu_gate = std::getenv("NR_REUSE_NO_CPU_GATE") != nullptr;   // tests: as split3's no_cpu_gate
+    bool lite_skip = false, aligned = false; int phase = 0; float jx = 0, jy = 0; bool jit = false;
+    if (reuse_frame) {
+        uint32_t rw = 0, dw = 0; uint64_t serial = 0;
+        if (engine && engine->jitter_known) {
+            jit = true; jx = engine->jitter_x; jy = engine->jitter_y; rw = engine->render_width; dw = engine->display_width;
+            serial = engine->serial;
+        } else if (engine) {
+            const FrameHint h = frame_hint();
+            if (h.jitter_known) { jit = true; jx = h.jitter_x; jy = h.jitter_y; rw = h.render_width; dw = h.display_width; }
+            serial = engine->serial ? engine->serial : h.serial;
+        }
+        phase = jit ? std::clamp(c.reuse_phase, 0, 2) : 0;
+        // FSR 4 Lite lossy's skip rule (its prepass): jitter x < 0, and below half the display width also not jitter y < -1/6
+        const bool skip_parity = jit && jx < 0.0f && (!rw || !dw || 2u * rw >= dw || !(jy < -1.0f / 6.0f));
+        lite_skip = skip_parity && !temporal->reset;
+        aligned = phase == 1 ? lite_skip : phase == 2 ? jit && !skip_parity && !temporal->reset : false;
+        if (jit) ++sp.jitter_frames;
+        const int64_t f = ++sp.frame;
+        const int N = c.reuse_every;
+        ++sp.win_frames; if (lite_skip) ++sp.lite_skip_frames;
+        if (aligned) sp.last_aligned = f;
+        // Alternating jitter gives an aligned frame at f or f - 1. None in the last 2 frames: the game is in a stretch where Lite
+        // does not skip (static jitter, a menu, another jitter pattern): schedule as Phase 0 (no waiting for a frame that does not
+        // come) until aligned frames come back; the next cycle then lands on one again.
+        if (phase != 0 && f - sp.last_aligned > 2) { phase = 0; ++sp.fallback_frames; }
+        reuse_skip = impl_->reuse_have && !temporal->reset && impl_->reuse_since + 1 < uint32_t(c.reuse_every);
+        if (!split_on && phase != 0) {
+            // option A: the network on aligned frames, scheduled every N frames on average (odd N: gaps N-1, N+1)
+            const bool run_now = sp.ideal < 0 || (aligned && f >= sp.ideal - 1) || f >= sp.ideal + 1;
+            reuse_skip = impl_->reuse_have && !temporal->reset && !run_now;
+        }
+        if (split_on) {
+            // [Reuse] Every changed (ours, merge/: NR Control's live switch): a cycle in flight is dropped as any other - its parts
+            // that ran left the arena's tile counters behind (sk_zero), and this frame runs the whole network. (Was: the
+            // schedule alone reset - every later wait timed out, ~200 ms a frame, for good: Elden Ring 11-23.)
+            bool n_changed = false;
+            if (sp.n != N) {
+                n_changed = sp.n != 0;
+                if (sp.active && sp.j > 0) sk_zero = true;
+                if (n_changed && (sp.active || sp.pending >= 0)) ++sp.dropped;
+                sp.n = N; sp.active = false; sp.pending = -1; sp.ring_n = 0;
+            }
+            const std::vector<uint32_t> cuts = split_cuts(N);
+            sp.last_parts = N;
+            bool drop = !impl_->reuse_have || temporal->reset || cuts.size() != size_t(N - 1) || n_changed;
+            if (serial && sp.last_serial && serial != sp.last_serial + 1) drop = true;   // a frame this runtime did not see
+            if (serial) sp.last_serial = serial;
+            {
+                std::lock_guard<std::mutex> l(g_arena_mutex);
+                const auto a = g_arena_user.find(impl_->session.act.handle);
+                if (a != g_arena_user.end() && a->second != impl_.get() && sp.frame > 0) {   // another runtime used the network memory
+                    drop = true;
+                    if (!sp.off) nr::logf("[nr] Split: another network run used this network's memory between two parts; Split is off "
+                                          "for this runtime from now on (reuse as with Split = 0)");
+                    sp.off = true; sk_zero = true;
+                }
+            }
+            if (!sp.made) {
+                auto& ss = impl_->session;
+                nrvk::ImageHeap* saved = ss.ctx.heap; ss.ctx.heap = nullptr;
+                const auto& t0 = impl_->temporal;
+                for (int k = 0; k < 2; ++k) {
+                    sp.col[k] = ss.ctx.image(ss.tex_in.w, ss.tex_in.h, ss.tex_in.format, true, false, false);
+                    sp.flow[k] = ss.ctx.image(t0.lw[0], t0.lh[0], VK_FORMAT_R32G32_SFLOAT, false, false);
+                    if (t0.depth.handle) sp.dep[k] = ss.ctx.image(t0.depth.w, t0.depth.h, t0.depth.format, false, false);
+                }
+                sp.live_col = ss.ctx.image(ss.tex_in.w, ss.tex_in.h, ss.tex_in.format, true, false, false);
+                sp.live_flow = ss.ctx.image(t0.lw[0], t0.lh[0], VK_FORMAT_R32G32_SFLOAT, false, false);
+                for (auto& r : sp.ring) r = ss.ctx.image(t0.lw[0], t0.lh[0], VK_FORMAT_R32G32_SFLOAT, false, false);
+                ss.ctx.heap = saved;
+                sp.made = true;
+            }
+            if (!drop) {
+                const int64_t ns = sp.active ? f + (N - sp.j) : std::max(sp.next_slot, f);
+                const bool want = sp.pending < 0 &&
+                    (phase == 0 ? (!sp.active && sp.next_slot <= f)
+                                : ((aligned && ns <= f + 1) || (!sp.active && sp.next_slot + 1 <= f)));
+                if (want) {
+                    const int k = sp.active ? (sp.cs ^ 1) : (sp.cs < 0 ? 0 : (sp.cs ^ 1));
+                    sp.pending = k; sp.slot[k].frame = f; sp.slot[k].aligned = aligned; sp.slot[k].lite_skip = lite_skip;
+                    sk_capture = true; sk_cap = k;
+                    ++sp.net_runs; if (lite_skip) ++sp.net_runs_lite_skip;
+                }
+                bool started = false;
+                if (!sp.active && sp.pending >= 0 && sp.next_slot <= f) {
+                    sp.active = true; sp.cs = sp.pending; sp.pending = -1; sp.j = 0; started = true;
+                    ++sp.starts; if (sp.slot[sp.cs].aligned) ++sp.starts_aligned;
+                    sk_lag = int(f - sp.slot[sp.cs].frame); ++(sk_lag == 0 ? sp.lag0 : sp.lag1);
+                }
+                (void)started;
+                if (sp.active) {
+                    const int j = sp.j;
+                    sk_lo = j == 0 ? 0 : cuts[size_t(j) - 1];
+                    sk_hi = j == N - 1 ? impl_->session.steps.size() : cuts[size_t(j)];
+                    sk = j == N - 1 ? SplitKind::Last : SplitKind::Part;
+                    sk_slot = sp.cs;
+                    sk_slot_in = sk == SplitKind::Last || (j == 0 && sp.slot[sp.cs].frame != f);
+                    sk_ring_add = sk != SplitKind::Last && sp.slot[sp.cs].frame < f;
+                } else {
+                    sk = SplitKind::Wait; ++sp.waits;
+                    sk_ring_add = sp.pending >= 0 && sp.slot[sp.pending].frame < f;
+                }
+                if (sk_ring_add && sp.ring_n >= Impl::kSplitRing) drop = true;
+            }
+            if (drop) {
+                if (sp.active && sp.j > 0) sk_zero = true;
+                if (sp.active || sp.pending >= 0) ++sp.dropped;
+                sk = SplitKind::Whole; sk_capture = false; sk_ring_add = false; sk_slot_in = false;
+                sp.active = false; sp.pending = -1; sp.ring_n = 0;
+            }
+            reuse_skip = sk != SplitKind::Whole;
+        }
+        // The motion of the previous frames, as the last finished stat dispatch left it, carried for as many
+        // frames as the edit would have to be.
+            const float moved = *static_cast<const volatile float*>(impl_->reuse_stat_buffer.mapped);
+        if (split_trace) {   // save3/ trace: word 1 (accumulated mean; 0 = the shortcut, or no motion) and 5 as the last frame left them
+            const volatile uint32_t* w = static_cast<const volatile uint32_t*>(impl_->reuse_stat_buffer.mapped);
+            float w1; const uint32_t b1 = w[1]; std::memcpy(&w1, &b1, 4);
+            std::fprintf(stderr, "SAVE3 frame %lld acc %.6g word5 %08x fresh %d\n", (long long)sp.frame, double(w1), unsigned(w[5]), int(impl_->reuse_stat_fresh));
+        }
+        if (moved == moved && moved >= 0.0f && (c.reuse_gate_run || impl_->reuse_stat_fresh)) {   // save3/: GateRun 0: sampled frames only
+            const float per1080 = moved * 1920.0f / float(impl_->mw);
+            impl_->reuse_motion_sum += per1080; ++impl_->reuse_motion_samples;
+            impl_->reuse_motion_peak = std::max(impl_->reuse_motion_peak, per1080);
+        }
+        if (reuse_skip && !no_cpu_gate && c.reuse_gate_run && sk != SplitKind::Last) {
+            const float limit = c.reuse_gate * float(impl_->mw) / 1920.0f;
+            if (!(moved * float(impl_->reuse_since + 1) <= limit)) {   // also true of NaN
+                reuse_skip = false;
+                info.reuse_gated = true;
+                ++impl_->reuse_gate_trips;
+                if (split_on) {   // the whole network now; the half-done cycle is dropped
+                    if (sp.active && sp.j > 0) sk_zero = true;
+                    if (sp.active || sp.pending >= 0) ++sp.dropped;
+                    sk = SplitKind::Whole; sk_capture = false; sk_ring_add = false; sk_slot_in = false;
+                    sp.active = false; sp.pending = -1; sp.ring_n = 0;
+                }
+            }
+        }
+        if (!impl_->reuse_have || temporal->reset) impl_->reuse_since = 0;
+        {
+            const int64_t f = sp.frame; const int N = c.reuse_every;
+            if (split_on && sk == SplitKind::Whole) {
+                sp.next_slot = f + N; ++sp.whole; ++sp.net_runs; if (lite_skip) ++sp.net_runs_lite_skip;
+            }
+            if (!split_on && !reuse_skip) {
+                const bool on_time = sp.ideal >= 0 && f >= sp.ideal - 1 && f <= sp.ideal + 1 && !info.reuse_gated && !temporal->reset;
+                sp.ideal = on_time ? sp.ideal + N : f + N;
+                ++sp.net_runs; if (lite_skip) ++sp.net_runs_lite_skip;
+            }
+            if (split_trace)
+                std::fprintf(stderr, "SPLIT frame %lld kind %d part %d/%d capture %d slot %d lag %d ring %d jit %d jx %.4f jy %.4f lite_skip %d aligned %d phase %d skip %d gated %d\n",
+                             (long long)f, int(sk), sk == SplitKind::Part || sk == SplitKind::Last ? sp.j + 1 : 0, split_on ? N : 0,
+                             int(sk_capture), sk_slot, sk_lag, sp.ring_n, int(jit), double(jx), double(jy), int(lite_skip), int(aligned),
+                             phase, int(reuse_skip), int(info.reuse_gated));
+        }
+    } else if (impl_->reuse && (!temporal || !impl_->reuse_owned || impl_->reuse_feature == temporal->feature)) {
+        // Reuse is not in use by the feature that owns the stored edit (or by a frame that has no feature):
+        // the edit goes stale as soon as a frame is answered another way.
+        impl_->reuse_have = false;
+        impl_->reuse_since = 0;
+    }
+    // The network frame after skipped ones has no usable history: its predecessor in the history image is
+    // the last network frame, several frames of motion back.
+    const bool reuse_after_skip = reuse_frame && !reuse_skip && impl_->reuse_since > 0;
     // The caller's colour (and depth) sampled in place, when this frame allows
     // it: see Impl::DirectSrc. Null means the copies below, as always.
     const Impl::DirectSrc* ds = nullptr;
     // post_alpha: no alpha pass - after the network only the write-back touches the frame.
     const bool colour_direct =
-        NR_DIRECT_SAMPLE && !impl_->direct_src_failed && impl_->post_alpha && engine &&
+        NR_DIRECT_SAMPLE && !impl_->reuse && !impl_->direct_src_failed && impl_->post_alpha && engine &&
         temporal && !mask && passes == 1 &&
         impl_->temporal.pingpong && impl_->transfer != Transfer::Encoded &&
         (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && frame.width == nw && frame.height == nh;
@@ -2855,7 +3510,107 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // t.depth as before, and the colour is sampled in place (and the answer stored) anyway.
     // The game's depth, when the network reads it: with Motion Without Depth (the default, as NVIDIA's DLL) it is
     // neither bound nor copied.
-    const bool game_depth = engine && engine->depth.image && !impl_->motion_without_depth;
+    const bool game_depth_net = engine && engine->depth.image && !impl_->motion_without_depth;
+    // plugin3: EdgeDrop / Disocclusion this frame. Disocclusion reads the game's depth into temporal.depth even when the network does
+    // not (Motion Without Depth): the network's params keep their depth flag 0, so it is shown exactly what it was.
+    const bool fx_edge = reuse_frame && c.reuse_edge_drop == 1 && impl_->reuse3;
+    const bool fx_fill = reuse_frame && c.reuse_edge_drop == 2 && impl_->reuse3;
+    const bool fx_disocc = reuse_frame && c.reuse_disocc && impl_->reuse3 && engine && engine->depth.image;
+    if (reuse_frame && (c.reuse_edge_drop || c.reuse_disocc) && !impl_->reuse3 && !impl_->reuse3_logged) {
+        impl_->reuse3_logged = true;
+        nr::logf("[nr] [Reuse] EdgeDrop / Disocclusion asked for, but runtime_reuse_warp3.spv / motion3 / stat3 are missing from "
+                 "the shader folder: both stay off");
+    }
+    const bool game_depth = game_depth_net || fx_disocc;
+    // plugin5: Snap / Box / NearMV this frame (NearMV needs this frame's depth: with Disocclusion only)
+    const bool fx5_any = reuse_frame && (c.reuse_snap || c.reuse_box || c.reuse_nearmv || c.reuse_moved || c.reuse_disocc_fill);
+    if (fx5_any && !impl_->reuse5 && !impl_->reuse3_logged) {
+        impl_->reuse3_logged = true;
+        nr::logf("[nr] [Reuse] Snap / Box / NearMV asked for, but runtime_reuse_warp5.spv / snap_*.spv are missing: they stay off");
+    }
+    const bool fx5 = fx5_any && impl_->reuse5;
+    // armfix/: MotionRes this frame (made on first use; a later change of the divisor keeps the first one)
+    auto& hi = impl_->hi;
+    const int hi_div = c.reuse_motion_res == 1 || c.reuse_motion_res == 2 ? c.reuse_motion_res : 0;
+    bool hi_on = reuse_frame && fx5 && engine && engine->motion.image && hi_div && !hi.failed;
+    if (reuse_frame && hi_div && !fx5 && !hi.logged) { hi.logged = true;
+        nr::logf("[nr] [Reuse] MotionRes needs the warp5 path (DisoccFill, Snap, Box or NearMV on): it stays off"); }
+    if (hi_on && !hi.made) {
+        try {
+            auto& ss = impl_->session;
+            nrvk::ImageHeap* saved = ss.ctx.heap; ss.ctx.heap = nullptr;
+            hi.div = hi_div; hi.w = (impl_->mw + uint32_t(hi_div) - 1) / uint32_t(hi_div); hi.h = (impl_->mh + uint32_t(hi_div) - 1) / uint32_t(hi_div);
+            auto mk = [&](nrvk::Context::Image& im) { im = ss.ctx.image(hi.w, hi.h, VK_FORMAT_R32G32_SFLOAT, false, false); im.layout = VK_IMAGE_LAYOUT_GENERAL; };
+            mk(hi.flow); mk(hi.acc[0]); mk(hi.acc[1]);
+            for (auto& r : hi.ring) mk(r);
+            ss.ctx.heap = saved;
+            const auto& ad = impl_->adapters_dir; auto& r5 = *impl_; auto& tt = impl_->temporal;
+            for (unsigned k = 0; k < 2; ++k) {
+                hi.motion[k].create(ss.ctx, (ad / "runtime_reuse_motion3.spv").string(), {}, 24, {&hi.flow, &hi.acc[k ^ 1], &hi.acc[k]});
+                hi.warp5[k].create(ss.ctx, (ad / (std::string("runtime_reuse_warp5") + ".spv")).string(), {r5.reuse_stat_buffer.handle}, 112,
+                                   {&ss.tex_in, &ss.surf0, &r5.reuse_edit, &hi.acc[k], &tt.depth, &r5.reuse_dep, &r5.reuse_src,
+                                    &r5.reuse_carry, &r5.reuse_moved_cap, &r5.reuse_moved_now});
+                if (r5.reuse_wbd) {
+                    static const int v7wb = std::getenv("NR_V7_WB") ? std::atoi(std::getenv("NR_V7_WB")) : 1;
+                    const std::string sfx = v7wb == 2 ? "_a16r.spv" : "_a16.spv";
+                    hi.warp5d[k].create(ss.ctx, (ad / (std::string("runtime_reuse_warp5") + sfx)).string(), {r5.reuse_stat_buffer.handle}, 112,
+                                        {&ss.tex_in, &ss.surf0, &r5.reuse_edit, &hi.acc[k], &tt.depth, &r5.reuse_dep, &r5.reuse_src,
+                                         &r5.reuse_carry, &r5.reuse_moved_cap, &r5.reuse_moved_now});
+                }
+            }
+            const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 * 2 * Impl::kSplitRing}};
+            VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            pi.maxSets = 2 * Impl::kSplitRing; pi.poolSizeCount = 1; pi.pPoolSizes = sizes;
+            if (vkCreateDescriptorPool(ss.ctx.device, &pi, nullptr, &hi.pool) != VK_SUCCESS) throw std::runtime_error("MotionRes descriptor pool");
+            for (int r = 0; r < Impl::kSplitRing; ++r)
+                for (unsigned k = 0; k < 2; ++k) {
+                    hi.ring_set[r][k] = kernel_set(ss.ctx.device, hi.pool, hi.motion[k], {}, {&hi.ring[r], &hi.acc[k ^ 1], &hi.acc[k]});
+                    if (!hi.ring_set[r][k]) throw std::runtime_error("MotionRes descriptor set");
+                }
+            hi.made = true;
+            nr::logf("[nr] [Reuse] MotionRes %d: the carried edit's motion accumulated at %ux%u (1/4 field %ux%u), %.1f MB",
+                     hi_div, hi.w, hi.h, impl_->temporal.lw[0], impl_->temporal.lh[0], double(hi.w) * hi.h * 8.0 * (3 + Impl::kSplitRing) / 1048576.0);
+        } catch (const std::exception& e) {
+            hi.failed = true; hi_on = false;
+            nr::logf("[nr] [Reuse] MotionRes could not be set up (%s): it stays off", e.what());
+        }
+    }
+    if (hi_on && hi.div != hi_div) {
+        hi_on = false;
+        if (!hi.logged) { hi.logged = true; nr::logf("[nr] [Reuse] MotionRes changed from %d to %d: needs a restart, the carried edit uses the 1/4 field until then", hi.div, hi_div); }
+    }
+    if (hi_on && !hi.laid) {
+        for (auto* im : {&hi.flow, &hi.acc[0], &hi.acc[1]})
+            barrier(cmd, im->handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        for (auto& im : hi.ring)
+            barrier(cmd, im.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        hi.laid = true;
+    }
+    hi.flow_ok = false;
+    // plugin4: CutDrop this frame
+    const bool fx_cut = reuse_frame && c.reuse_cut_drop > 0.0f && impl_->reuse4;
+    if (reuse_frame && c.reuse_cut_drop > 0.0f && !impl_->reuse4 && !impl_->reuse3_logged) {
+        impl_->reuse3_logged = true;
+        nr::logf("[nr] [Reuse] CutDrop asked for, but runtime_reuse_warp4.spv / runtime_reuse_cut.spv are missing: it stays off");
+    }
+    if (fx_cut) {
+        if (split_trace) {   // the change the GPU measured on the previous reuse frame (read a frame late; the harness waits per frame)
+            float ch; uint32_t cb = static_cast<const volatile uint32_t*>(impl_->reuse_stat_buffer.mapped)[2]; std::memcpy(&ch, &cb, 4);
+            std::fprintf(stderr, "CUTCHANGE frame %lld change %.5f bits %08x ema %08x\n", (long long)impl_->split.frame - 1, double(ch), cb,
+                         static_cast<const volatile uint32_t*>(impl_->reuse_stat_buffer.mapped)[4]);
+        }
+        const uint32_t seen = static_cast<const volatile uint32_t*>(impl_->reuse_stat_buffer.mapped)[3];
+        if (seen != impl_->reuse_cut_seen) {
+            impl_->reuse_cut_seen = seen; ++impl_->reuse_cuts;
+            float change; uint32_t bits = static_cast<const volatile uint32_t*>(impl_->reuse_stat_buffer.mapped)[2];
+            std::memcpy(&change, &bits, 4);
+            nr::logf("[nr] [Reuse] CutDrop: cut detected at reuse frame %u (mean luma change %.3f, CutChange %.3f); carried edits from "
+                     "before it are dropped until a fresh one lands (%llu cuts so far)", seen ? seen - 1u : 0u, double(change),
+                     double(c.reuse_cut_change), (unsigned long long)impl_->reuse_cuts);
+        }
+    } else impl_->reuse_cut_have = false;
     const bool depth_in_place = colour_direct && game_depth &&
         engine->depth.format == VK_FORMAT_R32_SFLOAT && (engine->depth.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
         engine->depth_x == 0 && engine->depth_y == 0 &&
@@ -2864,7 +3619,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // linearly filterable format, whatever the pass count (every pass reads the
     // frame's vectors), as NVIDIA's DLL reads them.
     const bool motion_direct =
-        NR_DIRECT_MOTION && !impl_->motion_src_failed && engine && temporal && !mask && engine->motion.image &&
+        NR_DIRECT_MOTION && !impl_->reuse && !impl_->motion_src_failed && engine && temporal && !mask && engine->motion.image &&
         (engine->motion.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && impl_->filters_linearly(engine->motion.format);
     // (research NR_DIRECT_STORE=1): the post block stores into the frame itself.
     // With a separate target (storage-capable) the post block stores into it and the
@@ -2880,7 +3635,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     // the plain path (no temporal, no engine frame) samples the caller's colour in place
     // too - the input copy goes. Research switch NR_PLAIN_DIRECT=0 turns it off.
     static const bool plain_env = !(std::getenv("NR_PLAIN_DIRECT") && !std::atoi(std::getenv("NR_PLAIN_DIRECT")));
-    const bool plain_direct = plain_env && !temporal && !engine && !mask && passes == 1 && impl_->plain_pre &&
+    const bool plain_direct = plain_env && !impl_->reuse && !temporal && !engine && !mask && passes == 1 && impl_->plain_pre &&
         impl_->plain_post && !impl_->direct_src_failed && impl_->post_alpha &&
         impl_->transfer != Transfer::Encoded && (frame.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
         frame.width == nw && frame.height == nh;
@@ -2908,6 +3663,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
     if (sets && sets->cview) ds = sets;
     if (!ds) impl_->materialize(cmd, true, true);   // the frame could not be sampled in place: the copies
     const bool stored = ds && ds->store;
+    bool wb_direct = false;   // v7: the warp / Snap apply stored the answer into the frame itself
     const bool depth_direct = ds && ds->dview != VK_NULL_HANDLE;   // the caller's depth bound in place
     const bool mv_direct = sets && sets->mview;
     barrier(cmd, frame.image, frame.before, ds ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -2999,15 +3755,21 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         }
         fs = &it->second;
     }
-    bool gate = false;
+    bool gate = false, flow_open = false;
     uint32_t pre_seed = 0;
+    float frame_params[12] = {};
+    bool frame_depth = false, net_stamped = false, ran_steps = false;
+    bool disocc_now = false;   // plugin3: this frame's depth is in temporal.depth for Disocclusion (the network's frame_depth unchanged)
     if (temporal) {
         // The original's gate, all three terms, resolved here and nowhere else:
         // the first-frame latch, DLSSNR.Reset, and a motion source existing at
         // all.
         Impl::InputDomain& previous = fs ? fs->input : impl_->input_single;
         const bool domain_changed = !(input == previous);
-        gate = (fs ? fs->latch : t.latch) && !temporal->reset && !domain_changed;
+        const bool history_open = (fs ? fs->latch : t.latch) && !temporal->reset && !domain_changed;
+        gate = history_open && !reuse_after_skip;
+        if (sk == SplitKind::Part || sk == SplitKind::Last) gate = false;
+        flow_open = history_open;
         previous = input;
         // The pre block's noise seed, the DLL's rule: a counter in the pre node
         // (+0xc8) handed to the kernel and then incremented (0x180060f44), zeroed
@@ -3057,6 +3819,19 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             barrier(cmd, t.flow[0].handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+            if (hi_on) {   // armfix/ MotionRes: the same vectors into the carried edit's own field
+                barrier(cmd, hi.flow.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                VkImageBlit mh = mv;
+                mh.dstOffsets[1] = {int32_t(hi.w), int32_t(hi.h), 1};
+                vkCmdBlitImage(cmd, engine->motion.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hi.flow.handle, VK_IMAGE_LAYOUT_GENERAL, 1, &mh,
+                               c.reuse_motion_res_filter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+                barrier(cmd, hi.flow.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+                hi.flow_ok = true;
+            }
             barrier(cmd, engine->motion.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     engine->motion.after, VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_ACCESS_TRANSFER_READ_BIT, engine->motion.after_stage,
@@ -3151,7 +3926,9 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             dispatch(cmd, t.luma_kernel[p][k], (t.lw[k]+7)/8, (t.lh[k]+7)/8, 1, &lp, sizeof lp);
             compute_barrier(cmd);
         }
-        if (gate && !engine) {
+        // The estimator's flow also runs on the network frame after skipped ones, whose history gate is closed:
+        // the motion of that frame is what the gate reads next.
+        if (flow_open && !engine) {
             for (int k = int(kTemporalLevels) - 1; k >= 0; --k) {
                 const bool first = unsigned(k) == kTemporalLevels - 1, last = k == 0;
                 Temporal::FlowPush fp{t.lw[k], t.lh[k],
@@ -3194,6 +3971,87 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         vkCmdUpdateBuffer(cmd,t.params.handle,0,sizeof params,params);
         b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,0,nullptr,1,&b,0,nullptr);
+        std::memcpy(frame_params, params, sizeof params);
+        frame_depth = have_depth;
+        disocc_now = fx_disocc && !impl_->depth_unread;
+    }
+    // plugin2: split copies. Our images rest in GENERAL; tex_in in SHADER_READ_ONLY_OPTIMAL.
+    auto xcopy = [&](const nrvk::Context::Image& src, VkImageLayout sl, const nrvk::Context::Image& dst, VkImageLayout dl) {
+        barrier(cmd, src.handle, sl, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        barrier(cmd, dst.handle, dl, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageCopy r{};
+        r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.extent = {src.w, src.h, 1};
+        vkCmdCopyImage(cmd, src.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+        barrier(cmd, src.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sl, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        barrier(cmd, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dl, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    };
+    const VkImageLayout kG = VK_IMAGE_LAYOUT_GENERAL, kIn = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    auto write_params = [&](const float* p) {
+        auto& tt = impl_->temporal;
+        VkBufferMemoryBarrier b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        b.srcAccessMask=VK_ACCESS_SHADER_READ_BIT;b.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+        b.buffer=tt.params.handle;b.size=VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,1,&b,0,nullptr);
+        vkCmdUpdateBuffer(cmd,tt.params.handle,0,sizeof(float) * 12,p);
+        b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,0,nullptr,1,&b,0,nullptr);
+    };
+    // the cycle's input frame put in place of this frame's (tex_in, the motion field, depth, params)
+    auto slot_in = [&](int k) {
+        auto& tt = impl_->temporal;
+        xcopy(sp.col[k], kG, s.tex_in, kIn);
+        xcopy(sp.flow[k], kG, tt.flow[0], kG);
+        if (frame_depth && sp.dep[k].handle) xcopy(sp.dep[k], kG, tt.depth, kG);
+        write_params(sp.slot[k].params);
+    };
+    if (sk_zero) {
+        // The graph's tile counters and sync words count whole graph executions (nr_graph.cpp NR_TCHAIN): a cycle stopped
+        // after a part that ran half a chain leaves them behind, and every later wait would time out. The arena as a build
+        // leaves it (zero), as NrSession::retarget makes it for a new plan: the next network starts like a first frame.
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        vkCmdFillBuffer(cmd, s.act.handle, 0, (VkDeviceSize(s.arena_total) + 3) / 4 * 4, 0);
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        ++sp.zeroed;
+        if (split_trace) std::fprintf(stderr, "SPLITZERO frame %lld\n", (long long)sp.frame);
+    }
+    if (sk != SplitKind::Off && !sp.laid) {
+        for (auto* im : {&sp.col[0], &sp.col[1], &sp.flow[0], &sp.flow[1], &sp.dep[0], &sp.dep[1], &sp.live_col, &sp.live_flow})
+            if (im->handle) barrier(cmd, im->handle, VK_IMAGE_LAYOUT_UNDEFINED, kG, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        for (auto& im : sp.ring)
+            barrier(cmd, im.handle, VK_IMAGE_LAYOUT_UNDEFINED, kG, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        sp.laid = true;
+    }
+    if (sk_capture) {
+        auto& tt = impl_->temporal;
+        xcopy(s.tex_in, kIn, sp.col[sk_cap], kG);
+        xcopy(tt.flow[0], kG, sp.flow[sk_cap], kG);
+        if ((frame_depth || disocc_now) && sp.dep[sk_cap].handle) xcopy(tt.depth, kG, sp.dep[sk_cap], kG);
+        sp.slot[sk_cap].dep_ok = disocc_now && sp.dep[sk_cap].handle;
+        std::memcpy(sp.slot[sk_cap].params, frame_params, sizeof frame_params);
+        sp.slot[sk_cap].params[0] = 0.0f;   // the history gate closed, as on the network frame after skipped ones
+        sp.slot[sk_cap].hg = false;
+        sp.slot[sk_cap].seed = pre_seed;
+    }
+    // campfire/ HistoryGate: set below, after this frame's motion step (the slot then takes the accumulated motion back to the previous
+    // network input frame and an open gate)
+    const bool hg_capture = sk_capture && c.reuse_hist_gate >= 1 && temporal && !temporal->reset && impl_->reuse_have && !mv_direct &&
+                            impl_->reuse_edit_from >= 0;
+    bool hg_now = false;
+    if (sk_ring_add) {
+        hi.ring_ok[sp.ring_n] = hi_on && hi.flow_ok;
+        if (hi.ring_ok[sp.ring_n]) xcopy(hi.flow, kG, hi.ring[sp.ring_n], kG);   // armfix/ MotionRes
+        xcopy(impl_->temporal.flow[0], kG, sp.ring[sp.ring_n++], kG);
     }
     if (!temporal && !mask) {
         // No motion source: the seed is 0 unless Controls::noise_every_frame, then the DLL's counter.
@@ -3228,7 +4086,7 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         if (impl_->bound_feature) {
             auto prev = impl_->features.find(impl_->bound_feature);
             if (prev != impl_->features.end() && prev->second.history.handle) {
-                if (!prev->second.cleared) {   // made at the start of this recording: still UNDEFINED
+                if (!prev->second.cleared) {   // made at the start of this recording (ensure_history): still UNDEFINED
                     barrier(cmd, prev->second.history.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
                     prev->second.history.layout = VK_IMAGE_LAYOUT_GENERAL;
@@ -3241,14 +4099,14 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             // Never swapped out: it starts from zeros - what copying its cleared image in gave.
             const nrvk::Context::Image& h = t.hist(t.hcur);
             barrier(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
             VkClearColorValue zero{};
             VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdClearColorImage(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
             barrier(cmd, h.handle, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
             fs->cleared = true;
             impl_->bound_feature = temporal->feature;
         } else {
@@ -3294,24 +4152,35 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
     }
     // The pass (one: a caller stacks passes as runs of its own).
-    for (uint32_t pass = 0; pass < passes; ++pass) {
-        ColourFrame shot_in{}, shot_out{};
-        const bool snapshot = c.model_capture && pass + 1 == passes;
-        if (snapshot) {
-            shot_in.image = ds ? frame.image : s.tex_in.handle;
-            shot_in.format = ds ? frame.format : s.tex_in.format;
-            shot_in.width = shot_out.width = nw; shot_in.height = shot_out.height = nh;
-            shot_in.before = shot_in.after = ds ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            shot_out.image = ds && ds->store ? wb : s.surf0.handle;
-            shot_out.format = ds && ds->store ? frame.format : s.surf0.format;
-            shot_out.before = shot_out.after = VK_IMAGE_LAYOUT_GENERAL;
-            c.model_capture(cmd, shot_in, shot_out, false);
+    if (reuse_frame) {
+        struct { uint32_t w, h; float sx, sy, px, py; uint32_t word; } sp{t.lw[0], t.lh[0], engine ? engine->motion_scale_x : 1.0f,
+                                                                         engine ? engine->motion_scale_y : 1.0f, float(nw), float(nh), 0u};
+        // save3/: at GateRun 0 only every kStatEvery-th reuse frame (the log's motion figures); NR_SAVE3_STAT=0: every frame as before
+        static const bool stat_all = std::getenv("NR_SAVE3_STAT") && std::getenv("NR_SAVE3_STAT")[0] == '0';
+        impl_->reuse_stat_fresh = c.reuse_gate_run || stat_all || impl_->reuse_stat_n++ % Impl::kStatEvery == 0;
+        if (impl_->reuse_stat_fresh)
+        dispatch(cmd, impl_->reuse_stat, 1, 1, 1, &sp, sizeof sp);
+        if (fx_cut) {
+            // plugin4: the cut detector, on every reuse frame (its grid must follow every frame), before any warp of this frame
+            const uint32_t k = impl_->reuse_cut_k ^= 1u;
+            struct { uint32_t w, h, mw, mh; float sx, sy; uint32_t frame; float threshold; uint32_t have; float ratio; } cp{
+                impl_->reuse_cut_luma[0].w, impl_->reuse_cut_luma[0].h, t.lw[0], t.lh[0], engine ? engine->motion_scale_x : 1.0f,
+                engine ? engine->motion_scale_y : 1.0f, uint32_t(impl_->split.frame), c.reuse_cut_change, impl_->reuse_cut_have ? 1u : 0u, 4.0f};
+            static_assert(sizeof cp == 40, "cut push");
+            if (impl_->reuse_cut_wide) {
+                dispatch(cmd, impl_->reuse_cut_terms[k], (cp.w * cp.h + 63u) / 64u, 1, 1, &cp, sizeof cp);
+                compute_barrier(cmd);
+                dispatch(cmd, impl_->reuse_cut_sum, 1, 1, 1, &cp, sizeof cp);
+            } else
+            dispatch(cmd, impl_->reuse_cut[k], 1, 1, 1, &cp, sizeof cp);
+            impl_->reuse_cut_have = true;
         }
-        const bool time_net = impl_->timing_ok && impl_->split_timing;
-        const uint32_t net_query = timing_slot * impl_->timing_stride + 2 + 2 * pass;
-        if (c.network_timestamp) c.network_timestamp(cmd, true);
-        if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query);
-        for (size_t i = 0; i < s.steps.size(); ++i) {
+        compute_barrier(cmd);
+        reuse_skip ? ++impl_->reuse_skipped : ++impl_->reuse_ran;
+    }
+    auto run_steps = [&](size_t lo, size_t hi) {
+        if (lo < hi) ran_steps = true;
+        for (size_t i = lo; i < hi; ++i) {
             const auto& step = s.steps[i];
             const nrvk::Kernel* use = step.k;
             if (mask && step.k==impl_->original_pre) use = &impl_->mask_pre;
@@ -3365,23 +4234,398 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
             // stays full, because the passes that follow it are not part of
             // either contract - they were not built with device-scoped loads
             // and the arena is not the only thing they read.
-            const bool last = i + 1 >= s.steps.size();
+            // plugin2: `hi` is the end of this call's steps (a split part ends with the full barrier).
+            const bool last = i + 1 >= hi;
             // C=512 dispatches joined by tile counters (nr_graph.cpp NR_TCHAIN) have no barrier.
             if (!last && i < s.runner.no_barrier_after.size() && s.runner.no_barrier_after[i]) continue;
             compute_barrier(cmd, s.runner.exec_barrier && !last,
                             s.runner.inv_barrier && !last);
         }
+    };
+    // plugin3: the accumulation step (EdgeDrop: runtime_reuse_motion3 with its flag; off: the original kernel and push, as v2)
+    auto accumulate = [&](uint32_t next, bool first, float sx, float sy, int ring = -1) {
+        auto& tt = impl_->temporal;
+        struct { uint32_t w, h; float sx, sy; uint32_t first, edge; } mp{tt.lw[0], tt.lh[0], sx, sy, first ? 1u : 0u, 1u};
+        if (fx_edge) dispatch(cmd, impl_->reuse_motion3[next], (tt.lw[0] + 7) / 8, (tt.lh[0] + 7) / 8, 1, &mp, 24);
+        else dispatch(cmd, impl_->reuse_motion[next], (tt.lw[0] + 7) / 8, (tt.lh[0] + 7) / 8, 1, &mp, 20);
+        // armfix/ MotionRes: the same step at the carried edit's own size (from its field, or the split ring's copy of it); a step whose
+        // field is missing (the key came on inside a cycle) leaves `steps` behind, and the warp then reads the 1/4 accumulator
+        if (hi_on && hi.made) {
+            const bool have = ring >= 0 ? hi.ring_ok[ring] : hi.flow_ok;
+            if (first) hi.steps = 0;
+            if (have && hi.steps == (first ? 0u : impl_->reuse_since)) {
+                struct { uint32_t w, h; float sx, sy; uint32_t first, edge; } hp{hi.w, hi.h, sx, sy, first ? 1u : 0u, fx_edge ? 1u : 0u};
+                dispatch(cmd, hi.motion[next], (hi.w + 7) / 8, (hi.h + 7) / 8, 1, &hp, 24, ring >= 0 ? hi.ring_set[ring][next] : VK_NULL_HANDLE);
+                ++hi.steps;
+            }
+        }
+    };
+    // plugin3: the stored edit's frame's depth (Disocclusion), taken where the edit is stored, from temporal.depth as that frame had it
+    auto keep_edit_depth = [&](int64_t from, const nrvk::Context::Image& src, bool ok) {
+        impl_->reuse_edit_from = from;
+        if (fx5 && (c.reuse_box == 2 || (c.reuse_moved & 1) || c.reuse_disocc_fill == 4 || c.reuse_relit)) xcopy(s.tex_in, kIn, impl_->reuse_src, kG);   // armfix/: + Relit   // visfix/: + DisoccFill 4   // plugin5 Box 2 / burn Moved: the edit's input colour
+        if (fx5 && ((c.reuse_moved & 1) || (c.reuse_relit && c.reuse_relit != 8)) && impl_->reuse_moved_ok) {   // burn/: its cell means for Moved's colour test (armfix/: and Relit)
+            compute_barrier(cmd);
+            struct { uint32_t w, h, cw, ch; } mp{nw, nh, impl_->reuse_snap_cw, impl_->reuse_snap_ch};
+            dispatch(cmd, impl_->reuse_moved_prep_cap, (mp.cw + 7) / 8, (mp.ch + 7) / 8, 1, &mp, sizeof mp);
+            compute_barrier(cmd);
+        }
+        if (fx_disocc && ok && src.handle) {
+            xcopy(src, kG, impl_->reuse_dep, kG);
+            impl_->reuse_dep_ok = true;
+        } else impl_->reuse_dep_ok = false;
+    };
+    if (sk == SplitKind::Last) {
+        // plugin2: the cycle's last part on its input frame, the edit stored, the motion since replayed, then this
+        // frame's own input back for the warp below.
+        auto& tt = impl_->temporal;
+        // v7 (NR_V7_LAST, default on): this frame's input is not saved: it is copied in again from the frame afterwards (the
+        // frame's bits are unchanged until the warp writes it; the same copy as at the frame's start)
+        static const bool v7last = !(std::getenv("NR_V7_LAST") && !std::atoi(std::getenv("NR_V7_LAST")));
+        const bool relive = v7last && impl_->direct_in && !ds && frame.width == s.tex_in.w && frame.height == s.tex_in.h;
+        if (!relive)
+        xcopy(s.tex_in, kIn, sp.live_col, kG);
+        xcopy(tt.flow[0], kG, sp.live_flow, kG);
+        slot_in(sk_slot);
+        const bool time_net = impl_->timing_ok && impl_->split_timing;
+        const uint32_t net_query = timing_slot * impl_->timing_stride + 2;
+        if (c.network_timestamp) c.network_timestamp(cmd, true);
+        if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query);
+        run_steps(sk_lo, sk_hi);
+        if (time_net) { vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query + 1); net_stamped = true; }
+        if (c.network_timestamp) c.network_timestamp(cmd, false);
+        struct { uint32_t w, h; } stp{nw, nh};
+        auto& rb = *impl_;
+        if (c.reuse_blend > 0.0f && c.reuse_blend < 1.0f && sp.slot[sk_slot].hg && rb.reuse_store_ema.device && rb.reuse_have && rb.reuse_dep_ok &&
+            sp.slot[sk_slot].dep_ok) {
+            // campfire/ [Reuse] Blend: the previous stored edit (copied: it is overwritten here) mixed in at its source
+            xcopy(rb.reuse_edit, kG, rb.reuse_carry, kG);
+            compute_barrier(cmd);
+            // the colour test needs reuse_src to hold the previous edit frame's input (copied when Relit / DisoccFill 4 / Box 2 / Moved are on)
+            const bool src_kept = c.reuse_box == 2 || (c.reuse_moved & 1) || c.reuse_disocc_fill == 4 || c.reuse_relit;
+            struct { uint32_t w, h, mw, mh, dw, dh, inv; float alpha, disocc, ck0, ck1; } bp{nw, nh, tt.lw[0], tt.lh[0], tt.depth.w, tt.depth.h,
+                uint32_t(engine && engine->depth_inverted ? 1u : 0u), c.reuse_blend, c.reuse_disocc_threshold > 0.0f ? c.reuse_disocc_threshold : 0.1f,
+                c.reuse_blend_k0, src_kept ? c.reuse_blend_k1 : 0.0f};
+            static_assert(sizeof bp == 44, "store_ema push");
+            if (c.reuse_guard > 0.0f && rb.reuse_guard_ok) {
+                // guard/ [Reuse] Guard: how much the whole look moved since the previous run (16x16 block means), then the store with the
+                // alpha guard_sum chose (Blend, or GuardAlpha for a jump)
+                if (split_trace) {   // the previous run's figures (read a run late; the harness waits per frame)
+                    const auto* w = static_cast<const volatile uint32_t*>(rb.reuse_guard_stat.mapped); float a, e, j, sh;
+                    uint32_t wa = w[0], we = w[1], wj = w[3], ws = w[6]; std::memcpy(&a, &wa, 4); std::memcpy(&e, &we, 4); std::memcpy(&j, &wj, 4); std::memcpy(&sh, &ws, 4);
+                    std::fprintf(stderr, "GUARD before frame %lld: last run jump %.3f ema %.3f alpha %.3f guarded %u share %.2f (guarded %u of %u)\n",
+                                 (long long)sp.frame, double(j), double(e), double(a), w[2], double(sh), w[4], w[5]);
+                }
+                struct { uint32_t w, h, mw, mh, dw, dh, inv; float disocc; uint32_t bx; } gp{nw, nh, tt.lw[0], tt.lh[0], tt.depth.w, tt.depth.h,
+                    uint32_t(engine && engine->depth_inverted ? 1u : 0u), c.reuse_disocc_threshold > 0.0f ? c.reuse_disocc_threshold : 0.1f, rb.reuse_guard_bx};
+                static_assert(sizeof gp == 36, "guard_terms push");
+                dispatch(cmd, rb.reuse_guard_terms, (nw + 15) / 16, (nh + 15) / 16, 1, &gp, sizeof gp);
+                compute_barrier(cmd);
+                struct { uint32_t blocks; float ratio, floor_, galpha, blend; } sp2{((nw + 15) / 16) * ((nh + 15) / 16), c.reuse_guard, c.reuse_guard_floor,
+                    c.reuse_guard_alpha, c.reuse_blend};
+                static_assert(sizeof sp2 == 20, "guard_sum push");
+                dispatch(cmd, rb.reuse_guard_sum, 1, 1, 1, &sp2, sizeof sp2);
+                compute_barrier(cmd);
+                dispatch(cmd, rb.reuse_store_guard, (nw + 7) / 8, (nh + 7) / 8, 1, &bp, sizeof bp);
+            } else
+            dispatch(cmd, rb.reuse_store_ema, (nw + 7) / 8, (nh + 7) / 8, 1, &bp, sizeof bp);
+            if (split_trace) std::fprintf(stderr, "BLEND frame %lld alpha %.3f\n", (long long)sp.frame, double(c.reuse_blend));
+        } else
+        dispatch(cmd, impl_->reuse_store, (nw + 7) / 8, (nh + 7) / 8, 1, &stp, sizeof stp);
+        compute_barrier(cmd);
+        impl_->reuse_have = true;
+        impl_->reuse_since = 0;
+        keep_edit_depth(sp.slot[sk_slot].frame, sp.dep[sk_slot], sp.slot[sk_slot].dep_ok);
+        // the split run's post wrote hwrite (the pair is the same on every part: the slot moves only here); with
+        // upstream 0.0.9's history rotation the feature's slot follows it (was: hcur ^= 1, the fixed pair)
+        if (tt.pingpong) {
+            tt.hcur = tt.hwrite;
+            if (fs && impl_->rotation()) fs->slot = int(tt.hwrite);
+        }
+        for (int r = 0; r < sp.ring_n; ++r) {
+            xcopy(sp.ring[r], kG, tt.flow[0], kG);
+            const bool first = impl_->reuse_since == 0;
+            const uint32_t next = first ? 0u : impl_->reuse_acc_cur ^ 1u;
+            accumulate(next, first, engine->motion_scale_x, engine->motion_scale_y, r);
+            compute_barrier(cmd);
+            impl_->reuse_acc_cur = next;
+            ++impl_->reuse_since;
+        }
+        if (relive) {
+            nrvk::Context::Image fi = s.tex_in; fi.handle = frame.image; fi.w = frame.width; fi.h = frame.height;
+            xcopy(fi, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.tex_in, kIn);
+        } else
+        xcopy(sp.live_col, kG, s.tex_in, kIn);
+        xcopy(sp.live_flow, kG, tt.flow[0], kG);
+        sp.ring_n = 0; sp.active = false; sp.next_slot = sp.frame + 1; ++sp.cycles;
+    }
+    if (sk == SplitKind::Part && sp.j == 0) pre_seed = sp.slot[sk_slot].seed;
+    if (reuse_skip) {
+        // No network. The answer is this frame's own input plus the stored edit carried by the motion since.
+        const bool first = impl_->reuse_since == 0;
+        const uint32_t next = first ? 0u : impl_->reuse_acc_cur ^ 1u;
+        accumulate(next, first, engine ? engine->motion_scale_x : 1.0f, engine ? engine->motion_scale_y : 1.0f);
+        compute_barrier(cmd);
+        if (hg_capture && sp.slot[sk_cap].frame == sp.frame) {
+            // campfire/ HistoryGate: the motion accumulated from this frame back to the stored edit's input frame (= the previous network
+            // run's input: its history), normalized uv (the accumulator's units: scale 1, field covering the frame) and the gate open
+            xcopy(impl_->reuse_acc[next], kG, sp.flow[sk_cap], kG);
+            float* pp = sp.slot[sk_cap].params;
+            pp[3] *= std::clamp(c.reuse_hist_strength, 0.0f, 1.0f);   // campfire/ HistoryStrength: the history's weight on these runs
+            pp[0] = c.reuse_hist_gate == 1 ? 1.0f : 0.0f; pp[1] = 1.0f; pp[2] = 1.0f; pp[8] = 1.0f; pp[9] = 1.0f; pp[10] = 0.0f; pp[11] = 0.0f;
+            sp.slot[sk_cap].hg = true;
+            hg_now = sk == SplitKind::Part && sp.j == 0 && !sk_slot_in && sk_slot == sk_cap;   // part 0 runs on this very frame
+            if (split_trace) std::fprintf(stderr, "HISTGATE frame %lld since %u now %d\n", (long long)sp.frame, impl_->reuse_since + 1, int(hg_now));
+        }
+        // the accumulated motion's mean length, for the fade
+        struct { uint32_t w, h; float sx, sy, px, py; uint32_t word; } ap{t.lw[0], t.lh[0], 1.0f, 1.0f, float(nw), float(nh), 1u};
+        // save3/: the fade limit the warp below gets (the same expression as each warp path's), a wide max pass, then the sum only when
+        // the max says the fade could act (exact: save3/NOTES.md); fields over 2^24 texels (the bound's range) take the plain pass
+        const float fade_lim = (fx_cut ? std::min(c.reuse_gate, c.reuse_cut_drop) : c.reuse_gate) * float(nw) / 1920.0f;
+        if (impl_->reuse_accg && uint64_t(ap.w) * ap.h <= (1ull << 24)) {
+            struct { decltype(ap) a; float limit; uint32_t sentinel; } gp{ap, fade_lim, fx_edge ? 1u : 0u};
+            static_assert(sizeof gp == 36, "stat gate push");
+            const uint32_t n = ap.w * ap.h;
+            dispatch(cmd, impl_->reuse_stat_max[next], (n + 4095u) / 4096u, 1, 1, &gp, sizeof gp);
+            compute_barrier(cmd);
+            dispatch(cmd, fx_edge ? impl_->reuse_stat_acc3g[next] : impl_->reuse_stat_accg[next], 1, 1, 1, &gp, sizeof gp);
+        } else
+        dispatch(cmd, fx_edge ? impl_->reuse_stat_acc3[next] : impl_->reuse_stat_acc[next], 1, 1, 1, &ap, sizeof ap);
+        compute_barrier(cmd);
+        // plugin3: Disocclusion needs this frame's depth (read above) and the stored edit's (keep_edit_depth)
+        const bool warp_disocc = disocc_now && impl_->reuse_dep_ok;
+        // v7: the answer straight into the frame (the write-back blit goes)
+        Impl::WbSet* wbs = nullptr;
+        if ((fx5 || fx_cut) && impl_->reuse_wbd && c.apply_model && !mask && !stored && impl_->transfer == Transfer::DirectBlit &&
+            (tgt ? tgt->format : frame.format) == VK_FORMAT_R16G16B16A16_SFLOAT &&
+            ((tgt ? tgt->usage : frame.usage) & VK_IMAGE_USAGE_STORAGE_BIT) && (tgt || !ds) &&
+            (tgt ? tgt->width : frame.width) == nw && (tgt ? tgt->height : frame.height) == nh) {
+            for (auto& w : impl_->wb_sets) if (w.image == wb) wbs = &w;
+            if (!wbs) {
+                Impl::WbSet w; w.image = wb; const VkDevice dev = s.ctx.device;
+                VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                vi.image = wb; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+                vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
+                    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 40}};
+                VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+                pi.maxSets = 5; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
+                if (vkCreateImageView(dev, &vi, nullptr, &w.view) == VK_SUCCESS &&
+                    vkCreateDescriptorPool(dev, &pi, nullptr, &w.pool) == VK_SUCCESS) {
+                    auto& r5 = *impl_;
+                    nrvk::Context::Image a = s.surf0; a.handle = wb; a.view = w.view; a.layout = VK_IMAGE_LAYOUT_GENERAL; a.sampler = VK_NULL_HANDLE;
+                    for (unsigned k = 0; k < 2; ++k)
+                        w.w5[k] = kernel_set(dev, w.pool, r5.reuse_warp5d[k], {r5.reuse_stat_buffer.handle},
+                                             {&s.tex_in, &a, &r5.reuse_edit, &r5.reuse_acc[k], &t.depth, &r5.reuse_dep, &r5.reuse_src, &r5.reuse_carry,
+                                              &r5.reuse_moved_cap, &r5.reuse_moved_now});
+                    for (unsigned k = 0; k < 2; ++k)
+                        w.w4[k] = kernel_set(dev, w.pool, r5.reuse_warp4d[k], {r5.reuse_stat_buffer.handle},
+                                             {&s.tex_in, &a, &r5.reuse_edit, &r5.reuse_acc[k], &t.depth, &r5.reuse_dep});
+                    w.ap = kernel_set(dev, w.pool, r5.reuse_snap_applyd, {},
+                                      {&s.tex_in, &r5.reuse_carry, &r5.reuse_snap_img[4], &r5.reuse_snap_img[5], &a});
+                    if (w.w5[0] && w.w5[1] && w.ap && w.w4[0] && w.w4[1]) { impl_->wb_sets.push_back(w); wbs = &impl_->wb_sets.back(); }
+                }
+            }
+            if (wbs) {
+                if (tgt) barrier(cmd, wb, tgt->before, VK_IMAGE_LAYOUT_GENERAL, tgt->before_stage, tgt->before_access,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+                else barrier(cmd, wb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+            }
+        }
+        wb_direct = wbs != nullptr;
+        if (fx5) {
+            // plugin5: warp5 = warp4 (+ the cut drop when CutDrop is on) + Box / NearMV; with Snap the edit goes to `carry` and the
+            // guided-filter passes write the answer
+            const float lim = (fx_cut ? std::min(c.reuse_gate, c.reuse_cut_drop) : c.reuse_gate) * float(nw) / 1920.0f;
+            const bool near_ok = warp_disocc || disocc_now;
+            const uint32_t f5 = uint32_t(std::clamp(c.reuse_box, 0, 2)) | (near_ok ? uint32_t(std::clamp(c.reuse_nearmv, 0, 2)) << 2 : 0u) |
+                                (c.reuse_snap ? 16u : 0u);
+            struct { uint32_t w, h, mw, mh, round_u8; float limit; uint32_t flags; float feather, disocc; uint32_t inverted, dw, dh, from1;
+                     uint32_t flags5; float k0, k1, sigma; } wp{
+                nw, nh, t.lw[0], t.lh[0], uint32_t(impl_->round_u8), lim,
+                (fx_edge ? 1u : 0u) | (warp_disocc ? 2u : 0u) | (fx_fill ? 4u : 0u) | (fx_cut ? 8u : 0u), std::max(c.reuse_edge_feather, 0.0f),
+                std::max(c.reuse_disocc_threshold, 1.0e-4f), engine && engine->depth_inverted ? 1u : 0u, t.depth.w, t.depth.h,
+                uint32_t(impl_->reuse_edit_from + 1), f5, c.reuse_box_k0, std::max(c.reuse_box_k1, c.reuse_box_k0 + 1.0e-4f),
+                std::max(c.reuse_nearmv_sigma, 1.0e-3f)};
+            static_assert(sizeof wp == 68, "warp5 push");
+            // burn/: Moved's push (after warp5's 68 bytes); the colour test only with its cells (else that bit is dropped)
+            uint32_t mv_bits = uint32_t(c.reuse_moved) & 15u;
+            if ((mv_bits & 1u) && !impl_->reuse_moved_ok) {
+                mv_bits &= ~1u;
+                if (!impl_->reuse_moved_logged) { impl_->reuse_moved_logged = true;
+                    nr::logf("[nr] [Reuse] Moved's colour test asked for, but runtime_reuse_moved_prep.spv is missing: that test stays off"); }
+            }
+            if ((mv_bits & 3u) == 0u) mv_bits = 0u;
+            if (c.reuse_disocc_fill) mv_bits |= 16u;   // burn/ DisoccFill
+            if (c.reuse_disocc_fill == 2) mv_bits |= 32u;   //   2: the innermost matching ring only
+            if (c.reuse_disocc_fill == 3) mv_bits |= 64u;   //   3: rings at 1-4 x the radius (not the object's rim)
+            if (c.reuse_disocc_fill == 4) mv_bits |= 64u | 128u;   //   visfix/ 4: as 3, samples weighted by colour match (edit frame's input vs now)
+            if (c.reuse_disocc_fill == 5) mv_bits |= 64u | 256u;   //   visfix/ 5: as 3, the outermost matching ring only
+            if (c.reuse_disocc_fill && c.reuse_disocc_fill_mix < 1.0f) mv_bits |= 512u;   //   visfix/ DisoccFillMix
+            if (c.reuse_disocc_fill >= 3 && c.reuse_fill_rim) mv_bits |= 524288u;   //   rim/ DisoccFillRim: the hole's fallback samples
+            if (c.reuse_disocc && c.reuse_disocc_motion) mv_bits |= 2097152u;   //   rim/ DisoccMotion: threshold x (1 + moved px / 16)
+            struct { decltype(wp) a; uint32_t moved; float mk0, mk1, mrad, md0, md1; uint32_t cw, ch; float fill_r; float rl0, rl1; } wpm{wp, mv_bits, c.reuse_moved_k0,
+                std::max(c.reuse_moved_k1, c.reuse_moved_k0 + 1.0e-4f), std::max(c.reuse_moved_radius, 1.0f), c.reuse_moved_d0,
+                std::max(c.reuse_moved_d1, c.reuse_moved_d0 + 1.0e-4f), impl_->reuse_snap_cw, impl_->reuse_snap_ch,
+                std::max(c.reuse_disocc_fill_radius, 1.0f), 0.0f, 1.0f};
+            static_assert(sizeof wpm == 112, "warp5 push + Moved + Fill + Relit");
+            const bool relit = c.reuse_relit >= 1 && c.reuse_relit <= 9 && impl_->reuse_moved_ok && !(mv_bits & 3u);   // armfix/
+            const bool relit_cells = relit && c.reuse_relit != 8;
+            if (relit) {
+                const int r = c.reuse_relit;
+                wpm.moved |= 4096u | (r == 2 ? 8192u : 0u) | (r == 3 || r == 5 || r == 7 || r >= 8 ? 16384u : 0u) | (r == 4 || r == 5 || r >= 8 ? 32768u : 0u) | (r == 6 || r == 7 ? 65536u : 0u) |
+                             (r >= 8 ? 131072u : 0u) | (r == 8 ? 262144u : 0u);
+                wpm.rl0 = c.reuse_relit_k0; wpm.rl1 = r == 6 || r == 7 ? c.reuse_relit_k1 : std::max(c.reuse_relit_k1, c.reuse_relit_k0 + 1.0e-4f);
+            }
+            if (mv_bits & 512u) wpm.mk0 = std::max(c.reuse_disocc_fill_mix, 0.0f);       // visfix/: Moved's colour test is off with these (bits 0-1 clear)
+            if (mv_bits & 128u) wpm.md0 = std::max(c.reuse_disocc_fill_sigma, 1.0e-3f);   //   and its depth test: fields free
+            if ((mv_bits & (512u | 128u)) && (mv_bits & 3u)) { mv_bits &= ~(512u | 128u); wpm.moved = mv_bits; }   // never with Moved
+            if ((mv_bits & 1u) || relit_cells) {
+                struct { uint32_t w, h, cw, ch; } mp{nw, nh, impl_->reuse_snap_cw, impl_->reuse_snap_ch};
+                dispatch(cmd, impl_->reuse_moved_prep_now, (mp.cw + 7) / 8, (mp.ch + 7) / 8, 1, &mp, sizeof mp);
+                compute_barrier(cmd);
+            }
+            // armfix/: AgeFade (moved bit 10, the factor in mk1) and MotionEdge (bit 11: mrad = the radius, md1 = the threshold, px); both
+            // fields are free without Moved's tests (bits 0-1), which the shipped shader does not have
+            const uint32_t age = impl_->reuse_since + 1;
+            if (c.reuse_age_fade > 0.0f && !(mv_bits & 3u)) {
+                wpm.moved |= 1024u;
+                wpm.mk1 = std::clamp(1.0f - c.reuse_age_fade * float(int(age) - c.reuse_age_fade_from), std::clamp(c.reuse_age_fade_floor, 0.0f, 1.0f), 1.0f);
+            }
+            if (c.reuse_motion_edge > 0.0f && !(mv_bits & 3u)) {
+                wpm.moved |= 2048u; wpm.mrad = std::max(c.reuse_motion_edge_radius, 0.5f); wpm.md1 = c.reuse_motion_edge;
+            }
+            const bool use_hi = hi_on && hi.made && hi.steps == age;
+            if (split_trace) std::fprintf(stderr, "ARMFIX frame %lld age %u hi %d steps %u fade %.3f edge %.2f\n", (long long)sp.frame, age, int(use_hi),
+                                          hi.steps, (wpm.moved & 1024u) ? double(wpm.mk1) : 1.0, (wpm.moved & 2048u) ? double(wpm.md1) : 0.0);
+            if (use_hi) {
+                wpm.a.mw = hi.w; wpm.a.mh = hi.h;
+                if (wbs && !wbs->poolh) {
+                    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8},
+                                                          {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16}};
+                    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+                    pi.maxSets = 2; pi.poolSizeCount = 3; pi.pPoolSizes = sizes;
+                    if (vkCreateDescriptorPool(s.ctx.device, &pi, nullptr, &wbs->poolh) == VK_SUCCESS) {
+                        auto& r5 = *impl_;
+                        nrvk::Context::Image a = s.surf0; a.handle = wb; a.view = wbs->view; a.layout = VK_IMAGE_LAYOUT_GENERAL; a.sampler = VK_NULL_HANDLE;
+                        for (unsigned k = 0; k < 2; ++k)
+                            wbs->w5h[k] = kernel_set(s.ctx.device, wbs->poolh, hi.warp5d[k], {r5.reuse_stat_buffer.handle},
+                                                     {&s.tex_in, &a, &r5.reuse_edit, &hi.acc[k], &t.depth, &r5.reuse_dep, &r5.reuse_src, &r5.reuse_carry,
+                                                      &r5.reuse_moved_cap, &r5.reuse_moved_now});
+                    }
+                }
+            }
+            if (wbs && use_hi && wbs->w5h[next]) dispatch(cmd, hi.warp5d[next], (nw + 7) / 8, (nh + 7) / 8, 1, &wpm, sizeof wpm, wbs->w5h[next]);
+            else if (wbs && use_hi) throw std::runtime_error("MotionRes: no descriptor set for the frame");
+            else if (use_hi) dispatch(cmd, hi.warp5[next], (nw + 7) / 8, (nh + 7) / 8, 1, &wpm, sizeof wpm);
+            else
+            if (wbs) dispatch(cmd, impl_->reuse_warp5d[next], (nw + 7) / 8, (nh + 7) / 8, 1, &wpm, sizeof wpm, wbs->w5[next]);
+            else
+            dispatch(cmd, impl_->reuse_warp5[next], (nw + 7) / 8, (nh + 7) / 8, 1, &wpm, sizeof wpm);
+            if (c.reuse_snap) {
+                auto& r5 = *impl_;
+                const uint32_t cw = r5.reuse_snap_cw, ch = r5.reuse_snap_ch;
+                compute_barrier(cmd);
+                struct { uint32_t w, h, cw, ch; } pp{nw, nh, cw, ch};
+                dispatch(cmd, r5.reuse_snap_prep, (cw + 7) / 8, (ch + 7) / 8, 1, &pp, sizeof pp);
+                compute_barrier(cmd);
+                struct { uint32_t cw, ch, radius, coef; float eps; } bp{cw, ch, std::min(c.reuse_snap_radius, 8u), 1u, std::max(c.reuse_snap_eps, 1.0e-7f)};
+                dispatch(cmd, r5.reuse_snap_coef, (cw + 7) / 8, (ch + 7) / 8, 1, &bp, sizeof bp);
+                compute_barrier(cmd);
+                bp.coef = 0u;
+                dispatch(cmd, r5.reuse_snap_mean, (cw + 7) / 8, (ch + 7) / 8, 1, &bp, sizeof bp);
+                compute_barrier(cmd);
+                struct { uint32_t w, h, cw, ch, round_u8; float amount; } ap5{nw, nh, cw, ch, uint32_t(impl_->round_u8), std::clamp(c.reuse_snap_mix, 0.0f, 1.0f)};
+                if (wbs) dispatch(cmd, r5.reuse_snap_applyd, (nw + 7) / 8, (nh + 7) / 8, 1, &ap5, sizeof ap5, wbs->ap);
+                else
+                dispatch(cmd, r5.reuse_snap_apply, (nw + 7) / 8, (nh + 7) / 8, 1, &ap5, sizeof ap5);
+            }
+            if (wbs)   // the answer is in the frame: on to the layout the write-back would have left it in
+                barrier(cmd, wb, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        } else if (fx_cut) {
+            // plugin4: warp4 = warp3 + the cut drop; the fade from the lower of Gate and CutDrop
+            const float lim = std::min(c.reuse_gate, c.reuse_cut_drop) * float(nw) / 1920.0f;
+            struct { uint32_t w, h, mw, mh, round_u8; float limit; uint32_t flags; float feather, disocc; uint32_t inverted, dw, dh, from1; } wp{
+                nw, nh, t.lw[0], t.lh[0], uint32_t(impl_->round_u8), lim,
+                (fx_edge ? 1u : 0u) | (warp_disocc ? 2u : 0u) | (fx_fill ? 4u : 0u) | 8u, std::max(c.reuse_edge_feather, 0.0f),
+                std::max(c.reuse_disocc_threshold, 1.0e-4f), engine && engine->depth_inverted ? 1u : 0u, t.depth.w, t.depth.h,
+                uint32_t(impl_->reuse_edit_from + 1)};
+            static_assert(sizeof wp == 52, "warp4 push");
+            if (wbs) {
+                dispatch(cmd, impl_->reuse_warp4d[next], (nw + 7) / 8, (nh + 7) / 8, 1, &wp, sizeof wp, wbs->w4[next]);
+                barrier(cmd, wb, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            } else
+            dispatch(cmd, impl_->reuse_warp4[next], (nw + 7) / 8, (nh + 7) / 8, 1, &wp, sizeof wp);
+        } else if (fx_edge || fx_fill || warp_disocc) {
+            struct { uint32_t w, h, mw, mh, round_u8; float limit; uint32_t flags; float feather, disocc; uint32_t inverted, dw, dh; } wp{
+                nw, nh, t.lw[0], t.lh[0], uint32_t(impl_->round_u8), c.reuse_gate * float(nw) / 1920.0f,
+                (fx_edge ? 1u : 0u) | (warp_disocc ? 2u : 0u) | (fx_fill ? 4u : 0u), std::max(c.reuse_edge_feather, 0.0f),
+                std::max(c.reuse_disocc_threshold, 1.0e-4f), engine && engine->depth_inverted ? 1u : 0u, t.depth.w, t.depth.h};
+            static_assert(sizeof wp == 48, "warp3 push");
+            dispatch(cmd, impl_->reuse_warp3[next], (nw + 7) / 8, (nh + 7) / 8, 1, &wp, sizeof wp);
+        } else {
+            struct { uint32_t w, h, mw, mh, round_u8; float limit; } wp{nw, nh, t.lw[0], t.lh[0], uint32_t(impl_->round_u8),
+                                                                       c.reuse_gate * float(nw) / 1920.0f};
+            dispatch(cmd, impl_->reuse_warp[next], (nw + 7) / 8, (nh + 7) / 8, 1, &wp, sizeof wp);
+        }
+        compute_barrier(cmd);
+        if (split_trace)
+            std::fprintf(stderr, "EDIT frame %lld from %lld age %u flags %u\n", (long long)sp.frame, (long long)impl_->reuse_edit_from,
+                         impl_->reuse_since + 1, (fx_edge ? 1u : 0u) | (warp_disocc ? 2u : 0u) | (fx_fill ? 4u : 0u));
+        impl_->reuse_acc_cur = next;
+        ++impl_->reuse_since;
+        info.reused = true;
+    }
+    for (uint32_t pass = 0; pass < (reuse_skip && sk != SplitKind::Part ? 0u : passes); ++pass) {
+        ColourFrame shot_in{}, shot_out{};
+        const bool snapshot = c.model_capture && pass + 1 == passes;
+        if (snapshot) {
+            shot_in.image = ds ? frame.image : s.tex_in.handle;
+            shot_in.format = ds ? frame.format : s.tex_in.format;
+            shot_in.width = shot_out.width = nw; shot_in.height = shot_out.height = nh;
+            shot_in.before = shot_in.after = ds ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            shot_out.image = ds && ds->store ? wb : s.surf0.handle;
+            shot_out.format = ds && ds->store ? frame.format : s.surf0.format;
+            shot_out.before = shot_out.after = VK_IMAGE_LAYOUT_GENERAL;
+            c.model_capture(cmd, shot_in, shot_out, false);
+        }
+        const bool time_net = impl_->timing_ok && impl_->split_timing;
+        const uint32_t net_query = timing_slot * impl_->timing_stride + 2 + 2 * pass;
+        if (hg_now) xcopy(impl_->temporal.flow[0], kG, sp.live_flow, kG);   // campfire/ HistoryGate: this frame's own field kept
+        if (sk == SplitKind::Part && (sk_slot_in || hg_now)) slot_in(sk_slot);
+        if (c.network_timestamp) c.network_timestamp(cmd, true);
+        if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query);
+        run_steps(sk == SplitKind::Part ? sk_lo : 0, sk == SplitKind::Part ? sk_hi : s.steps.size());
+        if (time_net) net_stamped = true;
         if (time_net) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing, net_query + 1);
         if (c.network_timestamp) c.network_timestamp(cmd, false);
         if (snapshot) c.model_capture(cmd, shot_in, shot_out, true);
+    }
+    if (hg_now) { xcopy(sp.live_flow, kG, impl_->temporal.flow[0], kG); write_params(frame_params); }   // campfire/ HistoryGate: put back
+    if (sk == SplitKind::Part) { ++sp.j; }
+    if (ran_steps) { std::lock_guard<std::mutex> l(g_arena_mutex); g_arena_user[s.act.handle] = impl_.get(); }
+    if (reuse_frame && !reuse_skip) {
+        // Keep this network frame's edit for the frames that skip it.
+        struct { uint32_t w, h; } sp{nw, nh};
+        dispatch(cmd, impl_->reuse_store, (nw + 7) / 8, (nh + 7) / 8, 1, &sp, sizeof sp);
+        compute_barrier(cmd);
+        impl_->reuse_have = true;
+        impl_->reuse_since = 0;
+        keep_edit_depth(impl_->split.frame, impl_->temporal.depth, disocc_now);
+        if (split_trace) std::fprintf(stderr, "EDIT frame %lld from %lld age 0 flags 0\n", (long long)impl_->split.frame,
+                                      (long long)impl_->split.frame);
     }
     if (temporal) {
         // The latch is set after every recorded frame and `reset` never clears
         // it: reset suppresses consumption, it does not un-write the buffer.
         if (fs) { fs->latch = true; fs->parity ^= 1u; }
         else { t.latch = true; t.parity ^= 1u; }
-        // The post variant wrote this frame's history into the other image (hwrite, now the feature's).
-        if (t.pingpong) {
+        // The post variant wrote this frame's history into the other image (hwrite, now the feature's). Ours: not on a
+        // reuse frame that skipped the network (nothing was written).
+        if (t.pingpong && !reuse_skip) {
             t.hcur = t.hwrite;
             if (fs && impl_->rotation()) fs->slot = int(t.hwrite);
         }
@@ -3396,7 +4640,9 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         s.ctx.destroy(impl_->retiring[i].first);
         impl_->retiring.erase(impl_->retiring.begin() + long(i));
     }
-    info.network_dispatches = uint32_t(s.steps.size()) * passes;
+    info.network_dispatches = reuse_skip ? 0u : uint32_t(s.steps.size()) * passes;
+    info.edit_fresh = !info.reused || impl_->reuse_edit_from != impl_->vf_seen_from;   // visfix/
+    impl_->vf_seen_from = impl_->reuse_edit_from;
     if (c.apply_model) {
         if (mask) {
             struct { uint32_t w,h;float intensity; } push{frame.width,frame.height,c.intensity};
@@ -3407,8 +4653,8 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
         const uint32_t extent[] = {frame.width, frame.height, uint32_t(impl_->round_u8)};
         if (!impl_->post_alpha || mask)
             dispatch(cmd, impl_->alpha, (frame.width + 7) / 8, (frame.height + 7) / 8, 1, extent, sizeof extent);
-        if (stored) {
-            // The post block's store was the write-back.
+        if (stored || wb_direct) {
+            // The post block's store was the write-back (v7: or the warp's / Snap apply's).
         } else {
         barrier(cmd, out, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
@@ -3482,12 +4728,12 @@ ControlMaskResult Runtime::record_all(VkCommandBuffer cmd, const ColourFrame& fr
                 engine->motion.after_stage, engine->motion.after_access);
     if (engine && temporal)
         impl_->incheck.end(s.ctx, cmd, tgt && (tgt->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ? *tgt : frame, *engine, impl_->temporal.flow[0], impl_->temporal.depth,
-                           depth_direct, game_depth && !impl_->depth_unread,
+                           depth_direct, game_depth_net && !impl_->depth_unread,
                            history_consumed && *history_consumed, impl_->mw, impl_->mh, mv_direct);
     if (impl_->timing_ok) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, impl_->timing,
                             timing_slot * impl_->timing_stride + 1);
-        impl_->slot_passes[timing_slot] = impl_->split_timing ? passes : 0;
+        impl_->slot_passes[timing_slot] = impl_->split_timing ? (sk == SplitKind::Off ? passes : (net_stamped ? 1u : 0u)) : 0;
         ++impl_->timings_recorded;
         impl_->timing_slot = (timing_slot + 1) % Impl::kTimingSlots;
         // Collect whatever has finished. Never waits; the caller is a render
@@ -3506,6 +4752,30 @@ void set_input_check(bool on, const std::string& folder, int pictures) {
                      folder.empty() ? "(none)" : folder.c_str());
 }
 
+bool Runtime::reuse_allowed() const { return impl_->reuse; }
+Runtime::ReuseCounts Runtime::reuse_counts() {
+    ReuseCounts n{impl_->reuse_ran, impl_->reuse_skipped, impl_->reuse_gate_trips, impl_->reuse_motion_sum,
+                  impl_->reuse_motion_samples, impl_->reuse_motion_peak};
+    impl_->reuse_motion_sum = 0; impl_->reuse_motion_samples = 0; impl_->reuse_motion_peak = 0;
+    auto& sp = impl_->split;
+    n.cycles = sp.cycles; n.dropped = sp.dropped; n.starts = sp.starts; n.starts_aligned = sp.starts_aligned; n.waits = sp.waits;
+    n.lag0 = sp.lag0; n.lag1 = sp.lag1; n.whole = sp.whole; n.net_runs = sp.net_runs; n.net_runs_lite_skip = sp.net_runs_lite_skip;
+    n.jitter_frames = sp.jitter_frames;
+    n.frames = sp.win_frames; n.lite_skip_frames = sp.lite_skip_frames; n.fallback_frames = sp.fallback_frames;
+    sp.win_frames = sp.lite_skip_frames = sp.fallback_frames = 0;
+    sp.cycles = sp.dropped = sp.starts = sp.starts_aligned = sp.waits = sp.lag0 = sp.lag1 = sp.whole = 0;
+    sp.net_runs = sp.net_runs_lite_skip = sp.jitter_frames = 0;
+    n.timed = impl_->win_timed; n.gpu_sum = impl_->win_gpu; n.gpu_min = impl_->win_min; n.gpu_max = impl_->win_max;
+    n.net_timed = impl_->win_net_n; n.net_sum = impl_->win_net;
+    impl_->win_timed = 0; impl_->win_gpu = 0; impl_->win_min = impl_->win_max = 0; impl_->win_net_n = 0; impl_->win_net = 0;
+    n.parts = sp.last_parts;
+    if (sp.last_parts) {
+        const auto it = sp.cuts.find(sp.last_parts);
+        if (it != sp.cuts.end()) for (uint32_t c : it->second) n.cuts += (n.cuts.empty() ? "" : ",") + std::to_string(c);
+        n.cut_source = sp.cut_source[sp.last_parts];
+    }
+    return n;
+}
 float Runtime::last_gpu_ms() const { return impl_->gpu_ms; }
 float Runtime::average_gpu_ms() const { return impl_->gpu_ms_avg; }
 float Runtime::average_network_ms() const { return impl_->split_timing ? impl_->net_ms_avg : 0.0f; }
@@ -3816,3 +5086,5 @@ void d3d12_net_controls(D3d12NetPlan::Dispatch& d, const D3d12NetControls& c, bo
 }  // namespace nr
 
 namespace nr { bool Runtime::recordings_done() const { return impl_->gpu_uses.ready(); } }
+
+namespace nr { uint64_t Runtime::reuse_cut_count() const { return impl_ ? impl_->reuse_cuts : 0; } }   // burn/

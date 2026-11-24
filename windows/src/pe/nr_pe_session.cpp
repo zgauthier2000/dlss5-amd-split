@@ -235,6 +235,7 @@ struct Session::Impl {
         // layer's (the ReShade route's layers each have their own).
         std::map<int, std::chrono::steady_clock::time_point> layers;
         int net{};     // the network it runs (nr::NetworkChoice)
+        bool reuse{};  // RuntimeConfig::reuse
         uint64_t used{};   // LRU stamp
         std::chrono::steady_clock::time_point last{};   // when it was last selected
         bool light{};      // built inside a recording (inframe): its images in its network memory's heap
@@ -288,14 +289,16 @@ struct Session::Impl {
     uint64_t inframe_built{}, plans_built{};
     double inframe_ms_max{};
     bool same_config_but_format(const Built& e) const { return same_config(e, e.format); }
-    bool same_config(const Built& e, VkFormat f) const { return e.format == f && e.net == net_want; }
+    bool same_config(const Built& e, VkFormat f) const { return e.format == f && e.net == net_want && e.reuse == reuse_want; }
     // The network a runtime runs (nr::NetworkChoice).
     static int net_of(const Runtime& r) {
+        // the experimental model first: its int4 route (ExperimentalInt4) also reports int4_mixed() (fix 11-22: it was taken for
+        // CC_SILVER_AARDWOLD_INT4_MIXED, so the session marked the experimental model unavailable and fell back to CC_SMALL_FP8)
+        if (r.experimental()) return nr::kSmallFp8Experimental;
 #if NR_INT4
         if (r.optimized()) return nr::network_with_layers(nr::kSilverAardwoldOptimized, r.layers());
 #endif
         if (r.optimized()) return nr::kSilverAardwoldOptimizedFp8;
-        if (r.experimental()) return nr::kSmallFp8Experimental;
         return r.network() == NetworkModel::Small ? nr::kSmallFp8 : nr::kSilverAardwold;
     }
     RuntimeConfig make_config(uint32_t w, uint32_t h, VkFormat f) const;
@@ -551,6 +554,7 @@ struct Session::Impl {
     uint32_t stage_slot{};
     uint32_t stage_slot_passes[kStageSlots]{};
     uint64_t stage_recorded{};
+    uint64_t fb_cut_seen{};   // burn/: CutFeedback
     // The averages by NR-chain layer (Session::set_call_layer; 0 outside a chain): every layer's runs apart, and whether
     // its last run was timed here (else the runtime's own timing is its cost)
     struct StageAverage {
@@ -1189,6 +1193,10 @@ struct Session::Impl {
     // [Network] Model: the network the switch asks for, the one being built, and the one running (Built::net).
     NetworkSwitch net_switch;
     int net_want{}, build_net{}, running_net{-1};
+    // Controls::reuse_every was asked for once: from then on every runtime is built able to reuse the network's edit.
+    // Never cleared, so the cache keeps one kind of runtime.
+    bool reuse_want{}, build_reuse{};
+    std::chrono::steady_clock::time_point reuse_logged{};
     int call_net{-1};   // Session::set_call_network
     // The network this call wants: an NR-chain layer's own (set_call_network) when the run can serve it,
     // else [Network] Model (the switch, which also takes the hotkey: called on every call either way).
@@ -1821,6 +1829,7 @@ bool Session::Impl::select_runtime(uint32_t w, uint32_t h, VkFormat format) {
         if (e.runtime->stale()) continue;   // its images belong to a later runtime (dropped by trim_cache)
         if (e.width != w || e.height != h || e.format != format) continue;
         if (e.net != net_want) continue;   // [Network] Model: the network the switch asks for
+        if (e.reuse != reuse_want) continue;
         e.used = ++use_stamp;
         const auto now = std::chrono::steady_clock::now();
         if (runtime != e.runtime.get()) {
@@ -2214,6 +2223,42 @@ bool Session::Impl::ensure_runtime(const Controls& controls, uint32_t w, uint32_
         e = {w, h};
     }
     const bool ok = ensure_runtime_(controls, w, h, format);
+    if (ok && runtime && controls.reuse_every >= 2 && runtime->reuse_allowed()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - reuse_logged > std::chrono::seconds(5)) {
+            reuse_logged = now;
+            const auto n = runtime->reuse_counts();
+            const double frames = double(n.ran + n.skipped);
+            log("[nr] temporal reuse, every %d: %llu frames ran the network, %llu skipped it (%.0f %%), the motion gate "
+                "ran it %llu times; motion since the last line: mean %.1f px, peak %.1f px (Gate %.0f)",
+                controls.reuse_every, (unsigned long long)n.ran, (unsigned long long)n.skipped,
+                frames > 0 ? 100.0 * double(n.skipped) / frames : 0.0, (unsigned long long)n.gated,
+                n.motion_samples ? n.motion_sum / double(n.motion_samples) : 0.0, double(n.motion_peak),
+                double(controls.reuse_gate));
+            // plugin2: Split / Phase, and the runtime's own GPU timestamps around its whole recording per evaluate (network
+            // part, warp, copies) and around the network dispatches in it. NOT the evaluate line's "network" figure: that is
+            // a running average (10 % per frame) of the network-dispatch time per evaluate counting 0 on frames that skip it.
+            const bool split = controls.reuse_split && controls.reuse_every <= 8;
+            char extra[256] = "no split";
+            if (split)
+                std::snprintf(extra, sizeof extra, "%d parts (cuts %s), %llu cycles (%.2f frames per cycle start), part 1 one frame "
+                              "after its input %llu of %llu, frames without a part %llu, cycles dropped %llu, whole-network frames %llu",
+                              n.parts, n.cuts.c_str(), (unsigned long long)n.cycles,
+                              n.starts ? double(n.frames) / double(n.starts) : 0.0, (unsigned long long)n.lag1,
+                              (unsigned long long)(n.lag0 + n.lag1), (unsigned long long)n.waits, (unsigned long long)n.dropped,
+                              (unsigned long long)n.whole);
+            log("[nr] reuse %s, Phase %d (%s): %llu frames, %llu of them Lite lossy skip frames (jitter x < 0; jitter read on %llu), "
+                "%llu frames without one in the last 2 (Phase acts as 0 there); %llu network / cycle input frames, %llu of them "
+                "on Lite skip frames; %s; NR GPU per frame (runtime timestamps, %llu frames) mean %.2f, "
+                "min %.2f, max %.2f ms; network dispatches mean %.2f ms on %llu frames with network work",
+                split ? "split" : "whole network", controls.reuse_phase,
+                controls.reuse_phase == 1 ? "Lite skip frames" : controls.reuse_phase == 2 ? "Lite run frames" : "none",
+                (unsigned long long)n.frames, (unsigned long long)n.lite_skip_frames, (unsigned long long)n.jitter_frames,
+                (unsigned long long)n.fallback_frames, (unsigned long long)n.net_runs, (unsigned long long)n.net_runs_lite_skip, extra,
+                (unsigned long long)n.timed, n.timed ? n.gpu_sum / double(n.timed) : 0.0, double(n.gpu_min), double(n.gpu_max),
+                n.net_timed ? n.net_sum / double(n.net_timed) : 0.0, (unsigned long long)n.net_timed);
+        }
+    }
     ++(ok ? ran : passed);
     if (!ok) ++pass_why[status.empty() ? std::string("no reason recorded") : status];
     nr::pe::stats::evaluate(call_layer, ok, ok ? std::string() : status);   // the whole session's (NR Control, the report)
@@ -2277,6 +2322,36 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     recheck_availability();
     if (!availability_checked) check_availability();
     net_want = wanted_network();
+    if (controls.reuse_every >= 2 && !reuse_want) {
+        reuse_want = true;
+        log("[nr] ReuseEvery %d asked for: networks are rebuilt able to reuse the network's edit (once)", controls.reuse_every);
+        log("[nr] [Reuse] Split %d, Phase %d, EdgeDrop %d (feather %.1f px), Disocclusion %d (threshold %.3f) (plugin3 build)",
+            controls.reuse_split ? 1 : 0, controls.reuse_phase, controls.reuse_edge_drop, double(controls.reuse_edge_feather),
+            controls.reuse_disocc ? 1 : 0, double(controls.reuse_disocc_threshold));
+        log("[nr] [Reuse] GateRun %d, CutDrop %.1f, CutChange %.3f (plugin4 build)", controls.reuse_gate_run ? 1 : 0,
+            double(controls.reuse_cut_drop), double(controls.reuse_cut_change));
+        log("[nr] [Reuse] Snap %d (radius %u, eps %g, mix %.2f), Box %d, NearMV %d (plugin5 build)", controls.reuse_snap,
+            controls.reuse_snap_radius, double(controls.reuse_snap_eps), double(controls.reuse_snap_mix), controls.reuse_box, controls.reuse_nearmv);
+        if (controls.reuse_relit)   // armfix/
+            log("[nr] [Reuse] Relit %d (K0 %.3f, K1 %.3f) (armfix build)", controls.reuse_relit, double(controls.reuse_relit_k0), double(controls.reuse_relit_k1));
+        if (controls.reuse_hist_gate || controls.reuse_blend > 0.0f)   // campfire/
+            log("[nr] [Reuse] HistoryGate %d, Blend %.3f (K0 %.3f, K1 %.3f) (campfire build; Split only)", controls.reuse_hist_gate, double(controls.reuse_blend),
+                double(controls.reuse_blend_k0), double(controls.reuse_blend_k1));
+        if (controls.reuse_disocc_motion)   // rim/
+            log("[nr] [Reuse] DisoccMotion %d (rim build)", controls.reuse_disocc_motion);
+        if (controls.reuse_fill_rim)   // rim/
+            log("[nr] [Reuse] DisoccFillRim %d (rim build)", controls.reuse_fill_rim);
+        if (controls.reuse_guard > 0.0f)   // guard/
+            log("[nr] [Reuse] Guard %.2f (GuardAlpha %.3f, GuardFloor %.2f) (guard build; with Blend only)", double(controls.reuse_guard),
+                double(controls.reuse_guard_alpha), double(controls.reuse_guard_floor));
+        if (controls.reuse_disocc_fill || controls.reuse_cut_feedback)
+            log("[nr] [Reuse] DisoccFill %d (radius %.1f px), CutFeedback %d (burn build)", controls.reuse_disocc_fill,
+                double(controls.reuse_disocc_fill_radius), controls.reuse_cut_feedback ? 1 : 0);
+        if (controls.reuse_moved)
+            log("[nr] [Reuse] Moved %d (dark only %d, relative %d, radius %.1f px, colour %.3f..%.3f, depth %.3f..%.3f) (burn build)",
+                controls.reuse_moved & 3, (controls.reuse_moved >> 2) & 1, (controls.reuse_moved >> 3) & 1, double(controls.reuse_moved_radius),
+                double(controls.reuse_moved_k0), double(controls.reuse_moved_k1), double(controls.reuse_moved_d0), double(controls.reuse_moved_d1));
+    }
     // Adopt a finished background build first.
     {
         nr::pe::watchdog::Phase phase("adopting a finished network build (build lock)");
@@ -2315,6 +2390,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
                 // what was built, not what was asked: a network without what it needs is another one (the runtime
                 // says why); the one asked for is not asked again this run
                 entry.net = net_of(*built);
+                entry.reuse = build_reuse;
                 if (entry.net != build_net) {
                     net_switch.unavailable(build_net, built->network_note().empty() ? "could not be built (see dlssnr-amd.log)"
                                                                                     : built->network_note());
@@ -2524,6 +2600,7 @@ bool Session::Impl::ensure_runtime_(const Controls& controls, uint32_t w, uint32
     nr::g_build_stage = 1; nr::g_build_pipes_done = 0; nr::g_build_pipes_total = 0;
     build_layer = call_layer;
     build_net = net_want;
+    build_reuse = config.reuse;
     status = "building the network in the background; frames pass through until it is ready";
     events::note(events::kNetwork, "network asked for: %s", nr::network_label(net_want));
     {
@@ -2644,6 +2721,7 @@ RuntimeConfig Session::Impl::make_config(uint32_t w, uint32_t h, VkFormat f) con
     RuntimeConfig config;
     config.root = root; config.width = w; config.height = h; config.colour_format = f;
     config.motion_point = motion_point;
+    config.reuse = reuse_want;
     // RuntimeConfig::network: 1 the small model, 2 CC_SMALL_FP8_EXPERIMENTAL, 3 CC_SILVER_AARDWOLD_OPTIMIZED, 0 the
     // 310.8 one
     config.network = net_want == nr::kSmallFp8 ? 1 : net_want == nr::kSmallFp8Experimental ? 2
@@ -2762,6 +2840,7 @@ bool Session::Impl::inframe(uint32_t w, uint32_t h, VkFormat f, std::shared_ptr<
     Built entry;
     entry.width = w; entry.height = h; entry.format = f;
     entry.net = net_of(*made);
+    entry.reuse = reuse_want;
     entry.used = ++use_stamp;
     entry.last = std::chrono::steady_clock::now();
     entry.light = true;
@@ -5075,6 +5154,10 @@ bool Session::Impl::record_renodx(VkCommandBuffer cmd, renodx::Stage& stage, con
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stage_timing, base);
     }
     try {
+        if (c.reuse_cut_feedback && runtime) {   // burn/ CutFeedback: a cut since the last frame drops the Feedback history
+            const uint64_t cuts = runtime->reuse_cut_count();
+            if (cuts != fb_cut_seen) { fb_cut_seen = cuts; stage.drop_feedback(); }
+        }
         stage.record(cmd, sf, network);
         renodx_facts = stage.facts();
         renodx_facts_known = true;

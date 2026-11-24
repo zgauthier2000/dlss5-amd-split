@@ -156,6 +156,111 @@ struct Controls {
     uint64_t feature = 0; // identity for non-temporal seed and Preprocess state
     float history_strength = -1.f; // negative: the session default; otherwise this layer's post blend
     bool model_capture_allowed = true; // an outer multipass host arms only its final pass
+    // Temporal reuse of the network's edit (RuntimeConfig::reuse). 0 or 1: the network runs on every frame.
+    // N >= 2: it runs on every Nth frame, and the frames between carry its last edit forward - the edit
+    // (answer minus what the network was shown) looked up where the accumulated motion says each pixel was
+    // when it was made - onto what the network would have been shown this frame. A frame with `reset`
+    // always runs the network. Needs the temporal path - the engine's motion vectors, or the fallback estimator's
+    // when there are none - and one pass, no preprocess.
+    int reuse_every = 4;
+    // The most the picture may have moved, in pixels of a 1080p-wide frame (scaled with the frame's width),
+    // for the network to be skipped: a frame whose predicted accumulated motion is larger runs the network
+    // instead. The motion is the mean of the previous frame's, times the frames since the network ran.
+    float reuse_gate = 400.0f;
+    // plugin2 (2026-11-21): [Reuse] Split. With reuse_every N = 2..8, the network's steps are spread over N frames
+    // (balanced cuts from the per-step cost table, Runtime::split_cuts), one part per frame; the finished edit is
+    // stored and warped as reuse does. Off: reuse as before, byte for byte.
+    bool reuse_split = true;
+    // plugin2: [Reuse] Phase. 0: no alignment (the network, or a split cycle's input frame, every N frames counted
+    // from the last network run, as before). 1: on frames where FSR 4 Lite lossy skips its network (EngineFrame
+    // jitter: x < 0, and with a render width under half the display's also y >= -1/6; never a reset frame); odd N
+    // alternates gaps of N-1 and N+1. 2: the other parity (Lite's run frames), for testing. Without the frame's
+    // jitter it acts as 0.
+    int reuse_phase = 1;
+    // plugin3 (2026-11-21): [Reuse] EdgeDrop. 1: no carried edit where the motion since the edit's frame looked outside a
+    // previous frame at any step (screen edges a pan reveals): the frame's plain picture there, with a feather of
+    // reuse_edge_feather pixels towards the edit frame's border. 2 (fill): there, the edit at the nearest point inside the
+    // edit's frame instead of none (today's "none" leaves the revealed strip without the network's look). 0: as before, byte for byte.
+    int reuse_edge_drop = 2;
+    float reuse_edge_feather = 4.0f;
+    // plugin3: [Reuse] Disocclusion. 1: the edit fades out where this frame's depth and the edit frame's depth at the pixel's
+    // source differ by more than reuse_disocc_threshold (relative view distance; nothing left at twice it): content the edit
+    // frame did not see there. Reads the game's depth for this (the network still does not, with Motion Without Depth).
+    bool reuse_disocc = true;
+    float reuse_disocc_threshold = 0.1f;
+    // plugin4 (2026-11-21): [Reuse] GateRun. 1 (default, as before): a frame whose predicted motion passes reuse_gate runs the network.
+    // 0: never; reuse_gate then only sets where the carried edit fades out.
+    bool reuse_gate_run = false;
+    // plugin4: [Reuse] CutDrop, pixels of a 1080p-wide frame (0 = off, as before). > 0: the carried edit also fades out from CutDrop to
+    // twice it of accumulated motion, and a cut detector (runtime_reuse_cut.comp: the mean luma change against the previous frame moved
+    // by this frame's vectors, past reuse_cut_change) drops every carried edit made from a frame before the cut. No network run is forced.
+    float reuse_cut_drop = 400.0f;
+    float reuse_cut_change = 0.03f;
+    // plugin5 (2026-11-21): the carried edit's look (plugin5/NOTES.md). All 0: v4.
+    //  Snap 1: the carried edit re-projected onto this frame's structure (guided filter on this frame's luma, 4x4 cells, radius in cells,
+    //    eps; mix 1 = the snapped edit alone).
+    //  Box 1: fade where this frame's colour + the edit leaves this frame's 3x3 box; 2: where the edit frame's input at the source does
+    //    (k0..k1 outside the box, values of the shown frame).
+    //  NearMV 1: the 3x3 coarse motion texels' nearest by depth; 2: the bilinear texels weighted by depth match (sigma, ln distance).
+    int reuse_snap = 0;
+    uint32_t reuse_snap_radius = 2;
+    float reuse_snap_eps = 1.0e-3f;
+    float reuse_snap_mix = 1.0f;
+    int reuse_box = 0;
+    float reuse_box_k0 = 0.02f, reuse_box_k1 = 0.06f;
+    int reuse_nearmv = 0;
+    float reuse_nearmv_sigma = 0.05f;
+    // burn/ (2026-11-21): [Reuse] Moved: fade the carried edit where the neighbourhood around the pixel's source in the edit frame differs
+    // from the one around it now (an object left: its dark rim stays burned into the background). 0 = off (v7 byte for byte).
+    // bit 0 colour test (4x4 cell means of sqrt(L/(1+L)), MovedK0..K1), bit 1 depth test (a nearer neighbour then but not now,
+    // MovedD0..D1), bit 2 darkening only (MovedDarkOnly), bit 3 colour test on structure (MovedRelative). MovedRadius: ring radius, px.
+    int reuse_moved = 0;
+    // burn/: [Reuse] CutFeedback 1: a cut the CutDrop detector sees also drops the stage's Feedback history (fast mode). 0 = off (v7).
+    bool reuse_cut_feedback = false;
+    float reuse_moved_k0 = 0.03f, reuse_moved_k1 = 0.08f, reuse_moved_radius = 12.0f, reuse_moved_d0 = 0.1f, reuse_moved_d1 = 0.3f;
+    // burn/: [Reuse] DisoccFill 1: where Disocclusion fades the edit out, the faded part is the mean edit of depth-matched points around
+    // the source in the edit frame (rings up to 2 x DisoccFillRadius px) instead of none. 0 = off (v7).
+    int reuse_disocc_fill = 4;
+    float reuse_disocc_fill_radius = 8.0f;
+    // visfix/ (2026-11-22): DisoccFill 4 = 3 + colour-matched samples (width DisoccFillSigma), 5 = 3 + the outermost matching ring only;
+    // DisoccFillMix < 1 = that share of the fill (1 = v9). Defaults = v9.
+    float reuse_disocc_fill_mix = 1.0f;
+    float reuse_disocc_fill_sigma = 0.05f;
+    // visfix/: [Reuse] FeedbackHold (the RenoDX stage's Feedback history on reused frames: Stage::note_network). Default off = v9.
+    bool reuse_feedback_hold = false;
+    // armfix/ (2026-11-22). Defaults = v9 (nothing recorded differently).
+    // [Reuse] MotionRes 0 (as before: the motion since the edit's frame accumulated at 1/4 of the network's size), 2 or 1: the carried
+    // edit's motion accumulated at 1/2 or the full network size as well (its own field, accumulators and split ring; the 1/4 ones stay for
+    // the fade, the cut detector and the network), and the warp reads that one. Needs warp5 (DisoccFill / Snap / Box / NearMV on).
+    int reuse_motion_res = 0;
+    int reuse_motion_res_filter = 1;   // research: 1 linear blit of the game's vectors into the field, 0 nearest
+    // [Reuse] AgeFade k: the carried edit x clamp(1 - k (age - AgeFadeFrom), AgeFadeFloor, 1), age = frames since the edit's frame. 0 = off.
+    float reuse_age_fade = 0.0f; int reuse_age_fade_from = 3; float reuse_age_fade_floor = 0.0f;
+    // [Reuse] MotionEdge t (px): the carried edit fades out where the accumulated motion differs from that MotionEdgeRadius px away (4
+    // directions) by t .. 2t px: content that moved against its neighbourhood since the edit's frame (a limb's edge). 0 = off.
+    float reuse_motion_edge = 0.0f, reuse_motion_edge_radius = 4.0f;
+    // [Reuse] Relit 1 | 2 | 3: the carried edit fades out where this frame's input (4x4 cell means of sqrt(L/(1+L))) differs from the edit
+    // frame's input at the pixel's source by RelitK0 .. RelitK1: light that moved over a surface since the edit's frame. 1: only where it
+    // is lighter now; 2: either direction; 3: lighter now, and only the edit's darkening fades. 0 = off.
+    // 4: darker now; 5: darker now, the edit's darkening only; 6 / 7: gain (research); 8 = 5 on per-pixel luma (this frame's input at the pixel
+    // against the edit frame's input, bilinear at the source; no cell images): THE FIX (armfix/NOTES.md); 9: cells and pixels, the larger.
+    int reuse_relit = 8; float reuse_relit_k0 = 0.01f, reuse_relit_k1 = 0.05f;
+    // campfire/ [Reuse] HistoryGate 1 (Split only): the network's own temporal history is consumed on the split cycle's input frame (the
+    // gate open), carried by the motion accumulated since the previous network input frame, instead of closed on every network run under
+    // reuse (each run a first frame: the arm lighter and wandering frame to frame against Every 1, campfire/NOTES.md). 0 = off (as before).
+    int reuse_hist_gate = 1;   // 2: the accumulated field kept for Blend, the gate closed (Blend alone)
+    // campfire/ [Reuse] Blend a (0 < a < 1, Split only, needs HistoryGate): the stored edit = a x the fresh one + (1 - a) x the previous one carried
+    // to the cycle's input frame (depth-checked): each refresh steps by a x the change between network runs. 0 = off.
+    float reuse_blend = 0.5f;
+    float reuse_blend_k0 = 0.01f, reuse_blend_k1 = 0.05f;
+    // guard/ [Reuse] Guard (ratio; 0 = off) / GuardAlpha / GuardFloor (levels): with Blend, a network run whose whole look jumps more than Guard x
+    // the recent average (and GuardFloor) is mixed in with GuardAlpha instead of Blend; two jumping runs in a row: the second is taken
+    float reuse_guard = 0.0f, reuse_guard_alpha = 0.1f, reuse_guard_floor = 1.0f;   // campfire/ [Reuse] BlendK0 / BlendK1: Blend's colour test (sqrt(L/(1+L)) units; K1 0 = off)
+    // [Reuse] DisoccFillRim (0/1): with DisoccFill 3/4, a hole with no sample on its own depth layer takes the edit of the layers behind it
+    int reuse_fill_rim = 1;
+    // rim/ [Reuse] DisoccMotion (0/1): Disocclusion's threshold grows with the pixel's motion since the edit
+    int reuse_disocc_motion = 1;
+    float reuse_hist_strength = 1.0f;   // campfire/ [Reuse] HistoryStrength: x the history's weight on HistoryGate's runs (1 = as every frame)
     // Optional readback of the last pass before and after its network, before composition.
     std::function<void(VkCommandBuffer, const ColourFrame&, const ColourFrame&, bool)> model_capture;
 };
@@ -252,6 +357,11 @@ struct RuntimeConfig {
     // beyond this build's need, for other networks to fit.
     std::shared_ptr<ActArenaRef> act_arena;
     double act_slack = 1.0;
+    // Able to run Controls::reuse_every: allocates the stored edit and the motion accumulator and turns the
+    // direct-sampling and direct-store paths off (a frame that skips the network has no post block to store
+    // the answer, so the answer must exist as an image). Needs the temporal path (TemporalConfig::enable).
+    // Off, the runtime is exactly what it was.
+    bool reuse = false;
 };
 
 // SDR encoded RGB, source-sized and upright. Accepts RGBA32F and 8-bit RGBA/BGRA
@@ -331,6 +441,9 @@ struct TemporalFrame {
 struct RecordResult {
     uint32_t network_dispatches{};
     bool applied{};
+    bool reused{};   // the answer came from the stored edit; the network did not run
+    bool reuse_gated{};   // reuse was asked for and the motion was too large: the network ran
+    bool edit_fresh{};    // visfix/: the network ran for this frame, or a new stored edit took over this frame (split's last part)
     float effective_skin{}, effective_background{};
 
 };
@@ -399,12 +512,28 @@ struct EngineFrame {
     // extent, one pass, the model applied). `colour` is then only read, and the
     // host's seed copy of the colour into the target is not needed.
     ColourFrame target;
+    // plugin2 (Controls::reuse_phase): the frame's camera jitter as the game handed it to the upscaler (pixels,
+    // NGX Jitter.Offset.X / Y = FSR's jitterOffset), the upscaler's render and display widths, and a frame
+    // serial (consecutive evaluates; 0 = not known). Not given: the host's FrameHint (set_frame_hint) is used.
+    bool jitter_known = false;
+    float jitter_x = 0.0f, jitter_y = 0.0f;
+    uint32_t render_width = 0, display_width = 0;
+    uint64_t serial = 0;
     // A history the caller made for this run (RGBA16F at the network's size, GENERAL): written into the image the
     // feature's history is read from, before the network runs, when the history gate is open. Passes (fast)
     // Interleaved: what this pass would have written last frame, made from the slots' increments, so a pass that ran
     // several frames ago reads a history one frame old (read with this frame's own motion vectors).
     ColourFrame history;
 };
+// plugin2: what a host knows of the frame being evaluated, for record_engine calls whose EngineFrame does not
+// carry it (the OptiScaler plugin reads it from the NGX parameters of the evaluate that runs NR).
+struct FrameHint {
+    uint64_t serial = 0;
+    bool jitter_known = false;
+    float jitter_x = 0.0f, jitter_y = 0.0f;
+    uint32_t render_width = 0, display_width = 0;
+};
+void set_frame_hint(const FrameHint&);
 
 struct EngineResult {
     RecordResult frame;
@@ -425,6 +554,8 @@ bool image_heap_fits(const RuntimeCore& core, uint32_t width, uint32_t height);
 
 class Runtime {
 public:
+    // burn/: cuts the CutDrop detector has seen so far (read on the CPU a frame late)
+    uint64_t reuse_cut_count() const;
     // Caller enables the same device features/extensions as nrvk::Context::create.
     // Initialization uploads weights on host.queue; serialize it with host submits.
     Runtime(const HostDevice&, const RuntimeConfig&);
@@ -456,6 +587,27 @@ public:
     // Requires a runtime built with TemporalConfig::enable, whose extent matches
     // the render resolution rather than the display one.
     EngineResult record_engine(VkCommandBuffer, const EngineFrame&, const Controls&);
+    // Temporal reuse (RuntimeConfig::reuse): whether this runtime was built able to, and what it did so far -
+    // frames that ran the network, frames that skipped it, and skips the motion gate declined.
+    // `motion_*` are the frames' mean motion, in pixels of a 1080p-wide frame (the unit of Controls::reuse_gate),
+    // summed over `motion_samples` frames and the largest one, since the last call; read by the log so the gate
+    // can be set from what a game actually does.
+    struct ReuseCounts { uint64_t ran{}, skipped{}, gated{}; double motion_sum{}; uint64_t motion_samples{}; float motion_peak{};
+        // plugin2: since the last call. Split cycles finished / dropped (a reset, gate trip, a missed frame or the network memory
+        // used by another runtime: the whole network then), parts and cycle starts on aligned frames, waits (a frame without a part),
+        // capture lags 0 / 1; per-call GPU ms of the runtime's whole recording (timestamps, frames whose result was read) and of
+        // the network dispatches in it; the last cycle's parts and cuts; frames whose network or cycle started on a frame where
+        // Lite lossy skips (jitter rule) / on any frame with the jitter known.
+        uint64_t cycles{}, dropped{}, starts{}, starts_aligned{}, waits{}, lag0{}, lag1{}, whole{};
+        uint64_t net_runs{}, net_runs_lite_skip{}, jitter_frames{};
+        uint64_t frames{}, lite_skip_frames{}, fallback_frames{};   // this window's reuse frames, Lite skip frames among them, Phase fallbacks
+        uint64_t timed{}; double gpu_sum{}; float gpu_min{}, gpu_max{}; uint64_t net_timed{}; double net_sum{};
+        int parts{}; std::string cuts; std::string cut_source; };
+    bool reuse_allowed() const;
+    ReuseCounts reuse_counts();
+    // plugin2: the cuts Split uses for `parts` parts at this runtime's network (step indices, ascending; empty: none fit),
+    // and where the per-step costs came from ("table small 2258x1270 measured" or "workgroups (modelled)").
+    std::vector<uint32_t> split_cuts(int parts, std::string* source = nullptr);
     // whether record_engine can take EngineFrame::target with these controls
     // (the model applied, one pass). A host asks before it skips its own seed copy.
     bool takes_target(const Controls&) const;

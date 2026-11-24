@@ -196,10 +196,9 @@ nr::pe::Session& vk_session() {
 // [Preprocess] in dlssnr-amd.ini beside this module: the file re-read at most once a second, the
 // hotkey every evaluate. Written with the defaults (off) when absent. OptiScaler knows nothing of it:
 // the change is made on the proxy it hands us and taken back out of the answer before it gets it back.
-nr::Preprocess preprocess_now() {
+const nr::pe::PreprocessConfig& ini_config() {
     static nr::pe::PreprocessFile file;
     static nr::pe::PreprocessConfig config;
-    static nr::pe::PreprocessSwitch toggle;
     static ULONGLONG next = 0;
     static uint64_t epoch = 0;
     const ULONGLONG now = GetTickCount64();
@@ -209,6 +208,48 @@ nr::Preprocess preprocess_now() {
         const char* folder = nr::pe::module_folder();
         if (*folder) file.poll(nr::u8::writable_ini_path(folder), config);
     }
+    return config;
+}
+
+// [Reuse] in the same file: the network on every Every-th frame, the frames between carrying its edit
+// forward by the game's motion vectors (nr::Controls::reuse_every). Zero or one: the network every frame.
+void reuse_now(nr::Controls& c) {
+    const auto& ini = ini_config();
+    c.reuse_every = ini.reuse_every;
+    c.reuse_gate = ini.reuse_gate;
+    c.reuse_split = ini.reuse_split;
+    c.reuse_phase = ini.reuse_phase;
+    c.reuse_edge_drop = ini.reuse_edge_drop;
+    c.reuse_edge_feather = ini.reuse_edge_feather;
+    c.reuse_disocc = ini.reuse_disocc;
+    c.reuse_disocc_threshold = ini.reuse_disocc_threshold;
+    c.reuse_gate_run = ini.reuse_gate_run;
+    c.reuse_cut_drop = ini.reuse_cut_drop;
+    c.reuse_cut_change = ini.reuse_cut_change;
+    c.reuse_snap = ini.reuse_snap;
+    c.reuse_snap_radius = ini.reuse_snap_radius;
+    c.reuse_snap_eps = ini.reuse_snap_eps;
+    c.reuse_snap_mix = ini.reuse_snap_mix;
+    c.reuse_box = ini.reuse_box;
+    c.reuse_box_k0 = ini.reuse_box_k0;
+    c.reuse_box_k1 = ini.reuse_box_k1;
+    c.reuse_nearmv = ini.reuse_nearmv;
+    c.reuse_nearmv_sigma = ini.reuse_nearmv_sigma;
+    c.reuse_cut_feedback = ini.reuse_cut_feedback;
+    c.reuse_disocc_fill = ini.reuse_disocc_fill; c.reuse_disocc_fill_radius = ini.reuse_disocc_fill_radius;
+    c.reuse_disocc_fill_sigma = ini.reuse_disocc_fill_sigma; c.reuse_disocc_fill_mix = ini.reuse_disocc_fill_mix;   // visfix/
+    c.reuse_relit = ini.reuse_relit; c.reuse_relit_k0 = ini.reuse_relit_k0; c.reuse_relit_k1 = ini.reuse_relit_k1;   // armfix/
+    c.reuse_hist_gate = ini.reuse_hist_gate; c.reuse_blend = ini.reuse_blend; c.reuse_blend_k0 = ini.reuse_blend_k0; c.reuse_blend_k1 = ini.reuse_blend_k1;   // campfire/
+    c.reuse_fill_rim = ini.reuse_fill_rim; c.reuse_disocc_motion = ini.reuse_disocc_motion;
+    c.reuse_guard = ini.reuse_guard; c.reuse_guard_alpha = ini.reuse_guard_alpha; c.reuse_guard_floor = ini.reuse_guard_floor;   // guard/
+    c.reuse_moved = ini.reuse_moved; c.reuse_moved_k0 = ini.reuse_moved_k0; c.reuse_moved_k1 = ini.reuse_moved_k1;
+    c.reuse_moved_radius = ini.reuse_moved_radius; c.reuse_moved_d0 = ini.reuse_moved_d0; c.reuse_moved_d1 = ini.reuse_moved_d1;
+}
+
+nr::Preprocess preprocess_now() {
+    static nr::pe::PreprocessConfig config;
+    static nr::pe::PreprocessSwitch toggle;
+    config = ini_config();
     return toggle.frame(config);
 }
 
@@ -1585,6 +1626,7 @@ int evaluate_d3d12(ID3D12GraphicsCommandList* cmd, Feature* f, void* params, ID3
     f->controls = controls_from(controls);
     if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) f->controls.history_strength = w2->history;
     f->controls.preprocess = preprocess_now();
+    reuse_now(f->controls);
     // a wilsjo2 layer that runs [Preprocess] itself (nr_asi_wilsjo2*.cpp, from the frame's light): not again here
     f->prep_by_layer = false;
     if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2(); w2 && w2->prep_outside) {
@@ -1969,6 +2011,7 @@ int evaluate_vk(void* cmd_buffer, Feature* f, void* params, const void* color, c
     f->controls = controls_from(controls);
     if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) f->controls.history_strength = w2->history;
     f->controls.preprocess = preprocess_now();
+    reuse_now(f->controls);
     // a wilsjo2 layer that runs [Preprocess] itself (nr_asi_wilsjo2*.cpp, from the frame's light): not again here
     f->prep_by_layer = false;
     if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2(); w2 && w2->prep_outside) {
@@ -2141,6 +2184,7 @@ int evaluate_vk_on(nr::pe::Session& session, const nr::pe::DeviceHandles& handle
     f->controls = controls_from(controls);
     if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2()) f->controls.history_strength = w2->history;
     f->controls.preprocess = preprocess_now();
+    reuse_now(f->controls);
     // a wilsjo2 layer that runs [Preprocess] itself (nr_asi_wilsjo2*.cpp, from the frame's light): not again here
     f->prep_by_layer = false;
     if (const auto* w2 = nr::pe::renodx_route::call_wilsjo2(); w2 && w2->prep_outside) {

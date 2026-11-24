@@ -70,4 +70,6 @@ void asi_facts(const char* build, const char* frame_gen);
 // "" it can).
 void hud_facts(const char* now, const char* why_game, const char* why_captured, const char* why_estimated);
 
+// release/: where the DXGI Present count comes from (nr_pe_menu.cpp's install; null = none)
+void set_dxgi_presents_source(uint64_t (*fn)());
 }  // namespace nr::pe::control

@@ -1,0 +1,32 @@
+#version 460
+// plugin5 (2026-11-21) Snap, step 1: the guided filter's 4x4 cell means (as upstream's st_prep.comp, MIT, src 1: the RGB edit) of the
+// carried edit (warp5's `carry`) against this frame's luma I (Rec. 709 weights on the shown values): A = (I, I^2, e.r, e.g),
+// B = (e.b, I e). One thread per cell.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D shown;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D carry;
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D outa;
+layout(set = 0, binding = 3, rgba32f) uniform writeonly image2D outb;
+layout(push_constant) uniform Push { uint width, height, cw, ch; } pc;
+// plugin6 (2026-11-21, part A trim): the 16 texels' loads first (clamped inside the frame), then the same sums in the same order,
+// skipping the texels outside the frame as v5 did: bit for bit v5's cell means, without one dependent load pair per step.
+void main() {
+    const ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (q.x >= int(pc.cw) || q.y >= int(pc.ch)) return;
+    const ivec2 hi = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+    vec3 sv[16], cv[16];
+    for (int k = 0; k < 16; ++k) {
+        const ivec2 p = min(q * 4 + ivec2(k & 3, k >> 2), hi);
+        sv[k] = texelFetch(shown, p, 0).rgb; cv[k] = imageLoad(carry, p).rgb;
+    }
+    vec4 A = vec4(0.0), B = vec4(0.0); float c = 0.0;
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x) {
+            const ivec2 p = q * 4 + ivec2(x, y);
+            if (p.x >= int(pc.width) || p.y >= int(pc.height)) continue;
+            const float I = dot(sv[y * 4 + x], vec3(0.2126, 0.7152, 0.0722));
+            const vec3 v = cv[y * 4 + x];
+            A += vec4(I, I * I, v.r, v.g); B += vec4(v.b, I * v); c += 1.0;
+        }
+    imageStore(outa, q, A / max(c, 1.0)); imageStore(outb, q, B / max(c, 1.0));
+}

@@ -28,6 +28,43 @@ struct PreprocessConfig {
     Preprocess values{};
     std::string hotkey = "Ctrl+F10";   // empty: none
     bool sound = true;                 // a cue when it switches on or off
+    // [Reuse], the same file: temporal reuse of the network's edit (Controls::reuse_every / reuse_gate).
+    // The OptiScaler route builds its controls from NGX parameters, which have no key for it.
+    int reuse_every = 4;
+    float reuse_gate = 400.0f;
+    // plugin2: [Reuse] Split (the network spread over Every frames) and Phase (0 none, 1 Lite lossy's skipped frames, 2 the other)
+    bool reuse_split = true;
+    int reuse_phase = 1;
+    // plugin3: [Reuse] EdgeDrop, Disocclusion (+ DisoccThreshold, EdgeFeather): see nr::Controls
+    int reuse_edge_drop = 2;
+    float reuse_edge_feather = 4.0f;
+    bool reuse_disocc = true;
+    float reuse_disocc_threshold = 0.1f;
+    // plugin4: [Reuse] GateRun, CutDrop, CutChange: see nr::Controls
+    bool reuse_gate_run = false;
+    float reuse_cut_drop = 400.0f;
+    float reuse_cut_change = 0.03f;
+    // plugin5: [Reuse] Snap, SnapRadius, SnapEps, SnapMix, Box, BoxK0, BoxK1, NearMV, NearSigma: see nr::Controls
+    int reuse_snap = 0;
+    uint32_t reuse_snap_radius = 2;
+    float reuse_snap_eps = 1.0e-3f;
+    float reuse_snap_mix = 1.0f;
+    int reuse_box = 0;
+    float reuse_box_k0 = 0.02f, reuse_box_k1 = 0.06f;
+    int reuse_nearmv = 0;
+    float reuse_nearmv_sigma = 0.05f;
+    // burn/: [Reuse] Moved, MovedDarkOnly, MovedRelative, MovedRadius, MovedK0, MovedK1, MovedD0, MovedD1: see nr::Controls
+    int reuse_moved = 0;
+    bool reuse_cut_feedback = false;
+    int reuse_disocc_fill = 4;
+    float reuse_disocc_fill_radius = 8.0f;
+    float reuse_disocc_fill_sigma = 0.05f, reuse_disocc_fill_mix = 1.0f;   // visfix/
+    int reuse_relit = 8; float reuse_relit_k0 = 0.01f, reuse_relit_k1 = 0.05f;   // armfix/: [Reuse] Relit, RelitK0, RelitK1: see nr::Controls
+    int reuse_hist_gate = 1; float reuse_blend = 0.5f, reuse_blend_k0 = 0.01f, reuse_blend_k1 = 0.05f;
+    int reuse_fill_rim = 1;   // rim/: [Reuse] DisoccFillRim
+    int reuse_disocc_motion = 1;   // rim/: [Reuse] DisoccMotion
+    float reuse_guard = 0.0f, reuse_guard_alpha = 0.1f, reuse_guard_floor = 1.0f;   // guard/: [Reuse] Guard, GuardAlpha, GuardFloor   // campfire/: [Reuse] HistoryGate, Blend, BlendK0, BlendK1: see nr::Controls
+    float reuse_moved_k0 = 0.03f, reuse_moved_k1 = 0.08f, reuse_moved_radius = 12.0f, reuse_moved_d0 = 0.1f, reuse_moved_d1 = 0.3f;
 };
 // One key of the section into `p`; false when it is not one of its keys.
 bool parse_preprocess_key(PreprocessConfig& p, const std::string& key, const std::string& value);
@@ -38,7 +75,9 @@ void write_preprocess(FILE* f, const PreprocessConfig& p);
 // 2 offload to RAM, 3 minimal), where the pre block reads the motion vectors, the history at a new frame size, the
 // Style grade, the OSD and which compiler made the network's machine code (ACO Mode).
 struct NetworkConfig {
-    int model = nr::kSmallFp8;
+    int model = nr::kSmallFp8Experimental;
+    bool experimental_int4 = true;   // release/: [Network] ExperimentalInt4 (read by core/nr_runtime.cpp at build)
+    bool fp16_activations = true;    // release/: [Network] FP16Activations (the same)
     std::string hotkey = "Ctrl+F11";
     bool sound = true;
     int residency = 0;
@@ -46,8 +85,8 @@ struct NetworkConfig {
     bool resize_history = false;
     int osd = 1;   // OSD: 0 off, 1 after a switch, 2 always, 3 always with each layer's cost
     bool style_grade = true;   // Style Grade: Natural / Cinematic graded as NVIDIA's DLL (false: the older picture)
-    bool memory_guard = false;  // Memory Guard (off by default since 0.0.8.3): a network only with video memory left for the game (false: no such check)
-    bool history_f16 = true;   // History Precision: 16 the history images RGBA16F (default), 32 RGBA32F
+    bool memory_guard = false;  // Memory Guard (off by default since 0.0.8.3): a network only where its video memory is free (false: no such check)
+    bool history_f16 = false;  // History Precision: 16 the history images RGBA16F, 32 RGBA32F (ours: default 32, the picture as before; upstream 16)
     // OptimizedLayers: CC_SILVER_AARDWOLD_OPTIMIZED's level (nr::kLayersQuality / Balanced / Performance / Ultra (default));
     // `model` is already the one it picks (nr::network_with_layers)
     int optimized_layers = 3;   // nr::kLayersDefault (Ultra Performance); a number: make_ini.py reads these defaults
@@ -195,7 +234,9 @@ class ChainFile {
 void touch_config();
 uint64_t config_epoch();
 // [Log], with its comments (read by nr_pe_log.cpp; every route's file carries it).
-// [NRControl] (the OptiScaler route's menu: its key), with its comments.
+void write_log(FILE* f, bool enabled, bool clear);
+// [Reuse] is written by nr_pe_config.cpp's write_reuse (every key, with its comments).
+// [NRControl] (NR Control, the OptiScaler route's menu: its key), with its comments.
 void write_nrcontrol(FILE* f);
 void write_d3d12(FILE* f, bool enabled);   // [D3D12Passthrough] (the OptiScaler route)
 void write_gpu(FILE* f);   // [GPU] (Architecture: nr_gpu_arch.hpp gpu_manual)

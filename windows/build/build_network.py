@@ -28,10 +28,18 @@ import sys
 from pathlib import Path
 
 R = Path(__file__).resolve().parents[2]
-RUNTIME = ['runtime_alpha', 'runtime_encode', 'runtime_transfer', 'runtime_upscale', 'runtime_prep', 'runtime_depth', 'cascade_lograt', 'cascade_blur', 'cascade_feed',
-           'runtime_downscale', 'runtime_taps']
-# runtime passes built from another pass's source with defines: name -> (source, defines)
-RUNTIME_VARIANTS = {'runtime_transfer_store': ('runtime_transfer', ['NR_STORE_NATIVE'])}
+# the runtime's own passes around the network (it runs the network only: the composition is RenoDX's stage's and the
+# wilsjo2 flow's): the alpha restore, the depth guide's copy and the blit for compute-only command buffers
+RUNTIME = ['runtime_alpha', 'runtime_depth', 'runtime_blit',
+           # ours (merge/, ported from linux/): temporal reuse with Split and Phase, and its fixes
+           'runtime_reuse_store', 'runtime_reuse_motion', 'runtime_reuse_warp', 'runtime_reuse_stat',
+           'runtime_reuse_motion3', 'runtime_reuse_warp3', 'runtime_reuse_stat3',
+           'runtime_reuse_warp4', 'runtime_reuse_cut',
+           'runtime_reuse_warp5', 'runtime_reuse_snap_prep', 'runtime_reuse_snap_box', 'runtime_reuse_snap_apply',
+           'runtime_reuse_stat_max', 'runtime_reuse_stat_accg', 'runtime_reuse_stat3g',
+           'runtime_reuse_cut_terms', 'runtime_reuse_cut_sum', 'runtime_reuse_moved_prep', 'runtime_reuse_store_ema']
+# ours: the answer-into-the-frame twins (NR_ANSWER16=1), loaded as <name>_a16.spv
+RUNTIME_A16 = ['runtime_reuse_warp4', 'runtime_reuse_warp5', 'runtime_reuse_snap_apply']
 MOTION = ['motion_luma', 'motion_estimate']
 
 
@@ -87,6 +95,11 @@ def main():
     out.mkdir(parents=True)
 
     pipelines = table['pipelines']
+    # post_no_out1 in the manifest tells the host that the post kernels never write their second output (it makes
+    # that image 1x1): it has to say what they are built with.
+    consts = dict(r.split() for r in table['markers']['shader-constants.txt'][1:])
+    if consts.get('post_no_out1') == '1' and 'NR_POST_NO_OUT1=1' not in pipelines['fswinimagepost32']['defines']:
+        sys.exit('pipelines.json: post_no_out1 1, but fswinimagepost32 is built without NR_POST_NO_OUT1=1')
     for name, e in pipelines.items():
         glslang(a.arch, R / 'windows/shaders' / a.arch / e['source'], e['defines'] + a.define, out / f'g_{name}.spv',
                 unroll=e['source'] in UNROLLED, network=True)
@@ -113,13 +126,11 @@ def main():
     shutil.copy2(out / 'shader-constants.txt', out / 'temporal' / 'shader-constants.txt')
     for k in RUNTIME:
         glslang(a.arch, R / 'windows/shaders/passes' / f'{k}.comp', [], out / 'runtime' / f'{k}.spv')
-    for k, (src, defines) in RUNTIME_VARIANTS.items():
-        glslang(a.arch, R / 'windows/shaders/passes' / f'{src}.comp', defines, out / 'runtime' / f'{k}.spv')
-    # runtime_upscale.spv carries AMD FidelityFX Super Resolution 1 (MIT): its notice goes with it
-    shutil.copy2(R / 'windows/shaders/passes/include/fsr1/LICENSE.txt', out / 'runtime' / 'FidelityFX-FSR1-LICENSE.txt')
+    for k in RUNTIME_A16:
+        glslang(a.arch, R / 'windows/shaders/passes' / f'{k}.comp', ['NR_ANSWER16=1'], out / 'runtime' / f'{k}_a16.spv')
     print(f'{out}: {len(pipelines) + len(grade["pipelines"])} network pipelines, '
           f'{len(table["variants"]) + len(grade["variants"]) + len(MOTION)} temporal, '
-          f'{len(RUNTIME) + len(RUNTIME_VARIANTS)} runtime')
+          f'{len(RUNTIME)} runtime')
 
     if a.check:
         bad = [p.name for p in sorted(out.iterdir()) if p.is_file()
