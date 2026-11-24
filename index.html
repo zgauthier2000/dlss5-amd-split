@@ -2,12 +2,22 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DLSS 5 neural rendering on AMD: network every 4th frame, split over 4 frames</title>
 <style>
-:root { --bg:#f6f7f9; --panel:#fff; --line:#d5d9df; --ink:#1d2128; --muted:#5d6673; --accent:#8a5a00; }
-@media (prefers-color-scheme: dark) { :root { --bg:#111317; --panel:#1b1e24; --line:#2c313a; --ink:#e6e8eb; --muted:#9aa1ab; --accent:#f2c94c; } }
+:root { --bg:#f6f7f9; --panel:#fff; --line:#d5d9df; --ink:#1d2128; --muted:#5d6673; --accent:#8a5a00; --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; }
+@media (prefers-color-scheme: dark) { :root { --bg:#111317; --panel:#1b1e24; --line:#2c313a; --ink:#e6e8eb; --muted:#9aa1ab; --accent:#f2c94c; --s1:#3987e5; --s2:#d95926; --s3:#199e70; } }
 body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui, sans-serif; }
 main { max-width:1100px; margin:0 auto; padding:16px; } h1 { font-size:22px; } h2 { font-size:17px; margin:0 0 8px; }
 a { color:var(--accent); } section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; margin:16px 0; }
 section img { width:100%; max-height:420px; object-fit:cover; border-radius:4px; } p { margin:6px 0; } .small, footer { color:var(--muted); font-size:13px; }
+.chart { position:relative; max-width:760px; } .chart svg { width:100%; height:auto; display:block; overflow:visible; }
+.chart .grid { stroke:var(--line); stroke-width:1; } .chart .axis { fill:var(--muted); font-size:12px; }
+.chart .lab { font-size:12px; font-weight:600; fill:var(--ink); } .chart .s1 { stroke:var(--s1); fill:var(--s1); }
+.chart .s2 { stroke:var(--s2); fill:var(--s2); } .chart .s3 { stroke:var(--s3); fill:var(--s3); }
+.chart .ln { fill:none; stroke-width:2; stroke-linejoin:round; } .chart circle { stroke:var(--panel); stroke-width:2; }
+.legend { display:flex; gap:16px; flex-wrap:wrap; font-size:13px; color:var(--muted); margin:4px 0; }
+.legend span::before { content:""; display:inline-block; width:14px; height:3px; border-radius:2px; margin-right:6px; vertical-align:middle; background:var(--c); }
+.tip { position:absolute; pointer-events:none; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:6px 9px; font-size:12px;
+  color:var(--ink); box-shadow:0 2px 8px rgba(0,0,0,.15); display:none; white-space:nowrap; } .tip b { font-weight:600; }
+.chart .xh { stroke:var(--muted); stroke-width:1; stroke-dasharray:3 3; }
 table { border-collapse:collapse; margin:6px 0; } td, th { border:1px solid var(--line); padding:3px 12px; text-align:left; }
 </style></head><body><main>
 <h1>DLSS 5 neural rendering on an AMD GPU: the network every 4th frame, split evenly over 4 frames</h1>
@@ -17,6 +27,43 @@ so every frame costs about the same, and carries the result forward along the ga
 carried result no longer fits (revealed background, scene cuts, the frame's edges, lighting that changed). Pictures and settings are those of
 the <a href="https://github.com/zgauthier2000/dlss5-amd-split/releases/tag/v0.0.9-split.1">0.0.9-split.1 preview</a>.</p>
 <h2>Cost per frame</h2>
+<p class="small">NR's GPU time on each frame, Shadow of the Tomb Raider clip (NR at 0.75 scale, 1 pass), frames 8-31. Hover for the values.</p>
+<div class="legend"><span style="--c:var(--s1)">Every 4th frame, split (this build)</span><span style="--c:var(--s2)">Every 4th frame, not split</span><span style="--c:var(--s3)">Network every frame</span></div>
+<div class="chart" id="chart"><svg id="csvg" viewBox="0 0 760 300" role="img" aria-label="Frame time per frame: split stays near 3.5 ms, not split spikes to 11.5 ms every 4th frame, every frame stays at 11.4 ms"></svg><div class="tip" id="tip"></div></div>
+<script>
+(function () {
+  const D = [{"name": "Every 4th frame, split (this build)", "short": "Split (this build)", "pts": [[8, 4.05], [9, 3.59], [10, 3.26], [11, 3.47], [12, 4.01], [13, 3.59], [14, 3.26], [15, 3.48], [16, 4.04], [17, 3.58], [18, 3.25], [19, 3.46], [20, 4.02], [21, 3.6], [22, 3.25], [23, 3.48], [24, 4.1], [25, 3.59], [26, 3.26], [27, 3.48], [28, 4.02], [29, 3.61], [30, 3.25], [31, 3.48]]}, {"name": "Every 4th frame, not split", "short": "Not split", "pts": [[8, 11.46], [9, 0.75], [10, 0.75], [11, 0.76], [12, 11.45], [13, 0.75], [14, 0.76], [15, 0.75], [16, 11.48], [17, 0.75], [18, 0.75], [19, 0.75], [20, 11.43], [21, 0.76], [22, 0.75], [23, 0.75], [24, 11.5], [25, 0.76], [26, 0.75], [27, 0.75], [28, 11.49], [29, 0.79], [30, 0.76], [31, 0.75]]}, {"name": "Network every frame", "short": "Every frame", "pts": [[8, 11.39], [9, 11.41], [10, 11.41], [11, 11.42], [12, 11.37], [13, 11.39], [14, 11.36], [15, 11.43], [16, 11.39], [17, 11.4], [18, 11.36], [19, 11.37], [20, 11.33], [21, 11.39], [22, 11.38], [23, 11.31], [24, 11.35], [25, 11.37], [26, 11.36], [27, 11.37], [28, 11.4], [29, 11.34], [30, 11.4], [31, 11.36]]}], W = 760, H = 300, L = 44, R = 130, T = 12, B = 34, YMAX = 12;
+  const svg = document.getElementById('csvg'), tip = document.getElementById('tip'), NS = 'http://www.w3.org/2000/svg';
+  const k0 = D[0].pts[0][0], k1 = D[0].pts[D[0].pts.length - 1][0];
+  const x = k => L + (k - k0) * (W - L - R) / (k1 - k0), y = v => T + (1 - v / YMAX) * (H - T - B);
+  const el = (n, a, p) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); (p || svg).appendChild(e); return e; };
+  for (let v = 0; v <= YMAX; v += 2) { el('line', {x1: L, x2: W - R, y1: y(v), y2: y(v), class: 'grid'});
+    el('text', {x: L - 6, y: y(v) + 4, 'text-anchor': 'end', class: 'axis'}).textContent = v; }
+  el('text', {x: 4, y: T - 2, class: 'axis'}).textContent = 'ms';
+  for (let k = k0; k <= k1; k += 4) el('text', {x: x(k), y: H - B + 18, 'text-anchor': 'middle', class: 'axis'}).textContent = k;
+  el('text', {x: (L + W - R) / 2, y: H - 2, 'text-anchor': 'middle', class: 'axis'}).textContent = 'frame';
+  const ends = [];
+  D.forEach((s, i) => {
+    const c = 's' + (i + 1);
+    el('path', {d: s.pts.map((p, j) => (j ? 'L' : 'M') + x(p[0]).toFixed(1) + ' ' + y(p[1]).toFixed(1)).join(''), class: 'ln ' + c});
+    s.pts.forEach(p => el('circle', {cx: x(p[0]), cy: y(p[1]), r: 3.5, class: c, style: 'stroke:var(--panel);stroke-width:2'}));
+    const last = s.pts[s.pts.length - 1]; ends.push([y(last[1]), s.short, c]);
+  });
+  ends.sort((a, b) => a[0] - b[0]); for (let i = 1; i < ends.length; i++) if (ends[i][0] - ends[i - 1][0] < 15) ends[i][0] = ends[i - 1][0] + 15;
+  ends.forEach(e => el('text', {x: W - R + 8, y: e[0] + 4, class: 'lab'}).textContent = e[1]);
+  const xh = el('line', {y1: T, y2: H - B, class: 'xh', style: 'display:none'});
+  const hit = el('rect', {x: L, y: T, width: W - L - R, height: H - T - B, fill: 'transparent'});
+  hit.addEventListener('mousemove', ev => {
+    const r = svg.getBoundingClientRect(), sx = (ev.clientX - r.left) * W / r.width;
+    const k = Math.max(k0, Math.min(k1, Math.round(k0 + (sx - L) * (k1 - k0) / (W - L - R)))), j = k - k0;
+    xh.setAttribute('x1', x(k)); xh.setAttribute('x2', x(k)); xh.style.display = '';
+    tip.innerHTML = '<b>Frame ' + k + '</b><br>' + D.map((s, i) => '<span style="color:var(--s' + (i + 1) + ')">&#9632;</span> ' + s.name + ': <b>' + s.pts[j][1].toFixed(2) + ' ms</b>').join('<br>');
+    tip.style.display = 'block'; const px = x(k) * r.width / W; tip.style.left = (px > r.width / 2 ? px - tip.offsetWidth - 12 : px + 12) + 'px'; tip.style.top = '10px';
+  });
+  hit.addEventListener('mouseleave', () => { tip.style.display = 'none'; xh.style.display = 'none'; });
+})();
+</script>
+<p class="small">The same numbers, mean and slowest frame over the whole clip:</p>
 <table><tr><th>Shadow of the Tomb Raider clip, NR at 0.75 scale, 1 pass</th><th>mean</th><th>slowest frame</th></tr>
 <tr><td>Network every frame</td><td>11.4 ms</td><td>11.4 ms</td></tr>
 <tr><td>Every 4th frame, not split</td><td>3.4 ms</td><td>11.5 ms (one frame in four)</td></tr>
