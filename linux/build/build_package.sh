@@ -343,12 +343,13 @@ if [[ "$arch" == x86_64 ]]; then
     # release/: FSR 4 Lite lossy (the FSR 4 project's upscaler build, 1119r-4.1.2l-lossy-r3) as the default DX12 upscaler: put over
     # OptiScaler\amd_fidelityfx_upscaler_dx12.dll at install (install.sh --no-lite keeps the release's own)
     lite=${NR_LITE_DLL:-artifacts/ref/lite/amd_fidelityfx_upscaler_dx12.dll}
+    if [[ "$lite" == none ]]; then echo "NR_LITE_DLL=none: no FSR 4 Lite lossy in this package"; else
     [[ -f "$lite" ]] || { echo "missing $lite (FSR 4 Lite lossy)" >&2; exit 1; }
     if [[ -z "${NR_LITE_DLL:-}" ]]; then
         [[ "$(sha256sum -- "$lite" | cut -d' ' -f1)" == 95878c86a0c4d90ae0e67b628adf9d92b6e1790e624f2179570b74d0de9b4600 ]] ||
             { echo "$lite is not the tested Lite lossy 1119r-4.1.2l-lossy-r3" >&2; exit 1; }
     fi
-    mkdir -p -- "$pkg/optiscaler/lite"; cp -- "$lite" "$pkg/optiscaler/lite/amd_fidelityfx_upscaler_dx12.dll"
+    mkdir -p -- "$pkg/optiscaler/lite"; cp -- "$lite" "$pkg/optiscaler/lite/amd_fidelityfx_upscaler_dx12.dll"; fi
     # vulkan-1.dll for the game folder, its exports forwarded to winevulkan.dll (linux/vulkan-loader/vulkan1_forwarder.c)
     "$cc" -Wl,--no-insert-timestamp -shared -o "$pkg/optiscaler/vulkan-1.dll" linux/vulkan-loader/vulkan1_forwarder.c \
         linux/vulkan-loader/vulkan1_forwarder.def
@@ -387,7 +388,7 @@ cp -- linux/data/experimental/dlssnr-small-experimental.sha256 "$pkg/experimenta
 mkdir -p -- "$pkg/optimized"
 cp -- linux/data/optimized/dlssnr-optimized.delta linux/build/experimental_weights.py "$pkg/optimized/"
 cp -- linux/data/optimized/dlssnr-optimized.sha256 "$pkg/optimized/CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256"
-cp -- linux/package/install.sh linux/package/README.txt linux/package/lumenite.py "$pkg/"
+cp -- linux/package/install.sh linux/package/README.txt linux/package/lumenite.py README-SPLIT.md "$pkg/"
 cp -- LICENSE "$pkg/DLSSNR-AMD-LICENSE.txt"
 [[ "$gpu" != rdna3 ]] || cp -- docs/RDNA3-TARGET-TESTING.md "$pkg/"
 chmod +x "$pkg/install.sh" "$mt/extract_model.sh"

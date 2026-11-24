@@ -42,7 +42,8 @@
 #   --renodx     the RenoDX style (default): processed the way RenoDX's DLSS5 add-on does it.
 #   --wilsjo2    the wilsjo2 style: the original processing of OptiScaler-NR (wilsjo2), ported. --no-renodx means the same.
 #   --no-lite    keep OptiScaler's own FSR: without it, FSR 4 Lite lossy (this project's faster FSR 4 build) is installed
-#                as the DX12 upscaler and OptiScaler is set to use it (Dx12Upscaler = fsr31).
+#                as the DX12 upscaler and OptiScaler is set to use it (Dx12Upscaler = fsr31), when the package has it.
+#   --lite <dll> FSR 4 Lite lossy from a file you downloaded (amd_fidelityfx_upscaler_dx12.dll; see README-SPLIT.md), as above.
 #   With neither, the installer asks once after the network; Enter = the RenoDX style (not asked when not run in a terminal: RenoDX).
 #   Later NR Control (End in game) switches it at any time. For stacking use Passes.
 # ReShade routes:
@@ -79,6 +80,7 @@ lumenite="" lumenite_zip=""
 lumenite_commit=f80e98d716ad72e12af6f7baa727bcfeb4be5094
 model=""        # the network a game starts with ([Network] Model)
 renodx=""
+litedll=""     # --lite <dll>: FSR 4 Lite lossy from outside the package
 lite=1         # release/: FSR 4 Lite lossy as the DX12 upscaler (optiscaler route); --no-lite keeps OptiScaler's own
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -99,12 +101,14 @@ while [[ $# -gt 0 ]]; do
         --no-lumenite) lumenite=0; shift;;
         --no-renodx|--wilsjo2) renodx=0; shift;;
         --no-lite) lite=0; shift;;
-        -h|--help) sed -n '2,63p' "$0"; exit 0;;
+        --lite) [[ $# -gt 1 && -f "$2" ]] || { echo "--lite needs the path of amd_fidelityfx_upscaler_dx12.dll" >&2; exit 1; }
+            litedll=$(realpath -- "$2"); lite=1; shift 2;;
+        -h|--help) sed -n '2,64p' "$0"; exit 0;;
         *) if [[ -z "$game" ]]; then game=$1; elif [[ -z "$route" ]]; then route=$1;
            else echo "unexpected argument: $1" >&2; exit 1; fi; shift;;
     esac
 done
-[[ -n "$game" ]] || { sed -n '2,57p' "$0"; exit 1; }
+[[ -n "$game" ]] || { sed -n '2,58p' "$0"; exit 1; }
 [[ -d "$game" ]] || { echo "no such folder: $game" >&2; exit 1; }
 game=$(cd -- "$game" && pwd)
 manifest="$game/dlssnr-amd-install.txt"
@@ -472,8 +476,9 @@ case "$kind" in
         put_file "$rel/OptiScaler.dll" dxgi.dll
         put_file "$rel/OptiScaler.ini" OptiScaler.ini
         put_tree "$rel/OptiScaler" OptiScaler
-        if [[ $lite == 1 && -f "$here/optiscaler/lite/amd_fidelityfx_upscaler_dx12.dll" ]]; then   # release/: FSR 4 Lite lossy
-            cp -- "$here/optiscaler/lite/amd_fidelityfx_upscaler_dx12.dll" "$game/OptiScaler/amd_fidelityfx_upscaler_dx12.dll"
+        [[ -n "$litedll" ]] || litedll="$here/optiscaler/lite/amd_fidelityfx_upscaler_dx12.dll"
+        if [[ $lite == 1 && -f "$litedll" ]]; then   # release/: FSR 4 Lite lossy
+            cp -- "$litedll" "$game/OptiScaler/amd_fidelityfx_upscaler_dx12.dll"
             echo "FSR 4 Lite lossy is the DX12 upscaler (install again with --no-lite for OptiScaler's own FSR)."
         fi
         if [[ -d "$rel/Licenses" ]]; then mkdir -p -- "$game/OptiScaler/Licenses"; cp -r -- "$rel/Licenses"/. "$game/OptiScaler/Licenses/"; fi
@@ -489,6 +494,7 @@ case "$kind" in
         else
             put_file "$here/optiscaler/vulkan-1.dll" vulkan-1.dll
         fi
+        [[ -f "$litedll" ]] || lite=0   # no Lite lossy (a package without it and no --lite)
         NR_LITE=$lite python3 "$here/optiscaler/patch_ini.py" "$game"
         record OptiScaler.log; record dlssnr-amd.log; record dlssnr-amd.ini
         overrides="dxgi=n,b"
