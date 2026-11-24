@@ -1278,6 +1278,29 @@ inline void draw_network_options(nr::ini_edit::Ini& ini, const nr::control::Shar
     ini_flag(ini, "FP16 activations (experimental model)", "Network", "FP16Activations", "1",
              "[Network] FP16Activations. On (default): CC_SMALL_FP8_EXPERIMENTAL keeps FP16 activations in the layers where "
              "FP8 rounding does not change the picture (about 4% faster network, within 0.5 dB). Takes effect after a restart.");
+    {   // ours: [Reuse] Every and Split, live (the DLL reads the file again each second; from every frame to Every >= 2 the
+        // network is rebuilt once, able to reuse its edit)
+        ImGui::Separator();
+        ImGui::TextUnformatted(tr("Reuse (frame rate)"));
+        static const char* const everys[] = {NR_N("Every frame (no reuse)"), NR_N("Every 2 frames"), NR_N("Every 3 frames"),
+                                              NR_N("Every 4 frames"), NR_N("Every 5 frames"), NR_N("Every 6 frames"),
+                                              NR_N("Every 7 frames"), NR_N("Every 8 frames")};
+        int every = std::atoi(ini.get("Reuse", "Every", "4").c_str());
+        every = every <= 1 ? 1 : std::min(every, 8);
+        if (ImGui::BeginCombo(tr("Network runs"), tr(everys[every - 1]))) {
+            for (int e = 1; e <= 8; ++e)
+                if (ImGui::Selectable(tr(everys[e - 1]), e == every) && e != every) ini.set("Reuse", "Every", std::to_string(e));
+            ImGui::EndCombo();
+        }
+        help("[Reuse] Every. How often the network runs; the frames between carry its last edit forward along the motion "
+             "vectors. Fewer runs: faster, the edit a little older on moving things. Every frame: the full cost each frame. "
+             "Applied at once (the first switch from every frame to reuse builds the network again, a few seconds).");
+        if (every <= 1) ImGui::BeginDisabled();
+        ini_flag(ini, "Split the run over the frames", "Reuse", "Split", "1",
+                 "[Reuse] Split. On (default): one network run is spread over the frames until the next, so every frame costs "
+                 "about the same (even frame pacing). Off: the whole network on one frame, the others almost free (uneven).");
+        if (every <= 1) ImGui::EndDisabled();   // (Split: nothing to split with the network every frame)
+    }
     {
         const std::string k = ini.get("Network", "Hotkey", "Ctrl+F11");
         ImGui::TextDisabled(tr("Next network: %s (see Hotkeys)"), k.empty() ? tr("no key") : k.c_str());
