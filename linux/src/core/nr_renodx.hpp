@@ -40,7 +40,7 @@ struct Settings {
     bool auto_mask = false;             // NRAutoMask
     // The stack: passes 2..4 with their own controls once "Same as pass 1" is off (NRPass2FollowPass1 ...).
     uint32_t passes = 1;                // NRPasses 1..4 (1..30 with NRUnlockPasses)
-    uint32_t passes_mode = 1;           // NRPassesMode: 0 legacy, 1 fast (ours: fast)
+    uint32_t passes_mode = 0;           // NRPassesMode: 0 legacy, 1 fast (ours: legacy with NRPasses 1 = 1 pass; user 11-23 "i like 1 pass much better")
     uint32_t fast_method = fast::kDefaultMethod;   // NRFastMethod: 0 Interleaved, 1 Extrapolation, 2 Feedback, 3 Hybrid, 4 Edit strength (the route's default: Interleaved on OptiScaler; user 11-23 "interleaved looks by far best")
     // Each method's own settings, [0] Extrapolation, [1] Feedback, [2] Hybrid (NRFast<Method>Passes / HaloLimit / Fine)
     float fast_passes[3] = {3.0f, 3.0f, 3.0f};       // 1..8, referred to legacy pass counts
