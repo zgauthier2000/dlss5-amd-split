@@ -1557,7 +1557,11 @@ Runtime::Runtime(const HostDevice& host, const RuntimeConfig& config, const Cont
             std::string why;
             if (!nr::binary::use_rdna3(&why)) nr::binary::disable(why);
         }
+#ifndef NR_TEST_RDNA3_SPIRV   // ours (merge/): the Linux harness runs this core's RDNA3 path with the SPIR-V network (tests only)
         if (nr::binary::directory().empty())
+#else
+        if (false)
+#endif
             throw std::runtime_error("this GPU (RDNA3) runs NR as ACO's machine code only, and ACO Mode is off" +
                                      (nr::binary::disabled_why().empty() ? std::string()
                                                                          : " (" + nr::binary::disabled_why() + ")"));
