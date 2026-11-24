@@ -1,0 +1,62 @@
+{
+ "title": "Shadow of the Tomb Raider, Lara's arm, frames 36-47 (plays)",
+ "note": "",
+ "images": [
+  [
+   "This build: network every 4th frame, split over 4 frames",
+   [
+    "01_01.webp",
+    "01_02.webp",
+    "01_03.webp",
+    "01_04.webp",
+    "01_05.webp",
+    "01_06.webp",
+    "01_07.webp",
+    "01_08.webp",
+    "01_09.webp",
+    "01_10.webp",
+    "01_11.webp",
+    "01_12.webp"
+   ]
+  ],
+  [
+   "Reference: network every frame (about 3x the cost)",
+   [
+    "02_01.webp",
+    "02_02.webp",
+    "02_03.webp",
+    "02_04.webp",
+    "02_05.webp",
+    "02_06.webp",
+    "02_07.webp",
+    "02_08.webp",
+    "02_09.webp",
+    "02_10.webp",
+    "02_11.webp",
+    "02_12.webp"
+   ]
+  ],
+  [
+   "NR off (the game's own picture)",
+   [
+    "03_01.webp",
+    "03_02.webp",
+    "03_03.webp",
+    "03_04.webp",
+    "03_05.webp",
+    "03_06.webp",
+    "03_07.webp",
+    "03_08.webp",
+    "03_09.webp",
+    "03_10.webp",
+    "03_11.webp",
+    "03_12.webp"
+   ]
+  ]
+ ],
+ "a": 1,
+ "b": 2,
+ "fps": 4,
+ "intro": "Shadow of the Tomb Raider. Night market, Lara walking with the camera panning. Twelve frames, three full 4-frame cycles. The arm and the background beside it should look like the reference on every frame, without a band where the arm was a few frames earlier and without the arm pumping darker and lighter every 4th frame. Open \"About these pictures\" for the setup and numbers.",
+ "about": "<h2>Setup</h2><p>Shadow of the Tomb Raider: a captured game clip, 4K output, upscaler Balanced (render 2258x1270), NR at 0.75 scale. Same settings as the 0.0.9-split.1 preview (its default preset, 1 pass; Stellar Blade with its own reuse settings: no revealed-background fill, Snap on). Every picture then goes through FSR 4 Lite lossy (4.1.2l-lossy, the 2026-11-19 build) at 4K.</p><h2>What to look at</h2><p>Night market, Lara walking with the camera panning. Twelve frames, three full 4-frame cycles. The arm and the background beside it should look like the reference on every frame, without a band where the arm was a few frames earlier and without the arm pumping darker and lighter every 4th frame.</p><h2>Numbers</h2><p>Against the reference (PSNR, whole 4K frame): this build 42.7 dB on frames 36-47, NR off 32.8 dB; over the whole clip 42.7 vs 32.4 dB. Least close frame of the clip: frame 10, 40.6 dB.</p><h2>Notes</h2><p>Frames from captured game clips, run through the plugin&#x27;s own runtime in a test harness (deterministic, one run each); the display mapping is ours (x/(1+x), gamma 1/2.2), not the game&#x27;s tone mapping; no UI. Built on DLSSNR-AMD (TheAutomatic and contributors) and the RDNA3 ports by mauri870 and hedonemaeda. Not affiliated with, endorsed by or supported by NVIDIA or AMD. DLSS is a trademark of NVIDIA Corporation. No NVIDIA files or network weights are in this repository.</p>"
+}
