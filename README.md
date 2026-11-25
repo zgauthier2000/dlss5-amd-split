@@ -9,3 +9,7 @@ DLSS 5 neural rendering (small model) on an RX 7800 XT under Linux/Proton, befor
 - The earlier comparison page (2026-11-21, "as found vs ours"): [2026-11-21/](https://zgauthier2000.github.io/dlss5-amd-split/2026-11-21/)
 
 Frames come from captured game clips run through the plugin's own runtime in a test harness; the display mapping is ours, not the game's tone mapping. Built on [DLSSNR-AMD](https://github.com/TheAutomatic/DLSSNR-AMD) and the RDNA3 ports by mauri870 ([DLSSNR-RDNA3](https://github.com/mauri870/DLSSNR-RDNA3)) and hedonemaeda. This project is not affiliated with, endorsed by or supported by NVIDIA or AMD. DLSS is a trademark of NVIDIA Corporation. No NVIDIA files or network weights are in this repository.
+
+## License
+
+The page's code and text, Copyright (c) 2026 zgauthier2000, are licensed under the GNU GPL v2 or later, the same license as [fsr4-shader-performance-overrides](https://github.com/zgauthier2000/fsr4-shader-performance-overrides); see [LICENSE](LICENSE). The pictures are frames captured from the games shown, which belong to their publishers.
