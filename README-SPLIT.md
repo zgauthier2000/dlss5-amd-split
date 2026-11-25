@@ -81,5 +81,7 @@ of `dlssnr-amd.ini` in the game folder holds the settings above; `Every = 0` tur
 ## Credits and license
 
 DLSSNR-AMD by TheAutomatic and contributors; the RDNA3 port by mauri870 (DLSSNR-RDNA3) and its port to 0.0.8.3 by
-hedonemaeda. This work is MIT-licensed like them; bundled third-party parts keep their own licenses (see the
-package's license files). DLSS is NVIDIA's; this project is not affiliated with NVIDIA or AMD.
+hedonemaeda, released under the MIT License (its notice: `DLSSNR-AMD-LICENSE.txt`). This build's changes are licensed
+under the GNU GPL v2 or later, like [fsr4-shader-performance-overrides](https://github.com/zgauthier2000/fsr4-shader-performance-overrides),
+and so is the whole as distributed here (`LICENSE.txt`); v0.0.9-split.1 was published under MIT and stays so. Bundled
+third-party parts keep their own licenses (see the package's license files). DLSS is NVIDIA's; this project is not affiliated with NVIDIA or AMD.

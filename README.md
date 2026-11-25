@@ -508,6 +508,13 @@ for your own use. Do not share packages that contain the model.
 
 ## Licence
 
-MIT for the code in this repository, see [LICENSE](LICENSE). The packages also carry third-party
-components under their own licences, listed in [THIRD_PARTY.md](THIRD_PARTY.md). NVIDIA's model
-weights are NVIDIA's property and are neither included nor distributed.
+This branch's changes (the frame-rate mode Every N + Split + Phase, the carried-frame fixes, the RDNA3 work and the
+rest added since DLSSNR-AMD 0.0.9), Copyright (c) 2026 zgauthier2000, are licensed under the GNU GPL v2 or later, the
+same license as [fsr4-shader-performance-overrides](https://github.com/zgauthier2000/fsr4-shader-performance-overrides);
+see [LICENSE](LICENSE). The code they build on, DLSSNR-AMD 0.0.9 by mochizuki0323 / TheAutomatic and the RDNA3 ports by
+mauri870 and hedonemaeda, was released under the MIT License, which still applies to it; its notice is in
+[LICENSE-MIT-upstream](LICENSE-MIT-upstream). The whole, as distributed here, is under the GPL v2 or later.
+Releases of this branch before this change (v0.0.9-split.1) were published under MIT and stay under MIT.
+
+The packages also carry third-party components under their own licences, listed in [THIRD_PARTY.md](THIRD_PARTY.md).
+NVIDIA's model weights are NVIDIA's property and are neither included nor distributed.

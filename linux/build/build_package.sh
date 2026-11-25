@@ -389,7 +389,8 @@ mkdir -p -- "$pkg/optimized"
 cp -- linux/data/optimized/dlssnr-optimized.delta linux/build/experimental_weights.py "$pkg/optimized/"
 cp -- linux/data/optimized/dlssnr-optimized.sha256 "$pkg/optimized/CC_SILVER_AARDWOLD_OPTIMIZED.bin.sha256"
 cp -- linux/package/install.sh linux/package/README.txt linux/package/lumenite.py README-SPLIT.md "$pkg/"
-cp -- LICENSE "$pkg/DLSSNR-AMD-LICENSE.txt"
+cp -- LICENSE "$pkg/LICENSE.txt"   # GPL v2 or later (this branch's changes and the whole)
+cp -- LICENSE-MIT-upstream "$pkg/DLSSNR-AMD-LICENSE.txt"   # the MIT notice of the code it builds on
 [[ "$gpu" != rdna3 ]] || cp -- docs/RDNA3-TARGET-TESTING.md "$pkg/"
 chmod +x "$pkg/install.sh" "$mt/extract_model.sh"
 
